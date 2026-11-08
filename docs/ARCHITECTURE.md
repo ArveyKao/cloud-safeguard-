@@ -21,7 +21,7 @@ Shared Go types are `internal/model/model.go`, whose JSON tags are the wire cont
 5. **Everything is explainable and auditable.** Policy decisions carry rule-level reasons;
    every security-relevant action appends to a hash-chained audit log.
 6. **Contract-first.** Exported signatures in `internal/model`, `internal/store`,
-   `internal/vault`, `internal/provider`, `internal/capcatalog`, `internal/mockcloud` and
+   `internal/vaultcrypto`, `internal/provider`, `internal/capcatalog`, `internal/mockcloud` and
    `internal/server` are frozen; implementations replace stubs without changing callers.
 
 ---
@@ -48,7 +48,7 @@ flowchart TB
         MOCKC["Mock cloud handler<br/>internal/mockcloud"]
         CATALOG["Capability catalog<br/>internal/capcatalog"]
         TOKENS["Token hashing<br/>internal/token"]
-        VAULT[("Vault<br/>internal/vault<br/>AES-256-GCM")]
+        VAULT[("Vault<br/>internal/vaultcrypto<br/>AES-256-GCM")]
         STORE[("SQLite store<br/>internal/store<br/>+ audit hash chain")]
     end
     subgraph remote ["Remote"]
@@ -84,7 +84,7 @@ flowchart TB
 | --- | --- | --- |
 | Domain model | `internal/model` | Frozen types + JSON wire contract: Provider, Capability, Agent, Lease, Credential, AuditEvent, PolicySettings, Overview, envelopes, error codes, defaults |
 | Persistence | `internal/store` | SQLite schema, CRUD, pagination, sqlite `Store` interface, append-only audit with hash chain, sweeper queries, `Open`/`Close` |
-| Crypto | `internal/vault` | Master-key load/create, AES-256-GCM `Encrypt`/`Decrypt` with AAD, `KeyFingerprint`, `DeriveKey` |
+| Crypto | `internal/vaultcrypto` | Master-key load/create, AES-256-GCM `Encrypt`/`Decrypt` with AAD, `KeyFingerprint`, `DeriveKey` |
 | Policy | `internal/policy` | Explainable risk-based policy evaluation (CONTRACT §6) |
 | Control plane | `internal/server` | Routing, bearer auth, envelopes, lease lifecycle, admin CRUD, overview, init/bootstrap, sweeper, static + mock-cloud mounting, graceful shutdown |
 | Credential minters | `internal/provider` | `Minter` interface; `aliyun` STS RPC v1 signer; `mock` HMAC token minter |
@@ -524,7 +524,7 @@ hash := hex(SHA-256("csg-audit-v1\n" + prev_hash + "\n" + canonical))
 
 ## 11. Vault
 
-Package `internal/vault`:
+Package `internal/vaultcrypto`:
 
 - Master key: 32 bytes from `<dataDir>/master.key` (0600) or `CSG_MASTER_KEY` (base64
   standard) when set. Key file created on first `init`.
@@ -636,7 +636,7 @@ v0.1 is a **single-host, single-process, single-tenant** control plane:
 | New capability | `internal/capcatalog.Builtin()` or admin API (custom capability) | template must render valid JSON for sample params |
 | New policy rule | `internal/policy` engine + `PolicySettings` | keep reasons explainable and tests table-driven |
 | Chat approvals (P2) | approval notification/decision hook around `POST /admin/leases/{id}/approve` | keep the human decision audited |
-| External KMS/HSM | `internal/vault` backend | envelope encryption interface stays |
+| External KMS/HSM | `internal/vaultcrypto` backend | envelope encryption interface stays |
 | Audit export/SIEM | `internal/store` audit writes or a shipping hook | needed for tamper-proof external anchoring |
 | Multi-tenant/SSO (P2) | identity layer in `internal/server` + tenant scoping in store | out of scope for v0.1 |
 | Test seams | `server.Config.MinterFactory`, `server.Config.Now`, fake `store.Store` | used by httptest suites |

@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
-	"github.com/arveykao/cloud-safeguard/internal/vault"
+	"github.com/arveykao/cloud-safeguard/internal/vaultcrypto"
 )
 
 var testTime = time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)

@@ -162,8 +162,8 @@ accounts. It is the authority layer for non-human cloud access.
 ```
 
 Package map (see §8 for owners): `internal/model` (shared types), `internal/store`
-(SQLite), `internal/vault`, `internal/policy`, `internal/audit` (hash chain; may live in
-store), `internal/server` (HTTP + sweeper + bootstrap), `internal/provider`
+(SQLite), `internal/vaultcrypto` (Go package `vault`), `internal/policy`, `internal/audit` (hash chain; may
+live in store), `internal/server` (HTTP + sweeper + bootstrap), `internal/provider`
 (aliyun STS / mock), `internal/capcatalog`, `internal/mockcloud`, `internal/token`,
 `internal/cli`, `cmd/csg`, `web/` (React console embedded via `web.FS()`).
 
@@ -283,14 +283,14 @@ cloud API calls attributable in the audit chain. **v0.1 is accepted only if A1�
 | Owner (teammate) | Write scope | Deliverables |
 | --- | --- | --- |
 | **lead** | `docs/SPEC.md`, `docs/CONTRACT.md`, `Makefile`, `go.mod`, `go.sum`, `web/embed.go`, `.agent/**`, final integration commits | Frozen contract, shared types, integration, final verification, report |
-| **core-api** | `internal/store/**`, `internal/vault/**`, `internal/policy/**`, `internal/server/**`, additive changes to `internal/model/**` (only via Lead) | Store+vault+policy+audit+HTTP API+sweeper+Init+demo seed; unit/integration tests |
+| **core-api** | `internal/store/**`, `internal/vaultcrypto/**`, `internal/policy/**`, `internal/server/**`, additive changes to `internal/model/**` (only via Lead) | Store+vault+policy+audit+HTTP API+sweeper+Init+demo seed; unit/integration tests |
 | **agent-toolkit** | `internal/provider/**`, `internal/capcatalog/**`, `internal/mockcloud/**`, `internal/cli/**`, `cmd/csg/**`, `scripts/demo.sh` | Aliyun STS signer + mock provider + catalog + mock cloud + full CLI + demo script + tests |
 | **console-ui** | `web/**` (except `web/embed.go`), `web/dist/**` | React dashboard (all pages), API client, design system, build passes, mock-server for local dev |
 | **product-docs** | `README.md`, `docs/PRODUCT.md`, `docs/SECURITY.md`, `docs/ARCHITECTURE.md`, `docs/QUICKSTART.md`, `docs/API.md`, `docs/DECISIONS.md` | Product narrative (problem → platform → value/roadmap), security model, architecture, accurate quickstart/API docs |
 | **verifier** (spawned after build) | `scripts/verify/**`, `docs/VERIFICATION.md` (report only; no product-code edits) | Independent black-box verification of A1–A16, security probes, Playwright UI E2E + screenshots, docs accuracy, PASS/FAIL evidence |
 
 Working agreement:
-- Frozen exported signatures in `internal/model`, `internal/store` (Store interface), `internal/vault`, `internal/provider`, `internal/capcatalog`, `internal/mockcloud`, `internal/server` must be kept; replace stub files, add files freely. Contract changes go through Lead.
+- Frozen exported signatures in `internal/model`, `internal/store` (Store interface), `internal/vaultcrypto`, `internal/provider`, `internal/capcatalog`, `internal/mockcloud`, `internal/server` must be kept; replace stub files, add files freely. Contract changes go through Lead.
 - Only Lead edits `go.mod`/`go.sum`; if a dependency is truly needed, message Lead. The target is stdlib + `modernc.org/sqlite` only.
 - Teammates use their own ports/data dirs for local runs: core-api `:18801`, agent-toolkit `:18802`, console-ui Vite `:18803`; demo/verifier `:18787`. Kill your own processes after testing.
 - Teammates do not run `git commit`, do not touch other owners' files, and do not ask the user anything; message Lead with progress, blockers, or contract gaps.

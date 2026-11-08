@@ -25,7 +25,7 @@ import (
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
 	"github.com/arveykao/cloud-safeguard/internal/store"
-	"github.com/arveykao/cloud-safeguard/internal/vault"
+	"github.com/arveykao/cloud-safeguard/internal/vaultcrypto"
 )
 
 // ErrNotImplemented is a placeholder used until the implementation lands.

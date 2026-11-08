@@ -18,7 +18,7 @@ import (
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/store"
 	"github.com/arveykao/cloud-safeguard/internal/token"
-	"github.com/arveykao/cloud-safeguard/internal/vault"
+	"github.com/arveykao/cloud-safeguard/internal/vaultcrypto"
 )
 
 // InitOptions configures first-run bootstrap.
