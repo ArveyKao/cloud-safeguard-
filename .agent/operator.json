@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "applicability": "not_applicable",
+  "scope": "local single-binary CLI/library artifact plus loopback demo server (mock mode); no monitored production service or operator heartbeat",
+  "reason": "v0.1 is a local dev artifact: build/test/demo run on the build host over loopback. No deployment target, no background service to monitor. Revisit when deployed to a real environment.",
+  "updated_at": "2026-11-08T14:31:02Z"
+}

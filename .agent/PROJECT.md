@@ -67,8 +67,9 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 - Execution mode: coordinated Lead delegates implementation to DSH Agent Teams workers;
   Lead owns contract, integration and combined checks. No production target, no operator
   heartbeat required (CLI/library-style local artifact + local demo server).
-- Operator applicability: not_applicable for v0.1 (local-only artifact; no monitored
-  background service). Revisit when deployed.
+- Operator applicability: **not_applicable** for v0.1 (local-only artifact; no monitored
+  background service), recorded via `arvey-develop operator configure` in
+  `.agent/operator.json`. Revisit when deployed.
 - Credentials: no real cloud credentials are used for the build or demo. Demo runs entirely
   in `mock` provider mode. Broker AccessKey values live only in an encrypted SQLite vault in
   a throwaway data dir; no secret is written to the repo or evidence.
