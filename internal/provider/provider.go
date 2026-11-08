@@ -10,6 +10,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
 )
@@ -51,8 +52,13 @@ type Minter interface {
 }
 
 // New returns the Minter for a provider mode.
-//
-// IMPLEMENTATION BY AGENT-TOOLKIT OWNER: replace provider_stub.go.
 func New(mode model.ProviderMode) (Minter, error) {
-	return nil, ErrNotImplemented
+	switch mode {
+	case model.ModeSTS:
+		return stsMinter{}, nil
+	case model.ModeMock:
+		return mockMinter{}, nil
+	default:
+		return nil, fmt.Errorf("provider: unsupported mode %q", mode)
+	}
 }

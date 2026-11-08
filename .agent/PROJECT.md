@@ -5,24 +5,22 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 
 ## Now
 
-- **Stage:** develop (base contract frozen, parallel implementation in flight).
+- **Stage:** evaluate (implementation complete, independent verification in flight).
 - **North star:** an AI agent gets least-privilege, time-boxed cloud access in seconds
   without ever holding a long-lived AK/SK; risky access needs one human approval; every
   lease and cloud API call is auditable; rotating the broker credential touches one place.
-- **In flight:**
-  - `core-api` — store/vault/policy/audit/HTTP API/sweeper/init.
-  - `agent-toolkit` — Aliyun STS signer, mock provider, capability catalog, mock cloud,
-    full CLI, demo script.
-  - `console-ui` — React/Vite console (overview, approvals, agents, capabilities, leases,
-    providers/vault, audit, settings).
-  - `product-docs` — README, PRODUCT (zh), SECURITY, ARCHITECTURE, QUICKSTART, API,
-    DECISIONS.
-- **Blocked:** none. Lead integrates and runs combined checks; verifier spawned after the
-  first integrated build.
-- **Accepted:** MVP scope per `docs/SPEC.md` §3; contract per `docs/CONTRACT.md`;
-  single-tenant, Alibaba Cloud (`sts` + `mock`), console + CLI + demo.
-- **Next:** finish parallel implementation, integrate `make build`/`make test`, run verifier
-  A1–A16, fix findings, final demo + evidence.
+- **Accepted implementation:** `docs/SPEC.md` §3 scope built per `docs/CONTRACT.md`:
+  core control plane (store/vault/policy/audit/API/sweeper/init), Aliyun STS + mock
+  provider, capability catalog, mock cloud, `csg` CLI, `scripts/demo.sh`, embedded React
+  console (8 pages), and the docs suite. All worker task reports are in; combined checks
+  green on the integrated tree (`gofmt`, `go vet`, `go build`, `go test ./...`,
+  `go test -race` core packages, web typecheck/build, `make build`, demo S1–S8 8/8).
+- **In flight:** independent verifier (task-5) running A1–A16, demo, security probes,
+  Playwright console E2E and docs accuracy against the committed candidate; verifier
+  report lands in `docs/VERIFICATION.md`.
+- **Blocked:** none.
+- **Next:** triage verifier findings (route code fixes to owning workers), re-run combined
+  checks, finalize delivery record + evidence, present final demo/screenshots.
 
 ## Next useful delivery
 

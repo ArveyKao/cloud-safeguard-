@@ -1,0 +1,240 @@
+{
+  "schema_version": 2,
+  "id": "cloud-safeguard-v0.1",
+  "title": "Cloud Safeguard MVP: capability broker for AI agents",
+  "north_star": "Agents get just-in-time least-privilege cloud capability leases instead of long-lived AK/SK, without losing speed or losing an audit trail.",
+  "stage": "develop",
+  "iteration": 1,
+  "owner": "lead",
+  "implementer": "lead",
+  "worktree": null,
+  "depends_on": [],
+  "workstreams": [],
+  "contract_refs": [
+    "docs/SPEC.md",
+    "docs/CONTRACT.md"
+  ],
+  "issue_refs": [],
+  "issue_dispositions": {},
+  "plan": {
+    "problem": "AI agents operating real cloud resources currently rely on long-lived, broadly privileged AK/SK pairs: a leak is account takeover, rotation means hunting every copied key (agent config, ~/.aliyun/config.json, ~/.acme.sh/account.conf), cloud audit cannot attribute actions to an agent/task/approval, and per-task least privilege is too slow so operators fall back to admin.",
+    "hypothesis": "Put the broker AccessKey in an encrypted vault and expose capabilities instead of credentials: policy-evaluated, TTL-bounded, STS-scoped capability leases with auto-approval for low risk, one-click human approval for risky work and a tamper-evident audit chain. This keeps agent speed while enforcing least privilege and accountability.",
+    "success_metric": "Zero long-lived cloud credentials outside the vault; read-only lease to credential in <2s with no human; scoped write in <30s including approval; 100% of lease requests and cloud API calls attributable in the audit chain; all acceptance criteria A1-A16 pass on an independent verification of the committed candidate.",
+    "non_goals": [
+      "multi-tenant SaaS, human user accounts/SSO/RBAC",
+      "credential-free cloud API proxy mode (roadmap P1)",
+      "cloud providers other than Alibaba Cloud",
+      "Kubernetes/HA/external DB or KMS deployment",
+      "chat/Slack/Feishu approvals",
+      "per-parameter grant constraints",
+      "real cloud account calls during this build (mock mode is the verification path; sts mode unit-tested against a fake STS endpoint)"
+    ],
+    "final_demo": "make build; ./scripts/demo.sh --port 18787 --data-dir <clean tmp> -> S1-S8 PASS (auto-approve + scoped read, least-privilege 403, approval, denial, ungranted denial, break-glass + live revoke, audit verify); embedded console E2E (login -> approve pending lease -> active + credential available) with screenshots; clean-clone go test ./..., go vet, npm typecheck/build."
+  },
+  "decisions": [],
+  "design": "Single Go binary control plane (SQLite + AES-256-GCM vault + policy engine + hash-chained audit + sweeper + embedded React console) with a csg CLI. Providers: Alibaba Cloud STS AssumeRole (in-tree RPC v1 signer) and a mock mode backed by an in-binary mock cloud that enforces the same IAM policy documents. Normative contract: docs/CONTRACT.md; product definition: docs/SPEC.md.",
+  "source_revision": null,
+  "artifact_identity": null,
+  "provenance": {
+    "tested_revision": null
+  },
+  "risk": "standard",
+  "target": {
+    "kind": "local",
+    "surface": "api",
+    "location": null,
+    "name": "local macOS host; Go control plane + embedded web console + REST API + CLI; mock cloud demo (no real cloud creds)"
+  },
+  "criteria": [
+    {
+      "id": "A1",
+      "kind": "happy",
+      "expectation": "csg init --demo creates 0700 data dir, 0600 master key/DB, admin token, 5 built-in capabilities, 1 mock provider, 2 demo agents; tokens shown once; re-init refused without --force.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A2",
+      "kind": "happy",
+      "expectation": "make build produces bin/csg; serve exposes /healthz, /api/v1, embedded console at /, SPA fallback, graceful SIGINT shutdown.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A3",
+      "kind": "happy",
+      "expectation": "Auto-approve flow: low-risk lease active, credential envelope returns ALIBABA_CLOUD_* STS token, mock cloud read succeeds.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A4",
+      "kind": "security",
+      "expectation": "Least privilege enforced: same credential denied 403 on out-of-policy action; TTL/agent/global limits, concurrency and rate limits deny with explicit reasons; sweeper expires leases and scrubs credentials.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A5",
+      "kind": "security",
+      "expectation": "Server-side enforcement: forged/expired/revoked mock tokens 401; admin vs agent token domains separated; agent cannot read another agent lease (404); suspended agent blocked.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A6",
+      "kind": "happy",
+      "expectation": "Human approval and denial work from CLI and web console; leases become active/denied; audit trail records request/approval/denial/issuance.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A7",
+      "kind": "security",
+      "expectation": "Audit hash chain verifies on clean DB and fails after tampering (Go test + independent probe).",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A8",
+      "kind": "security",
+      "expectation": "No plaintext broker secret, STS secret or agent token in DB/WAL, access logs, API responses, or JS bundle.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A9",
+      "kind": "security",
+      "expectation": "Vault AES-256-GCM with AAD binding; wrong AAD fails; provider credential never returned by API.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A10",
+      "kind": "happy",
+      "expectation": "Policy settings editable and effective (raising auto-approve risk changes lease outcome), invalid settings rejected 400, change audited.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A11",
+      "kind": "happy",
+      "expectation": "Provider credential rotation works, is audited, existing leases unaffected, new leases mint with new credential, no agent changes.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A12",
+      "kind": "security",
+      "expectation": "Agent token rotation invalidates old token; suspend blocks; per-agent limits enforced with explicit reasons.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A13",
+      "kind": "happy",
+      "expectation": "Web console E2E: login, overview real counts, approve pending lease from UI, agent token shown once, audit verify works, no uncaught console errors; screenshots captured.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A14",
+      "kind": "happy",
+      "expectation": "go test ./... and go vet ./... pass; web typecheck+build pass; formatting clean.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A15",
+      "kind": "happy",
+      "expectation": "Demo S1-S8 reproducible from clean data dir, exit 0, no leftover server process.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    },
+    {
+      "id": "A16",
+      "kind": "docs",
+      "expectation": "README/QUICKSTART commands execute as documented; PRODUCT/SECURITY/ARCHITECTURE match shipped behavior and list limitations honestly.",
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    }
+  ],
+  "failure_modes": [],
+  "checks": [
+    {
+      "name": "gofmt -l . / go vet ./... / go build ./...",
+      "category": "test",
+      "required_phase": "pre-deploy",
+      "status": "unverified",
+      "evidence": []
+    },
+    {
+      "name": "go test ./... and go test -race (store, vault, policy, server)",
+      "category": "test",
+      "required_phase": "pre-deploy",
+      "status": "unverified",
+      "evidence": []
+    },
+    {
+      "name": "web: npm run typecheck && npm run build (web/dist embedded)",
+      "category": "test",
+      "required_phase": "pre-deploy",
+      "status": "unverified",
+      "evidence": []
+    },
+    {
+      "name": "scripts/demo.sh S1-S8 from clean data dir",
+      "category": "test",
+      "required_phase": "post-deploy",
+      "status": "unverified",
+      "evidence": [],
+      "phase_reason": "Runs the built binary as a real local service on loopback, exercising lease->credential->mock cloud->audit end to end (final_demo in plan)."
+    },
+    {
+      "name": "Independent verifier A1-A16 + Playwright console E2E",
+      "category": "review",
+      "required_phase": "post-deploy",
+      "status": "unverified",
+      "evidence": [],
+      "phase_reason": "Independent black-box verification of the deployed local artifact and browser console (final_demo in plan)."
+    }
+  ],
+  "target_check": {
+    "status": "unverified",
+    "evidence": []
+  },
+  "runtime_check": {
+    "applicable": true,
+    "reason": "Local demo server + embedded console are the delivery surface and are exercised by the demo script and verifier over loopback on the build host.",
+    "status": "unverified",
+    "evidence": []
+  },
+  "review": {
+    "required": true,
+    "reviewer": "verifier",
+    "status": "unverified",
+    "evidence": []
+  },
+  "issues": [],
+  "blockers": [],
+  "next_action": "Commit the integrated candidate, then spawn the independent verifier for A1-A16, demo, security probes and browser E2E.",
+  "started_at": "2026-11-08T13:34:06Z",
+  "first_working_at": null,
+  "delivered_at": null
+}

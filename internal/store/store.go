@@ -9,8 +9,15 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"time"
+
+	_ "modernc.org/sqlite" // pure-Go SQLite driver
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
 )
@@ -119,14 +126,84 @@ type Store interface {
 
 // DB is the SQLite-backed Store implementation. Open is implemented by the
 // core-api owner; the rest of the platform only depends on the Store interface.
-type DB struct{}
+type DB struct {
+	sql  *sql.DB
+	path string
+	// appendMu serializes audit appends so seq allocation and hash chaining are
+	// race-free across goroutines. VerifyAudit also takes it for a consistent
+	// snapshot.
+	appendMu sync.Mutex
+}
+
+// DBFileName is the SQLite database file inside the data directory.
+const DBFileName = "csg.db"
 
 // Open opens (and migrates) the control-plane database in dataDir.
 //
-// IMPLEMENTATION BY CORE-API OWNER: replace db_stub.go. Keep this signature.
+// The database file is created with mode 0600 (best effort). Open is idempotent:
+// opening an already-migrated database just applies no migrations.
 func Open(ctx context.Context, dataDir string) (*DB, error) {
-	return nil, ErrNotImplemented
+	if dataDir == "" {
+		return nil, errors.New("store: data dir is required")
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("store: create data dir: %w", err)
+	}
+	path := filepath.Join(dataDir, DBFileName)
+
+	dsn := "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(ON)"
+	sqlDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("store: open database: %w", err)
+	}
+	// WAL allows concurrent readers with a single writer; a small pool plus the
+	// busy timeout is plenty for a single-tenant control plane.
+	sqlDB.SetMaxOpenConns(4)
+	sqlDB.SetMaxIdleConns(4)
+	sqlDB.SetConnMaxLifetime(0)
+
+	if err := sqlDB.PingContext(ctx); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("store: ping database: %w", err)
+	}
+	// Best effort: the DB holds only ciphertext, but keep it owner-only anyway.
+	_ = os.Chmod(path, 0o600)
+
+	db := &DB{sql: sqlDB, path: path}
+	if err := db.applyMigrations(ctx); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// Path returns the database file path (used by tests and runtime diagnostics).
+func (db *DB) Path() string {
+	if db == nil {
+		return ""
+	}
+	return db.path
+}
+
+// SQL returns the underlying *sql.DB. It is exposed for tests and diagnostics
+// in the core-api package only; the rest of the platform depends on Store.
+func (db *DB) SQL() *sql.DB {
+	if db == nil {
+		return nil
+	}
+	return db.sql
 }
 
 // Close releases the database.
-func (db *DB) Close() error { return nil }
+func (db *DB) Close() error {
+	if db == nil || db.sql == nil {
+		return nil
+	}
+	err := db.sql.Close()
+	db.sql = nil
+	return err
+}
