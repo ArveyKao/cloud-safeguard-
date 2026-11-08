@@ -1,0 +1,35 @@
+# Build artifacts
+/bin/
+/data/
+/config.local.*
+*.out
+*.test
+
+# Demo / runtime state
+.demo/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Secrets and local keys
+master.key
+*.key
+.env
+.env.*
+!web/node_modules
+
+# Node
+web/node_modules/
+web/.vite/
+web/coverage/
+node_modules/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Agent scratch space
+.agent/scratch/

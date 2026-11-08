@@ -1,0 +1,79 @@
+{
+  "schema_version": 2,
+  "id": null,
+  "title": null,
+  "north_star": null,
+  "stage": "intent",
+  "iteration": 1,
+  "owner": null,
+  "implementer": null,
+  "worktree": null,
+  "depends_on": [],
+  "workstreams": [],
+  "contract_refs": [],
+  "issue_refs": [],
+  "issue_dispositions": {},
+  "plan": {
+    "problem": null,
+    "hypothesis": null,
+    "success_metric": null,
+    "non_goals": [],
+    "final_demo": null
+  },
+  "decisions": [],
+  "design": null,
+  "source_revision": null,
+  "artifact_identity": null,
+  "provenance": {
+    "tested_revision": null
+  },
+  "risk": "standard",
+  "target": {
+    "kind": "unselected",
+    "surface": "unselected",
+    "location": null,
+    "name": null
+  },
+  "criteria": [
+    {
+      "id": "A1",
+      "kind": "happy",
+      "expectation": null,
+      "status": "unverified",
+      "evidence": [],
+      "steps": []
+    }
+  ],
+  "failure_modes": [],
+  "checks": [
+    {
+      "name": null,
+      "category": "test",
+      "required_phase": "pre-deploy",
+      "status": "unverified",
+      "evidence": []
+    }
+  ],
+  "target_check": {
+    "status": "unverified",
+    "evidence": []
+  },
+  "runtime_check": {
+    "applicable": true,
+    "reason": null,
+    "status": "unverified",
+    "evidence": []
+  },
+  "review": {
+    "required": false,
+    "reviewer": null,
+    "status": "unverified",
+    "evidence": []
+  },
+  "issues": [],
+  "blockers": [],
+  "next_action": "Define the final demo, intent, success metric, user scenarios, and exact environment; design the smallest working slice.",
+  "started_at": null,
+  "first_working_at": null,
+  "delivered_at": null
+}
