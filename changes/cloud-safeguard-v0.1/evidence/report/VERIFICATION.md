@@ -26,6 +26,13 @@ Evidence files (all in this repo, plain text, no secrets/tokens):
 repro scripts `probe-api.sh`, `run-console-e2e.sh`, `console-e2e.mjs`, `docs-check.sh`,
 and `docs/screenshots/*.png`.
 
+> **Lead note (evidence relocation):** after verification, the evidence artifacts were moved
+> from `scripts/verify/`, `docs/screenshots/` and `docs/VERIFICATION.md` into
+> `changes/cloud-safeguard-v0.1/evidence/` (`verify/`, `screenshots/`, `report/`) so they live
+> in the delivery evidence directory and stay outside the product source identity. Paths
+> mentioned inside this report refer to the original verifier paths; the same files now live
+> under the evidence directory with identical content.
+
 ---
 
 ## 1. Acceptance criteria A1–A16

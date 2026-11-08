@@ -3,7 +3,7 @@
   "id": "cloud-safeguard-v0.1",
   "title": "Cloud Safeguard MVP: capability broker for AI agents",
   "north_star": "Agents get just-in-time least-privilege cloud capability leases instead of long-lived AK/SK, without losing speed or losing an audit trail.",
-  "stage": "develop",
+  "stage": "complete",
   "iteration": 1,
   "owner": "lead",
   "implementer": "lead",
@@ -33,208 +33,597 @@
   },
   "decisions": [],
   "design": "Single Go binary control plane (SQLite + AES-256-GCM vault + policy engine + hash-chained audit + sweeper + embedded React console) with a csg CLI. Providers: Alibaba Cloud STS AssumeRole (in-tree RPC v1 signer) and a mock mode backed by an in-binary mock cloud that enforces the same IAM policy documents. Normative contract: docs/CONTRACT.md; product definition: docs/SPEC.md.",
-  "source_revision": null,
+  "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
   "artifact_identity": null,
   "provenance": {
-    "tested_revision": null
+    "tested_revision": "a509c1c9868bfbed458ee07789c1a6191bc10bd0"
   },
   "risk": "standard",
   "target": {
     "kind": "local",
     "surface": "api",
-    "location": null,
-    "name": "local macOS host; Go control plane + embedded web console + REST API + CLI; mock cloud demo (no real cloud creds)"
+    "location": "/Users/arveykao/code/cloud-safeguard (verified from fresh clone at /tmp/csg-verify/candidate)",
+    "name": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
   },
   "criteria": [
     {
       "id": "A1",
       "kind": "happy",
-      "expectation": "csg init --demo creates 0700 data dir, 0600 master key/DB, admin token, 5 built-in capabilities, 1 mock provider, 2 demo agents; tokens shown once; re-init refused without --force.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "csg init --demo creates 0700 data dir, 0600 master.key/DB, 5 caps/1 mock provider/2 demo agents, tokens once; re-init refused without --force; --force rotates admin token.",
+      "status": "pass",
+      "steps": [
+        "rm -rf /tmp/csg-verify/probe-data && ./bin/csg init --demo --json --data-dir /tmp/csg-verify/probe-data",
+        "stat file perms of data dir, master.key, csg.db; inspect InitResult tokens/provider/capabilities/agents",
+        "re-run init without --force (must fail); re-run with --force (new admin token; old token 401)"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A1 probe block: 0700/0600 perms, 5 caps, 1 provider, 2 agents, tokens shown once, re-init refused; --force rotates admin token (old 401, agents survive).",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A2",
       "kind": "happy",
-      "expectation": "make build produces bin/csg; serve exposes /healthz, /api/v1, embedded console at /, SPA fallback, graceful SIGINT shutdown.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "make build produces bin/csg; serve exposes /healthz, /api/v1, embedded console /, SPA fallback, graceful SIGINT shutdown.",
+      "status": "pass",
+      "steps": [
+        "make build && ./bin/csg version",
+        "start ./bin/csg serve --addr 127.0.0.1:<free>; curl /healthz, /, /assets/*.js, /agents (SPA), unauthenticated /api/v1/agent/me",
+        "send SIGINT; confirm exit and released port"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A2 probe: /healthz 200, embedded dashboard + hashed asset 200, SPA fallback 200, unauthenticated API 401, graceful shutdown; default :8787 NOT RUN (unrelated process holds port) - explicit --addr used.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        },
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/build.log",
+          "captured_at": "2026-11-08T14:06:13Z",
+          "observed": "make build produced bin/csg; ./bin/csg version -> csg 0.1.0.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A3",
       "kind": "happy",
-      "expectation": "Auto-approve flow: low-risk lease active, credential envelope returns ALIBABA_CLOUD_* STS token, mock cloud read succeeds.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "Auto-approve S1 end-to-end: low-risk lease active, 6-var Alibaba Cloud STS env, mock cloud read 200.",
+      "status": "pass",
+      "steps": [
+        "agent POST /api/v1/agent/leases (aliyun.cloud.read, ttl 300)",
+        "POST .../credential; assert 6 env vars in contract order",
+        "GET /mock-cloud/v1/ecs/instances with returned token"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A3 probe: 201 active auto_approve, 15 explainable reasons, exact 6 ALIBABA_CLOUD_*/CSG_* env vars, mock ECS list 200 with 3 instances; CLI request --wait path also active.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A4",
-      "kind": "security",
-      "expectation": "Least privilege enforced: same credential denied 403 on out-of-policy action; TTL/agent/global limits, concurrency and rate limits deny with explicit reasons; sweeper expires leases and scrubs credentials.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "kind": "failure",
+      "expectation": "Least privilege enforced server-side: out-of-policy action 403; TTL/agent/global/concurrency/rate limits deny with explicit rule keys; sweeper expires and scrubs credentials.",
+      "status": "pass",
+      "steps": [
+        "valid read credential -> POST /mock-cloud/v1/ecs/instances/{id}/restart (expect 403)",
+        "over-limit TTL / concurrency / rate requests (expect denied leases with rule keys)",
+        "5s TTL lease -> wait past sweep -> expired + credential 409 + mock token 401 + DB blob cleared"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A4 probe: Forbidden.RAM 403; explicit ttl_within_capability/agent/global, concurrency_available, rate_limit rules; 5s lease -> expired, credential scrubbed, fetch 409, mock token 401 InvalidSecurityToken.Expired.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A5",
-      "kind": "security",
-      "expectation": "Server-side enforcement: forged/expired/revoked mock tokens 401; admin vs agent token domains separated; agent cannot read another agent lease (404); suspended agent blocked.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "kind": "failure",
+      "expectation": "Enforcement is server-side: forged/expired/revoked tokens 401, admin/agent domains separated, cross-agent lease 404, suspended agent 403, rotated token invalidates old.",
+      "status": "pass",
+      "steps": [
+        "forged/garbage/wrong-kind tokens on agent and admin routes",
+        "read another agent lease and credential (expect 404)",
+        "suspend/rotate an agent and retry (expect 403 / old 401)"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A5 probe: 401 for forged/wrong-kind/rotated admin token; 403 suspended agent; 404 cross-agent lease+credential; mock token 401 InvalidSecurityToken.Revoked/Expired; rotation old 401/new 200.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A6",
       "kind": "happy",
-      "expectation": "Human approval and denial work from CLI and web console; leases become active/denied; audit trail records request/approval/denial/issuance.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "Approval and denial work from CLI and HTTP; break-glass gating and critical audit; approve-then-revoke kills live token.",
+      "status": "pass",
+      "steps": [
+        "create medium lease; approve via csg leases approve and via POST /admin/leases/{id}/approve",
+        "deny a pending lease via CLI and HTTP; credential fetch 409",
+        "break-glass without flag (deny), with flag (pending -> approve -> critical audit), revoke -> mock token 401"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A6 probe: CLI+HTTP approve -> active/approved_by admin; CLI+HTTP deny -> denied, credential 409; break-glass gate + critical lease.approved audit; revoke -> mock token 401.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        },
+        {
+          "kind": "browser",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/screenshots/02-overview-pending-queue.png",
+          "captured_at": "2026-11-08T14:10:39Z",
+          "observed": "A13 console E2E also approves a pending lease from the UI (screenshots 02/03; API confirms active/approved_by admin/credential 200).",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A7",
-      "kind": "security",
-      "expectation": "Audit hash chain verifies on clean DB and fails after tampering (Go test + independent probe).",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "kind": "failure",
+      "expectation": "Audit hash chain verifies on clean DB and fails after a row is tampered with (endpoint, CLI and Go test).",
+      "status": "pass",
+      "steps": [
+        "GET /api/v1/admin/audit/verify on clean DB",
+        "copy DB, UPDATE an audit row, verify tampered copy (expect ok=false first_invalid_seq=2)",
+        "confirm internal/store Go test covers tamper detection"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A7 probe: clean verify ok=true events=82; tampered DB copy -> ok=false first_invalid_seq=2 (CLI exits nonzero); Go test VerifyAudit tamper coverage present.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A8",
-      "kind": "security",
-      "expectation": "No plaintext broker secret, STS secret or agent token in DB/WAL, access logs, API responses, or JS bundle.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "kind": "failure",
+      "expectation": "No plaintext broker secret, STS token or agent/admin token in DB/WAL, access logs, CLI/API responses or JS bundle.",
+      "status": "pass",
+      "steps": [
+        "register canary broker credential via CLI providers add",
+        "scan SQLite DB/-wal/-shm, server access log, captured API responses and web/dist for exact canary/token strings",
+        "assert provider API returns masked AK only and no foreign agent data"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A8 probe: canary broker secret/AK, 4 mock STS tokens, admin token, old admin token and 3 agent tokens -> 0 hits in DB/WAL/SHM, access log, CLI/API responses, web/dist; only access_key_id_masked exposed.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A9",
-      "kind": "security",
-      "expectation": "Vault AES-256-GCM with AAD binding; wrong AAD fails; provider credential never returned by API.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "kind": "failure",
+      "expectation": "Vault AES-256-GCM with AAD binding; wrong AAD fails to decrypt; provider credential never returned by API.",
+      "status": "pass",
+      "steps": [
+        "go test ./internal/vaultcrypto (AAD mismatch/tamper/nonce/key-size)",
+        "inspect providers/leases encrypted_credential column format (v1:)",
+        "assert no API response exposes a provider credential"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A9 probe: DB blobs are v1: AES-GCM ciphertext; API exposes no provider credential; only the owning active lease can fetch its credential; vaultcrypto AAD tests pass.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A10",
       "kind": "happy",
-      "expectation": "Policy settings editable and effective (raising auto-approve risk changes lease outcome), invalid settings rejected 400, change audited.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "Policy settings editable and effective (medium auto-approve), invalid settings 400, change audited.",
+      "status": "pass",
+      "steps": [
+        "baseline medium lease -> pending",
+        "csg policy set --auto-approve-max-risk medium -> same request active/auto_approve",
+        "PUT invalid policy -> 400; audit action=policy.updated; restore defaults"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A10 probe: baseline pending; after policy set medium -> active auto_approve; invalid PUT 400 invalid_request; policy.updated audit event present.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A11",
       "kind": "happy",
-      "expectation": "Provider credential rotation works, is audited, existing leases unaffected, new leases mint with new credential, no agent changes.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "Provider credential rotation works, is audited, old leases unaffected, new leases mint, no agent changes.",
+      "status": "pass",
+      "steps": [
+        "csg providers rotate ID with secret file",
+        "masked AK updated; audit provider.credential_rotated; providers test ok",
+        "old lease token still works; new lease active with unchanged agent token"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A11 probe: rotation exit 0 (secret not echoed), masked AK updated, provider.credential_rotated audited, providers test ok=true; pre-rotation token still 200, new lease mints active.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A12",
-      "kind": "security",
+      "kind": "failure",
       "expectation": "Agent token rotation invalidates old token; suspend blocks; per-agent limits enforced with explicit reasons.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "status": "pass",
+      "steps": [
+        "rotate an agent token; old 401 / new 200",
+        "suspend agent -> requests + /agent/me 403; activate restores",
+        "lower per-agent limits and hit them -> explicit rule keys"
+      ],
+      "evidence": [
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A12 probe: rotated old token 401/new 200; suspend 403 on requests and /agent/me; ttl_within_agent/concurrency_available/rate_limit denials with numeric detail.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A13",
       "kind": "happy",
-      "expectation": "Web console E2E: login, overview real counts, approve pending lease from UI, agent token shown once, audit verify works, no uncaught console errors; screenshots captured.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "Web console E2E: login, real overview counts, approve pending lease from UI, one-time agent token, audit verify, no uncaught console errors; screenshots captured.",
+      "status": "pass",
+      "steps": [
+        "Playwright 1440x900 vs shipped embedded bundle served by real control plane",
+        "login; counts vs API; approve pending lease with TTL+note; assert via API active/approved_by admin/credential 200",
+        "navigate all pages; create agent + one-time token modal; audit verify; settings save; logout; SPA deep link; 1024 responsive; console error audit"
+      ],
+      "evidence": [
+        {
+          "kind": "browser",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/screenshots/02-overview-pending-queue.png",
+          "captured_at": "2026-11-08T14:10:39Z",
+          "observed": "A13 console E2E: 34/34 checks PASS, 0 uncaught console/page errors; UI approval confirmed via API; 12 screenshots under changes/.../evidence/screenshots/.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        },
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A13 supporting API evidence: console-approved lease returns active/approved_by admin/credential 200; overview counts match.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A14",
       "kind": "happy",
-      "expectation": "go test ./... and go vet ./... pass; web typecheck+build pass; formatting clean.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "Build/checks pass: gofmt/vet/go build/go test (+race), web typecheck+build, make build.",
+      "status": "pass",
+      "steps": [
+        "fresh clone at candidate a509c1c",
+        "gofmt -l .; go vet ./...; go build ./...; go test ./...; go test -race core packages",
+        "cd web && npm run typecheck && npm run build; make build"
+      ],
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/build.log",
+          "captured_at": "2026-11-08T14:06:13Z",
+          "observed": "A14: gofmt empty, vet clean, go build ok, go test all packages ok, -race store/vaultcrypto/policy/server ok, web typecheck+build clean, make build ok.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        },
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A14 supporting: built binary served the real API during probes (version 0.1.0).",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A15",
       "kind": "happy",
-      "expectation": "Demo S1-S8 reproducible from clean data dir, exit 0, no leftover server process.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "expectation": "Demo S1-S8 reproducible from clean data dirs, exit 0, no leftover server process.",
+      "status": "pass",
+      "steps": [
+        "./scripts/demo.sh --port 18787 --data-dir <clean tmp> twice",
+        "assert 8/8 PASS, exit 0, cleanup trap stops server, 0 listeners",
+        "make demo entry point also 8/8"
+      ],
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/demo-transcript.log",
+          "captured_at": "2026-11-08T14:13:20Z",
+          "observed": "A15: demo run twice from removed data dirs -> 8 passed, 0 failed both, EXIT_CODE=0, no listener on 18787 afterwards; make demo also 8/8.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        },
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/runtime-server.log",
+          "captured_at": "2026-11-08T14:13:20Z",
+          "observed": "A15 supporting: real control-plane server access log from a probe run (bounded window, no secrets).",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
       "id": "A16",
-      "kind": "docs",
-      "expectation": "README/QUICKSTART commands execute as documented; PRODUCT/SECURITY/ARCHITECTURE match shipped behavior and list limitations honestly.",
-      "status": "unverified",
-      "evidence": [],
-      "steps": []
+      "kind": "happy",
+      "expectation": "Docs accurate: README/QUICKSTART commands and exit codes execute as documented; PRODUCT/SECURITY/ARCHITECTURE match shipped behavior and list limitations honestly.",
+      "status": "pass",
+      "steps": [
+        "execute 48 documented README/QUICKSTART commands against a real instance",
+        "verify documented exit codes 2/3/4 and --help flag names",
+        "cross-check SECURITY residual-risk claims and ARCHITECTURE/PRODUCT numbers against behavior"
+      ],
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/docs-check.log",
+          "captured_at": "2026-11-08T14:14:31Z",
+          "observed": "A16: 48 documented commands executed successfully; documented exit codes 2/3/4 confirmed; help flags match; SECURITY residual risks and ARCH/PRODUCT numbers match behavior; live-cloud section NOT RUN (no creds).",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        },
+        {
+          "kind": "api",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "A16 supporting: documented API shapes/status codes were exercised by the probe harness.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     }
   ],
   "failure_modes": [],
   "checks": [
     {
-      "name": "gofmt -l . / go vet ./... / go build ./...",
+      "name": "gofmt / go vet / go build",
       "category": "test",
       "required_phase": "pre-deploy",
-      "status": "unverified",
-      "evidence": []
+      "status": "pass",
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/build.log",
+          "captured_at": "2026-11-08T14:06:13Z",
+          "observed": "gofmt -l . empty; go vet ./... clean; go build ./... exit 0 on candidate a509c1c.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
-      "name": "go test ./... and go test -race (store, vault, policy, server)",
+      "name": "go test ./... and go test -race (store, vaultcrypto, policy, server)",
       "category": "test",
       "required_phase": "pre-deploy",
-      "status": "unverified",
-      "evidence": []
+      "status": "pass",
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/build.log",
+          "captured_at": "2026-11-08T14:06:13Z",
+          "observed": "go test ./... all packages ok; go test -race core packages ok, no data race.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
-      "name": "web: npm run typecheck && npm run build (web/dist embedded)",
+      "name": "web typecheck + build; make build",
       "category": "test",
       "required_phase": "pre-deploy",
-      "status": "unverified",
-      "evidence": []
+      "status": "pass",
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/build.log",
+          "captured_at": "2026-11-08T14:06:13Z",
+          "observed": "npm run typecheck clean; vite build 55 modules; make build produced bin/csg with embedded final dist.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
-      "name": "scripts/demo.sh S1-S8 from clean data dir",
+      "name": "scripts/demo.sh S1-S8 from clean data dirs",
       "category": "test",
       "required_phase": "post-deploy",
-      "status": "unverified",
-      "evidence": [],
-      "phase_reason": "Runs the built binary as a real local service on loopback, exercising lease->credential->mock cloud->audit end to end (final_demo in plan)."
+      "status": "pass",
+      "phase_reason": "Runs the built binary as a real local loopback service, exercising lease -> credential -> mock cloud -> audit end-to-end (plan.final_demo).",
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/demo-transcript.log",
+          "captured_at": "2026-11-08T14:13:20Z",
+          "observed": "demo.sh twice from removed data dirs: 8 passed, 0 failed, EXIT_CODE=0, clean server shutdown, no listener on 18787.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     },
     {
-      "name": "Independent verifier A1-A16 + Playwright console E2E",
-      "category": "review",
+      "name": "independent verifier A1-A16 + Playwright console E2E",
+      "category": "other",
       "required_phase": "post-deploy",
-      "status": "unverified",
-      "evidence": [],
-      "phase_reason": "Independent black-box verification of the deployed local artifact and browser console (final_demo in plan)."
+      "status": "pass",
+      "phase_reason": "Independent black-box verification of the deployed local artifact and embedded browser console (plan.final_demo).",
+      "evidence": [
+        {
+          "kind": "command",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+          "captured_at": "2026-11-08T14:14:40Z",
+          "observed": "Independent verifier: 164 PASS / 0 FAIL black-box probes; A1-A16 PASS on verifiable scope; no blocking defect or security hole.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        },
+        {
+          "kind": "review",
+          "ref": "changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md",
+          "captured_at": "2026-11-08T14:14:18Z",
+          "observed": "Independent verifier report verdict PASS with documented low-severity findings and environmental NOT RUN items.",
+          "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+          "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+        }
+      ]
     }
   ],
   "target_check": {
-    "status": "unverified",
-    "evidence": []
+    "status": "pass",
+    "evidence": [
+      {
+        "kind": "api",
+        "ref": "changes/cloud-safeguard-v0.1/evidence/verify/api-probes.log",
+        "captured_at": "2026-11-08T14:14:40Z",
+        "observed": "Deployed local control plane exercised end-to-end: init, serve, lease lifecycle, mock cloud enforcement, audit verify, admin review (164 PASS/0 FAIL).",
+        "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+        "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+      },
+      {
+        "kind": "deployment",
+        "ref": "changes/cloud-safeguard-v0.1/evidence/verify/deployment-receipt.md",
+        "captured_at": "2026-11-08T14:14:40Z",
+        "observed": "Local deployment receipt: candidate a509c1c, bin/csg 0.1.0, loopback instance, fresh clone, health + demo confirmation, captured 2026-11-08T14:13Z.",
+        "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+        "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+      },
+      {
+        "kind": "browser",
+        "ref": "changes/cloud-safeguard-v0.1/evidence/screenshots/02-overview-pending-queue.png",
+        "captured_at": "2026-11-08T14:10:39Z",
+        "observed": "Embedded console deployed and exercised in a real browser (12 screenshots, 34/34 checks, 0 console errors).",
+        "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+        "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+      }
+    ]
   },
   "runtime_check": {
     "applicable": true,
-    "reason": "Local demo server + embedded console are the delivery surface and are exercised by the demo script and verifier over loopback on the build host.",
-    "status": "unverified",
-    "evidence": []
+    "reason": "Local demo control plane + embedded console are the delivery surface; exercised over loopback by the verifier.",
+    "status": "pass",
+    "evidence": [
+      {
+        "kind": "logs",
+        "ref": "changes/cloud-safeguard-v0.1/evidence/verify/runtime-server.log",
+        "captured_at": "2026-11-08T14:13:20Z",
+        "observed": "Bounded control-plane access-log window (06:10:13..06:10:32 local) from a real probe run: healthz, API, mock-cloud requests, all non-secret, graceful shutdown.",
+        "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+        "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)",
+        "window_start": "2026-11-08T14:10:13Z",
+        "window_end": "2026-11-08T14:10:32Z",
+        "query": "bounded access-log window from csg serve on 127.0.0.1:18891 during the verifier probe run; see header of runtime-server.log"
+      }
+    ]
   },
   "review": {
     "required": true,
     "reviewer": "verifier",
-    "status": "unverified",
-    "evidence": []
+    "status": "pass",
+    "evidence": [
+      {
+        "kind": "review",
+        "ref": "changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md",
+        "captured_at": "2026-11-08T14:14:18Z",
+        "observed": "Independent verifier (fresh clone, separate context) verdict PASS on A1-A16 verifiable scope; 164/0 probes, demo 8/8 x2, console 34/34, docs 48 commands; findings F1-F6 low/info non-blocking.",
+        "source_revision": "source:v2:sha256:195530e57c43c3ea288784ca3a8b563e19ef7656a0ecab8cdba9d158bc53bc62",
+        "environment": "local macOS arm64 loopback instance (fresh-clone bin/csg, mock provider, throwaway data dir)"
+      }
+    ]
   },
-  "issues": [],
+  "issues": [
+    {
+      "id": "F1",
+      "scenario": "A1",
+      "expected": "admin token rotation during csg init --force is recorded in the audit chain",
+      "observed": "no audit event is emitted for bootstrap admin-token rotation (audit rows 0 immediately after force)",
+      "reproduction": "csg init --data-dir D --demo; csg init --force --data-dir D; csg audit list",
+      "severity": "nonblocking",
+      "relation": "related",
+      "status": "deferred",
+      "defer_reason": "Low severity; CONTRACT \u00a710 defines no bootstrap-rotation action and the candidate conforms to the frozen contract. Documented in the verification report; candidate for a future additive audit event."
+    },
+    {
+      "id": "F2",
+      "scenario": "A10",
+      "expected": "capability creation can express enabled=false",
+      "observed": "POST /admin/capabilities always creates enabled=true; disable must follow via PATCH",
+      "reproduction": "POST /api/v1/admin/capabilities with enabled=false -> created capability enabled=true",
+      "severity": "nonblocking",
+      "relation": "related",
+      "status": "deferred",
+      "defer_reason": "Low severity contract gap: the bool field cannot distinguish omitted from false; PATCH to disable works. Documented in the verification report."
+    },
+    {
+      "id": "F3",
+      "scenario": "A5",
+      "expected": "lease approval revalidates agent status",
+      "observed": "approve revalidates capability-enabled + provider-active only (CONTRACT \u00a74); a suspended agent cannot fetch credentials (403) but its old approved lease can become active again after reactivation until TTL",
+      "reproduction": "suspend agent; admin approves its pending lease; reactivate; agent fetches credential until lease expiry",
+      "severity": "nonblocking",
+      "relation": "related",
+      "status": "deferred",
+      "defer_reason": "CONTRACT \u00a74 explicitly lists only capability/provider revalidation; residual risk documented in SECURITY/VERIFICATION. Candidate for a future additive 409 on suspended-agent approval."
+    }
+  ],
   "blockers": [],
-  "next_action": "Commit the integrated candidate, then spawn the independent verifier for A1-A16, demo, security probes and browser E2E.",
+  "next_action": "Delivered. Evidence: changes/cloud-safeguard-v0.1/evidence/ (report, screenshots, raw logs, repro scripts). Low-severity findings F1-F3 deferred with reasons; environmental NOT RUN items (live Alibaba STS success path, default :8787 bind) documented in the report.",
   "started_at": "2026-11-08T13:34:06Z",
-  "first_working_at": null,
-  "delivered_at": null
+  "first_working_at": "2026-11-08T13:51:00Z",
+  "delivered_at": "2026-11-08T14:16:42Z"
 }

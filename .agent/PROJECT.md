@@ -5,22 +5,32 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 
 ## Now
 
-- **Stage:** evaluate (implementation complete, independent verification in flight).
+- **Stage:** complete (delivered 2026-11-08; independent verification PASS).
 - **North star:** an AI agent gets least-privilege, time-boxed cloud access in seconds
   without ever holding a long-lived AK/SK; risky access needs one human approval; every
   lease and cloud API call is auditable; rotating the broker credential touches one place.
 - **Accepted implementation:** `docs/SPEC.md` §3 scope built per `docs/CONTRACT.md`:
-  core control plane (store/vault/policy/audit/API/sweeper/init), Aliyun STS + mock
-  provider, capability catalog, mock cloud, `csg` CLI, `scripts/demo.sh`, embedded React
-  console (8 pages), and the docs suite. All worker task reports are in; combined checks
-  green on the integrated tree (`gofmt`, `go vet`, `go build`, `go test ./...`,
-  `go test -race` core packages, web typecheck/build, `make build`, demo S1–S8 8/8).
-- **In flight:** independent verifier (task-5) running A1–A16, demo, security probes,
-  Playwright console E2E and docs accuracy against the committed candidate; verifier
-  report lands in `docs/VERIFICATION.md`.
-- **Blocked:** none.
-- **Next:** triage verifier findings (route code fixes to owning workers), re-run combined
-  checks, finalize delivery record + evidence, present final demo/screenshots.
+  Go control plane (SQLite store, AES-256-GCM vault, explainable policy engine, lease
+  lifecycle + sweeper, agent/admin REST API, init/demo seed), Alibaba Cloud STS signer
+  (in-tree RPC v1) + mock provider/cloud, 5 built-in capabilities, `csg` CLI,
+  `scripts/demo.sh` (S1-S8), embedded 8-page React console, docs suite.
+- **Verification:** independent verifier on freshly cloned candidate `a509c1c`
+  (product content unchanged by the later evidence-only commit) — PASS on verifiable
+  A1-A16 scope: 164 PASS / 0 FAIL black-box probes, demo 8/8 twice, console Playwright
+  34/34 with 0 console errors, 48 documented commands executed, secret-at-rest/log/bundle
+  scans clean, audit tamper detected. Low findings F1-F3 (bootstrap rotation not audited,
+  capability-create enabled default, approve does not recheck agent status) are recorded
+  as nonblocking/deferred. Environmental NOT RUN: live Alibaba STS success path (no cloud
+  credentials; signer unit-tested against golden vector + fake STS endpoint) and the
+  default :8787 bind (port held by an unrelated process; all other A2 properties verified).
+- **Canonical delivery record:** `changes/cloud-safeguard-v0.1/delivery.json` — complete
+  assessment PASS (`arvey-develop delivery check --phase complete`, 16/16 behavior,
+  5/5 checks, target/runtime/review recorded; source:v2:sha256:195530e5..., tested
+  revision a509c1c). Evidence lives in `changes/cloud-safeguard-v0.1/evidence/`
+  (report, screenshots, raw logs, repro scripts, deployment receipt); it is intentionally
+  outside the product source identity (delivery-tooling evidence dir).
+- **Blocked:** none. Future work (not v0.1): credential-free proxy mode, per-parameter
+  grant constraints, chat approvals, multi-cloud, SSO/multi-tenant (see README roadmap).
 
 ## Next useful delivery
 
@@ -32,14 +42,14 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 - **Non-goals / boundaries:** multi-tenant/SaaS, SSO, credential-free API proxy, non-Alibaba
   providers, K8s/HA deployment, chat approvals (all roadmap, see SPEC §3).
 - **Target kind / environment / surface:** local dev artifact on this macOS machine
-  (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console.
+  (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console (target surface = api; browser E2E covers the console).
   No production deployment requested.
 - **Address / artifact:** `bin/csg` (single binary), demo on `http://127.0.0.1:18787`.
 - **Final demo:** `make demo` → S1–S8 pass; console screenshots captured by verifier.
 - **Evidence / review:** `scripts/demo.sh` transcript, `go test ./...`, `npm run build`,
-  verifier report `docs/VERIFICATION.md`, cross-family independent review (`arvey-develop
-  review run` or verifier teammate).
-- **Next action:** integrate parallel work; then independent verification.
+  verifier report `changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md`, canonical
+  `arvey-develop delivery check --phase complete` PASS.
+- **Next action:** delivered; no open workstreams or blockers.
 
 ## Existing commands
 
@@ -68,8 +78,9 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 - Canonical instructions: `AGENTS.md`; product spec: `docs/SPEC.md`; contract:
   `docs/CONTRACT.md`; shared types: `internal/model/model.go`.
 - Ownership map: `docs/SPEC.md` §8; frozen signatures: `docs/CONTRACT.md` §13.
-- Evidence: `docs/VERIFICATION.md` (verifier), demo transcript, test output; screenshots
-  under `docs/screenshots/`.
+- Evidence: `changes/cloud-safeguard-v0.1/evidence/` — independent verification report,
+  screenshots (12), build/demo/probe/console/docs logs, repro scripts, deployment receipt;
+  canonical delivery record `changes/cloud-safeguard-v0.1/delivery.json`.
 - Working notes: `.agent/scratch/` (gitignored).
 
 ## Actual constraints
