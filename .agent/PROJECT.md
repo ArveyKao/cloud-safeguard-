@@ -29,6 +29,30 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   revision a509c1c). Evidence lives in `changes/cloud-safeguard-v0.1/evidence/`
   (report, screenshots, raw logs, repro scripts, deployment receipt); it is intentionally
   outside the product source identity (delivery-tooling evidence dir).
+- **Agent roles + IAM prohibition (2026-11-09, branch `feat/agent-roles`, CONTRACT §16,
+  ADR-014):** integrated in the main checkout, not committed. Five cross-family (dsh) security
+  reviews; every finding fixed with a regression test proven to fail without its fix. Combined
+  checks on the merged tree: gofmt, vet, `go test ./...`, `go test -race ./internal/...` (8/8),
+  web typecheck + build (web/dist regenerated), demo S1-S9 9/9, live console check against the
+  real backend (roles, role-limited grants, access labels; no console errors). Known/deferred:
+  D4 access-raise vs concurrent grant (low; role check still blocks any credential); console
+  L1 retired-capability checkbox in the detail drawer (low; superseded by the redesign). Docs
+  outside CONTRACT/DECISIONS not yet updated.
+- **Role change (owner's instruction, 2026-11-09):** the owner asked Claude (Lead) to implement
+  the security-critical code itself: IAM prohibition/policy rendering, role enforcement and
+  approval rechecks, migrations, and §17 authentication, request verification and approval.
+  Workers keep console, CLI, MCP client, demo and docs. Every change, including Lead's, gets a
+  cross-family review. This overrides the "owner does not edit product code" rule for those areas.
+- **Accepted next:** supervisors bind people to cloud accounts with a role; agents inherit
+  their owner's role; requests carry read/write/full plus a required validity period; read is
+  automatic, write and full wait for the owner's approval; agent-first sign-in and MCP server
+  (CONTRACT §17, ADR-015). Accepted 2026-11-09, revised by the owner 2026-11-10; starts after
+  §16 merges. This removes the §16 agent role, grants and `aliyun.account.admin`.
+- **§17 progress (2026-11-10):** identity foundation built by Lead and verified locally:
+  `internal/authn` (Argon2id, TOTP), schema v3 (persons, role_bindings, sessions), session
+  login with CSRF, supervisor API for people and bindings, first supervisor in `csg init`,
+  `csg supervisor recover`. Adds `golang.org/x/crypto`. Not yet cross-family reviewed, and
+  bindings are not yet enforced on agent requests. Status table: CONTRACT §17.8.
 - **Blocked:** none. Future work (not v0.1): credential-free proxy mode, per-parameter
   grant constraints, chat approvals, multi-cloud, SSO/multi-tenant (see README roadmap).
 

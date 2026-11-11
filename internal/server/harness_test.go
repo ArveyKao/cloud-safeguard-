@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arveykao/cloud-safeguard/internal/authn"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
 	"github.com/arveykao/cloud-safeguard/internal/store"
@@ -55,9 +56,19 @@ type fakeMinter struct {
 	fail     error
 	requests []provider.MintRequest
 	seq      int
+	// onMint, when set, runs at the start of Mint without the lock held. Tests
+	// use it to change control-plane state between the authorization checks and
+	// the final activation write, reproducing a concurrent revoke or demotion.
+	onMint func(req provider.MintRequest)
 }
 
 func (m *fakeMinter) Mint(ctx context.Context, req provider.MintRequest) (model.Credential, error) {
+	m.mu.Lock()
+	hook := m.onMint
+	m.mu.Unlock()
+	if hook != nil {
+		hook(req)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.requests = append(m.requests, req)
@@ -117,6 +128,8 @@ type testEnv struct {
 	agentTokens map[string]string
 	agentIDs    map[string]string
 	providerID  string
+	// supervisor is the bootstrap supervisor with its one-time setup code.
+	supervisor *model.PersonWithSetupCode
 }
 
 // newTestEnv bootstraps a data dir (optionally with the demo seed) and starts a
@@ -134,6 +147,8 @@ func newTestEnv(t *testing.T, demo bool) *testEnv {
 		Addr:    "127.0.0.1:0",
 		DataDir: dir,
 		Now:     clock.Now,
+		// Cheap Argon2id so the suite stays fast; production uses the defaults.
+		PasswordParams: &authn.Params{MemoryKiB: 64, Time: 1, Threads: 1, SaltLen: 16, KeyLen: 32},
 		MinterFactory: func(p model.Provider) (provider.Minter, error) {
 			return minter, nil
 		},
@@ -159,6 +174,7 @@ func newTestEnv(t *testing.T, demo bool) *testEnv {
 		logs:        logs,
 		agentTokens: map[string]string{},
 		agentIDs:    map[string]string{},
+		supervisor:  initRes.Supervisor,
 	}
 	for _, agent := range initRes.Agents {
 		env.agentTokens[agent.Name] = agent.Token

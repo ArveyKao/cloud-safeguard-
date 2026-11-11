@@ -326,6 +326,79 @@ part of the product's value).
 
 ---
 
+## ADR-014 — Three agent roles and an absolute IAM prohibition
+
+**Context.** Hand-picking capabilities per agent is precise but unfriendly, and nothing in
+v0.1 stopped an agent reaching IAM: `aliyun.iam.break_glass` allowed `Action: "*"`, custom
+capability templates were not inspected, and approval did not recheck the agent.
+
+**Decision.** Agents hold one role: `guest` (read), `member` (read + write) or
+`administrator` (account-wide except IAM). The role is a ceiling on which capabilities an
+agent may request; risk tiers still decide whether a human must approve. No role can request
+or use IAM management: the ban is enforced when a capability is defined, on every policy
+evaluation, at approval, and by a Deny statement added to every rendered policy. Normative
+detail is CONTRACT §16. Partly supersedes ADR-004 (adds rules) and replaces the
+`aliyun.iam.break_glass` capability from CONTRACT §7. ADR-013 still stands: roles apply to
+agents, and humans keep the single admin token.
+
+**Consequences.**
+- Setup is a choice of one role, and leases stay short-lived and task-scoped.
+- IAM changes happen outside the platform, by a human in the cloud console, emergencies
+  included.
+- On a real cloud only the RAM role's own policy holds if the control plane is compromised,
+  so the setup guide must keep RAM out of it; the platform cannot verify that.
+- Indirect escalation is not stopped: running commands on an instance that has a RAM role, or
+  using a service that acts through its own role.
+
+**Alternatives.** Replacing capabilities with one broad policy per role (rejected: gives up
+least privilege); one RAM role per agent role (deferred: cloud-enforced, but heavier setup and
+needs provider changes); a configurable ban (rejected: anyone with the admin token could lift
+it).
+
+---
+
+## ADR-015 — Supervisors bind people to cloud accounts; agents inherit their owner's role
+
+**Status.** Accepted 2026-11-09, revised 2026-11-10 before any implementation. Supersedes
+ADR-013 (single admin token) and ADR-011 (first provider wins) once it ships, and replaces the
+agent role and grants of ADR-014 (the IAM prohibition of ADR-014 stays).
+
+**Context.** Teams need to know which person is behind each agent, and one person often needs
+different rights on different cloud accounts. The planned MCP server needs a request shape a
+person can reason about: which account, what resource, what permission, for how long. The
+project owner also wants the platform simple: a few supervisors set it up, everyone else only
+signs in and approves.
+
+**Decision.** Human accounts with password + TOTP. Supervisors (a platform flag, not a cloud
+role) add cloud accounts and bind people to them as guest, member or administrator. Every agent
+is owned by one person and inherits that person's role on each account, read live at every
+request. Requests name the cloud account, resource type, permission (`read`, `write`, `full`)
+and a required validity period, and map onto vetted templates. `read` is issued automatically;
+`write` (change existing resources, including items inside them) and `full` (create and delete
+resources) wait for the owner's approval. Normative detail: CONTRACT §17.
+
+**Consequences.**
+- Every lease is attributable to a person; access can differ per account; revoking a person
+  revokes their agents.
+- Adds password and TOTP handling, sessions and CSRF protection: new security surface and one
+  dependency (`golang.org/x/crypto`), relaxing ADR-001's standard-library rule.
+- Requests without a validity period are rejected, so callers must choose a duration.
+- Every change to the cloud needs a human click, so unattended agents can only read.
+- The owner approves their own agent; there is no second-person check. The account-wide
+  emergency capability is retired, which removes the case that most needed one.
+- Each template action must be classified as read, write or full. Unclassified actions count as
+  full, so a new template is safe by default but may need an administrator until classified.
+
+**Alternatives.** Global per-person roles (rejected: the owner wants rights per account); a
+separate role per agent, capped by the owner (rejected 2026-11-10: more to configure for little
+gain); a second administrator approving risky requests (rejected 2026-11-10: slower, and the
+owner is the accountable person); counting items inside a resource as create/delete (rejected:
+members could not do routine work such as DNS record updates); SSO/OIDC first (deferred: needs
+an external identity provider); free-text IAM actions in requests (rejected: agents would write
+their own policies and the IAM ban would be harder to guarantee).
+
+---
+
 ## How decisions change
 
 1. Propose the change to the Lead (contract/persistence/security changes affect SPEC or

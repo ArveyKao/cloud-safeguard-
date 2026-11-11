@@ -162,6 +162,7 @@ interface DrawerProps {
   children: ReactNode
   footer?: ReactNode
   labelledBy?: string
+  dismissible?: boolean
 }
 
 export function Drawer({
@@ -172,9 +173,10 @@ export function Drawer({
   children,
   footer,
   labelledBy,
+  dismissible = true,
 }: DrawerProps) {
   const dialogRef = useRef<HTMLDivElement>(null)
-  useDialogBehavior({ open, onClose, dismissible: true, dialogRef })
+  useDialogBehavior({ open, onClose, dismissible, dialogRef })
 
   if (!open) return null
   const titleId = labelledBy ?? 'drawer-title'
@@ -183,7 +185,7 @@ export function Drawer({
     <div
       className="drawer-overlay"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose()
+        if (dismissible && event.target === event.currentTarget) onClose()
       }}
     >
       <div
@@ -201,14 +203,16 @@ export function Drawer({
             </h2>
             {subtitle && <div className="drawer__subtitle">{subtitle}</div>}
           </div>
-          <button
-            type="button"
-            className="btn btn--icon btn--ghost"
-            onClick={onClose}
-            aria-label="Close panel"
-          >
-            <IconX size={17} />
-          </button>
+          {dismissible && (
+            <button
+              type="button"
+              className="btn btn--icon btn--ghost"
+              onClick={onClose}
+              aria-label="Close panel"
+            >
+              <IconX size={17} />
+            </button>
+          )}
         </header>
         <div className="drawer__body">{children}</div>
         {footer && <footer className="drawer__footer">{footer}</footer>}

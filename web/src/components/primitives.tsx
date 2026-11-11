@@ -2,8 +2,17 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import type { ButtonHTMLAttributes, ReactNode } from 'react'
 import { ApiError } from '../api/client'
-import type { Capability, Lease, LeaseStatus, ProviderMode, RiskTier, Severity } from '../api/types'
-import { RISK_ORDER } from '../api/types'
+import type {
+  AccessLevel,
+  AgentRole,
+  Capability,
+  Lease,
+  LeaseStatus,
+  ProviderMode,
+  RiskTier,
+  Severity,
+} from '../api/types'
+import { AGENT_ROLE_COPY, RISK_ORDER } from '../api/types'
 import { cx, titleCase } from '../lib/format'
 import { IconAlert, IconCheck, IconCopy, IconInfo, IconX } from './icons'
 
@@ -208,6 +217,41 @@ export function StatusBadge({ status }: { status: string }) {
   const allowed = ['active', 'suspended', 'revoked', 'disabled']
   const cls = allowed.includes(status) ? status : 'neutral'
   return <span className={cx('badge', 'badge--dot', `badge--${cls}`)}>{titleCase(status)}</span>
+}
+
+const ROLE_BADGE_CLASS: Record<AgentRole, string> = {
+  guest: 'badge--neutral',
+  member: 'badge--sky',
+  administrator: 'badge--critical',
+}
+
+export function RoleBadge({ role }: { role: AgentRole }) {
+  const copy = AGENT_ROLE_COPY[role]
+  return (
+    <span
+      className={cx('badge', 'badge--dot', ROLE_BADGE_CLASS[role])}
+      title={copy?.summary ?? role}
+    >
+      {copy?.label ?? titleCase(role)}
+    </span>
+  )
+}
+
+const ACCESS_BADGE_CLASS: Record<AccessLevel, string> = {
+  read: 'badge--active',
+  write: 'badge--medium',
+  admin: 'badge--critical',
+}
+
+export function AccessBadge({ access }: { access: AccessLevel }) {
+  return (
+    <span
+      className={cx('badge', 'badge--dot', ACCESS_BADGE_CLASS[access])}
+      title={`Access level: ${access}`}
+    >
+      {access}
+    </span>
+  )
 }
 
 export function OutcomeIcon({ outcome }: { outcome: string }) {

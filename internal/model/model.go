@@ -65,6 +65,124 @@ func ParseRiskTier(s string) (RiskTier, bool) {
 	return r, r.Valid()
 }
 
+// AgentRole is the coarse-grained role of an agent identity (CONTRACT §16.1).
+// Roles apply to agents only: the operator/admin token is not a role.
+//
+// A role permits a set of capability access levels:
+//
+//	guest         -> read
+//	member        -> read, write
+//	administrator -> read, write, admin
+type AgentRole string
+
+const (
+	RoleGuest         AgentRole = "guest"
+	RoleMember        AgentRole = "member"
+	RoleAdministrator AgentRole = "administrator"
+)
+
+// Valid reports whether the role is one of the known values.
+func (r AgentRole) Valid() bool {
+	switch r {
+	case RoleGuest, RoleMember, RoleAdministrator:
+		return true
+	}
+	return false
+}
+
+// Rank maps a role to an ordered integer: guest=1, member=2, administrator=3.
+// Unknown roles rank 0.
+func (r AgentRole) Rank() int {
+	switch r {
+	case RoleGuest:
+		return 1
+	case RoleMember:
+		return 2
+	case RoleAdministrator:
+		return 3
+	}
+	return 0
+}
+
+// Permits reports whether the role permits the given capability access level.
+// An invalid role or access level never permits anything (fail closed).
+func (r AgentRole) Permits(access AccessLevel) bool {
+	if !r.Valid() || !access.Valid() {
+		return false
+	}
+	return r.Rank() >= access.Rank()
+}
+
+// ParseAgentRole parses a role string. It accepts the canonical lowercase
+// values only; callers should normalize user input first.
+func ParseAgentRole(s string) (AgentRole, bool) {
+	r := AgentRole(s)
+	return r, r.Valid()
+}
+
+// AgentRoles returns the known roles in ascending order of privilege.
+func AgentRoles() []AgentRole { return []AgentRole{RoleGuest, RoleMember, RoleAdministrator} }
+
+// LowestRolePermitting returns the least privileged role that permits every
+// given access level. It returns guest for an empty list, and false when an
+// access level is invalid (no role can cover it).
+func LowestRolePermitting(accesses []AccessLevel) (AgentRole, bool) {
+	role := RoleGuest
+	for _, a := range accesses {
+		if !a.Valid() {
+			return RoleGuest, false
+		}
+		for _, candidate := range AgentRoles() {
+			if candidate.Permits(a) {
+				if candidate.Rank() > role.Rank() {
+					role = candidate
+				}
+				break
+			}
+		}
+	}
+	return role, true
+}
+
+// AccessLevel is the kind of cloud access a capability grants (CONTRACT §16.1).
+type AccessLevel string
+
+const (
+	AccessRead  AccessLevel = "read"
+	AccessWrite AccessLevel = "write"
+	AccessAdmin AccessLevel = "admin"
+)
+
+// Valid reports whether the access level is one of the known values.
+func (a AccessLevel) Valid() bool {
+	switch a {
+	case AccessRead, AccessWrite, AccessAdmin:
+		return true
+	}
+	return false
+}
+
+// Rank maps an access level to an ordered integer: read=1, write=2, admin=3.
+// Unknown levels rank 0.
+func (a AccessLevel) Rank() int {
+	switch a {
+	case AccessRead:
+		return 1
+	case AccessWrite:
+		return 2
+	case AccessAdmin:
+		return 3
+	}
+	return 0
+}
+
+// ParseAccessLevel parses an access level string. It accepts the canonical
+// lowercase values only; callers should normalize user input first.
+func ParseAccessLevel(s string) (AccessLevel, bool) {
+	a := AccessLevel(s)
+	return a, a.Valid()
+}
+
 // ProviderType is the cloud vendor family of a provider.
 type ProviderType string
 
@@ -172,6 +290,10 @@ type Capability struct {
 	// ProviderType must match the leased provider's Type.
 	ProviderType ProviderType `json:"provider_type"`
 	Risk         RiskTier     `json:"risk"`
+	// Access is the kind of cloud access this capability grants. It gates which
+	// agent roles may request it (CONTRACT §16.1) and how strictly the IAM
+	// prohibition inspects the rendered policy (§16.3).
+	Access AccessLevel `json:"access"`
 	// PolicyTemplate is a JSON IAM policy document that may contain
 	// {{placeholder}} references to capability params, e.g.
 	// "acs:alidns:*:*:domain/{{domain}}".
@@ -208,7 +330,11 @@ type Agent struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	Status      AgentStatus `json:"status"`
-	// Grants are capability IDs this agent may request.
+	// Role is the agent's role. It bounds which capability access levels the
+	// agent may hold and request (CONTRACT §16.1).
+	Role AgentRole `json:"role"`
+	// Grants are capability IDs this agent may request. They are always a subset
+	// of the capabilities the role permits.
 	Grants []string `json:"grants"`
 	// MaxTTLSeconds caps any single lease this agent may hold.
 	MaxTTLSeconds int `json:"max_ttl_seconds"`
@@ -223,8 +349,12 @@ type Agent struct {
 
 // CreateAgentInput is the admin request body for POST /admin/agents.
 type CreateAgentInput struct {
-	Name                string   `json:"name"`
-	Description         string   `json:"description"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Role is optional and defaults to guest.
+	Role AgentRole `json:"role,omitempty"`
+	// Grants is optional: omitted or empty means "every enabled capability the
+	// role permits at creation time".
 	Grants              []string `json:"grants"`
 	MaxTTLSeconds       int      `json:"max_ttl_seconds"`
 	MaxConcurrentLeases int      `json:"max_concurrent_leases"`
@@ -232,8 +362,12 @@ type CreateAgentInput struct {
 
 // UpdateAgentInput is the admin request body for PATCH /admin/agents/{id}.
 type UpdateAgentInput struct {
-	Name                *string      `json:"name,omitempty"`
-	Description         *string      `json:"description,omitempty"`
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
+	// Role changes the agent's role. Without grants, a role change resets the
+	// grants to every enabled capability the new role permits, and revokes the
+	// agent's pending/active leases the new role no longer permits.
+	Role                *AgentRole   `json:"role,omitempty"`
 	Grants              *[]string    `json:"grants,omitempty"`
 	MaxTTLSeconds       *int         `json:"max_ttl_seconds,omitempty"`
 	MaxConcurrentLeases *int         `json:"max_concurrent_leases,omitempty"`

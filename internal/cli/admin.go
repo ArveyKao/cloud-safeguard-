@@ -58,6 +58,7 @@ func (a *App) runCapsList(args []string) error {
 		rows = append(rows, []string{
 			c.ID,
 			c.Name,
+			string(c.Access),
 			string(c.Risk),
 			formatSeconds(c.DefaultTTLSeconds),
 			formatSeconds(c.MaxTTLSeconds),
@@ -65,7 +66,7 @@ func (a *App) runCapsList(args []string) error {
 			yesNo(c.Builtin),
 		})
 	}
-	writeTable(a.Stdout, []string{"ID", "NAME", "RISK", "DEFAULT_TTL", "MAX_TTL", "ENABLED", "BUILTIN"}, rows)
+	writeTable(a.Stdout, []string{"ID", "NAME", "ACCESS", "RISK", "DEFAULT_TTL", "MAX_TTL", "ENABLED", "BUILTIN"}, rows)
 	return nil
 }
 
@@ -108,6 +109,7 @@ func printCapability(w io.Writer, c model.Capability) {
 	fmt.Fprintf(w, "name:         %s\n", c.Name)
 	fmt.Fprintf(w, "description:  %s\n", c.Description)
 	fmt.Fprintf(w, "provider:     %s\n", c.ProviderType)
+	fmt.Fprintf(w, "access:       %s\n", c.Access)
 	fmt.Fprintf(w, "risk:         %s\n", c.Risk)
 	fmt.Fprintf(w, "enabled:      %s\n", yesNo(c.Enabled))
 	fmt.Fprintf(w, "builtin:      %s\n", yesNo(c.Builtin))
@@ -135,7 +137,7 @@ func printCapability(w io.Writer, c model.Capability) {
 // runAgents implements `csg agents ...` (admin).
 func (a *App) runAgents(args []string) error {
 	if len(args) == 0 {
-		return usagef("agents requires a subcommand: list | get ID | create | suspend ID | activate ID | rotate-token ID")
+		return usagef("agents requires a subcommand: list | get ID | create | set-role ID ROLE | suspend ID | activate ID | rotate-token ID")
 	}
 	switch args[0] {
 	case "list":
@@ -144,6 +146,8 @@ func (a *App) runAgents(args []string) error {
 		return a.runAgentsGet(args[1:])
 	case "create":
 		return a.runAgentsCreate(args[1:])
+	case "set-role":
+		return a.runAgentsSetRole(args[1:])
 	case "suspend":
 		return a.runAgentsStatus(args[1:], "suspend")
 	case "activate":
@@ -187,13 +191,14 @@ func (a *App) runAgentsList(args []string) error {
 			ag.ID,
 			ag.Name,
 			string(ag.Status),
+			string(ag.Role),
 			joinOrDash(ag.Grants),
 			formatSeconds(ag.MaxTTLSeconds),
 			fmt.Sprintf("%d", ag.MaxConcurrentLeases),
 			fmtTimePtr(ag.LastSeenAt),
 		})
 	}
-	writeTable(a.Stdout, []string{"ID", "NAME", "STATUS", "GRANTS", "MAX_TTL", "MAX_CONC", "LAST_SEEN"}, rows)
+	writeTable(a.Stdout, []string{"ID", "NAME", "STATUS", "ROLE", "GRANTS", "MAX_TTL", "MAX_CONC", "LAST_SEEN"}, rows)
 	return nil
 }
 
@@ -224,11 +229,17 @@ func (a *App) runAgentsGet(args []string) error {
 }
 
 func (a *App) runAgentsCreate(args []string) error {
-	fs := a.newFlagSet("agents create", `Usage: csg agents create --name NAME [--description D] [--capability id[,id...]] [--max-ttl DUR] [--max-concurrent N] [--json]
+	fs := a.newFlagSet("agents create", `Usage: csg agents create --name NAME [--role guest|member|administrator] [--description D]
+                         [--capability id[,id...]] [--max-ttl DUR] [--max-concurrent N] [--json]
+
+The role bounds which capabilities the agent may hold: guest -> read, member ->
+read+write, administrator -> everything. Without --capability the agent is
+granted every enabled capability its role permits.
 `)
 	cf := a.addClientFlags(fs)
 	name := fs.String("name", "", "agent name (required)")
 	description := fs.String("description", "", "agent description")
+	role := fs.String("role", string(model.RoleGuest), "agent role: guest | member | administrator")
 	var grants stringSliceFlag
 	fs.Var(&grants, "capability", "capability ID to grant (repeatable, comma-separated)")
 	maxTTL := fs.String("max-ttl", "", "maximum lease TTL for this agent (e.g. 30m)")
@@ -244,6 +255,10 @@ func (a *App) runAgentsCreate(args []string) error {
 	if strings.TrimSpace(*name) == "" {
 		return usagef("agents create requires --name")
 	}
+	agentRole, err := parseAgentRole(*role)
+	if err != nil {
+		return usagef("--role: %v", err)
+	}
 	ttlSeconds, err := parseOptionalDurationSeconds(*maxTTL)
 	if err != nil {
 		return usagef("--max-ttl: %v", err)
@@ -251,6 +266,7 @@ func (a *App) runAgentsCreate(args []string) error {
 	input := model.CreateAgentInput{
 		Name:                strings.TrimSpace(*name),
 		Description:         *description,
+		Role:                agentRole,
 		Grants:              grants.values(),
 		MaxTTLSeconds:       ttlSeconds,
 		MaxConcurrentLeases: *maxConcurrent,
@@ -266,8 +282,47 @@ func (a *App) runAgentsCreate(args []string) error {
 	if *jsonOut {
 		return a.printJSON(res)
 	}
-	fmt.Fprintf(a.Stdout, "Agent created: %s (%s)\n", res.Agent.ID, res.Agent.Name)
+	fmt.Fprintf(a.Stdout, "Agent created: %s (%s, role=%s)\n", res.Agent.ID, res.Agent.Name, res.Agent.Role)
 	fmt.Fprintf(a.Stdout, "Token (shown once, store securely): %s\n", res.Token)
+	return nil
+}
+
+// runAgentsSetRole implements `csg agents set-role ID ROLE`. Changing the role
+// resets the agent's grants to the new role's default set and revokes every
+// pending or active lease the new role no longer permits (CONTRACT §16.5).
+func (a *App) runAgentsSetRole(args []string) error {
+	fs := a.newFlagSet("agents set-role", `Usage: csg agents set-role ID guest|member|administrator [--json]
+
+A demotion revokes the agent's pending and active leases that the new role no
+longer permits, and resets its grants to the new role's default set.
+`)
+	cf := a.addClientFlags(fs)
+	jsonOut := fs.Bool("json", false, "print JSON")
+	positionals, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 2 {
+		return usagef("agents set-role requires an agent ID and a role")
+	}
+	role, err := parseAgentRole(positionals[1])
+	if err != nil {
+		return usagef("%v", err)
+	}
+	client, err := a.adminClient(cf)
+	if err != nil {
+		return err
+	}
+	var ag model.Agent
+	if err := client.patch(context.Background(), apiPrefix+"/admin/agents/"+pathEscape(positionals[0]),
+		model.UpdateAgentInput{Role: &role}, &ag); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return a.printJSON(ag)
+	}
+	fmt.Fprintf(a.Stdout, "agent %s (%s) role is now %s\n", ag.ID, ag.Name, ag.Role)
+	fmt.Fprintf(a.Stdout, "grants: %s\n", joinOrDash(ag.Grants))
 	return nil
 }
 
@@ -330,6 +385,7 @@ func printAgent(w io.Writer, ag model.Agent) {
 	fmt.Fprintf(w, "name:             %s\n", ag.Name)
 	fmt.Fprintf(w, "description:      %s\n", ag.Description)
 	fmt.Fprintf(w, "status:           %s\n", ag.Status)
+	fmt.Fprintf(w, "role:             %s\n", ag.Role)
 	fmt.Fprintf(w, "grants:           %s\n", joinOrDash(ag.Grants))
 	fmt.Fprintf(w, "max ttl:          %s\n", formatSeconds(ag.MaxTTLSeconds))
 	fmt.Fprintf(w, "max concurrent:   %d\n", ag.MaxConcurrentLeases)

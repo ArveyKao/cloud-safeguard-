@@ -133,6 +133,8 @@ func (a *App) Run(args []string) int {
 		err = a.runInit(rest)
 	case "serve":
 		err = a.runServe(rest)
+	case "supervisor":
+		err = a.runSupervisor(rest)
 	case "login":
 		err = a.runLogin(rest)
 	case "whoami":
@@ -206,6 +208,7 @@ Usage: csg <command> [flags]
 Local:
   init       Bootstrap a data directory (admin token shown once)
   serve      Run the control plane and embedded console
+  supervisor recover  Restore a locked-out supervisor (run on the server host)
   version    Print the version
 
 Authentication:
@@ -214,7 +217,7 @@ Authentication:
 
 Admin:
   caps       list | show ID
-  agents     list | get ID | create | suspend ID | activate ID | rotate-token ID
+  agents     list | get ID | create | set-role ID ROLE | suspend ID | activate ID | rotate-token ID
   providers  list | get ID | add | update ID | rotate ID | test ID
   leases     list | get ID | approve ID | deny ID | revoke ID
   audit      list | verify

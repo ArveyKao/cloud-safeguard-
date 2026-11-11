@@ -25,15 +25,26 @@ const (
 	MetaPolicySettings   = "policy_settings"
 )
 
-// currentSchemaVersion is the schema version this binary writes and expects.
-const currentSchemaVersion = 1
+// CurrentSchemaVersion is the schema version this binary writes and expects.
+// It is exported because the bootstrap path records it in the meta table.
+const CurrentSchemaVersion = 3
 
-// migrations is the ordered list of schema migrations. Migration index i moves
-// the schema from version i to i+1. Statements are executed one at a time
-// inside a transaction, then the schema_version meta key is bumped.
-var migrations = [][][]string{
+// migration is one ordered schema step. Migration index i moves the schema
+// from version i to i+1.
+type migration struct {
+	// statements are DDL/DML statements executed one at a time.
+	statements []string
+	// transform is an optional data migration that needs Go logic. It runs in
+	// the same transaction, after statements.
+	transform func(ctx context.Context, tx *sql.Tx, report *MigrationReport) error
+}
+
+// migrations is the ordered list of schema migrations. Each runs inside a
+// transaction, after which the schema_version meta key is bumped. Migrations
+// are append-only: never edit a released one.
+var migrations = []migration{
 	{ // version 0 -> 1
-		{
+		statements: []string{
 			`CREATE TABLE IF NOT EXISTS meta (
 				key   TEXT PRIMARY KEY,
 				value TEXT NOT NULL
@@ -139,25 +150,85 @@ var migrations = [][][]string{
 			`CREATE INDEX IF NOT EXISTS idx_audit_severity ON audit(severity)`,
 		},
 	},
+	{ // version 1 -> 2: agent roles and capability access levels (CONTRACT §16.6)
+		statements: []string{
+			`ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE capabilities ADD COLUMN access TEXT NOT NULL DEFAULT ''`,
+		},
+		transform: migrateRolesAndAccess,
+	},
+	{ // version 2 -> 3: people, supervisors, role bindings, sessions (CONTRACT §17)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS persons (
+				id               TEXT PRIMARY KEY,
+				username         TEXT NOT NULL UNIQUE,
+				display_name     TEXT NOT NULL DEFAULT '',
+				status           TEXT NOT NULL,
+				supervisor       INTEGER NOT NULL DEFAULT 0,
+				password_hash    TEXT NOT NULL DEFAULT '',
+				totp_secret_enc  TEXT NOT NULL DEFAULT '',
+				totp_last_step   INTEGER NOT NULL DEFAULT -1,
+				setup_code_hash  TEXT NOT NULL DEFAULT '',
+				setup_expires_at INTEGER,
+				failed_logins    INTEGER NOT NULL DEFAULT 0,
+				locked_until     INTEGER,
+				last_login_at    INTEGER,
+				created_at       INTEGER NOT NULL,
+				updated_at       INTEGER NOT NULL
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_persons_setup ON persons(setup_code_hash) WHERE setup_code_hash <> ''`,
+			`CREATE TABLE IF NOT EXISTS role_bindings (
+				person_id   TEXT NOT NULL,
+				provider_id TEXT NOT NULL,
+				role        TEXT NOT NULL,
+				created_by  TEXT NOT NULL DEFAULT '',
+				created_at  INTEGER NOT NULL,
+				updated_at  INTEGER NOT NULL,
+				PRIMARY KEY (person_id, provider_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_bindings_provider ON role_bindings(provider_id)`,
+			`CREATE TABLE IF NOT EXISTS sessions (
+				token_hash   TEXT PRIMARY KEY,
+				person_id    TEXT NOT NULL,
+				csrf_token   TEXT NOT NULL,
+				created_at   INTEGER NOT NULL,
+				last_seen_at INTEGER NOT NULL,
+				expires_at   INTEGER NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_sessions_person ON sessions(person_id)`,
+		},
+	},
 }
 
-// applyMigrations brings the database schema up to currentSchemaVersion. It is
+// applyMigrations brings the database schema up to CurrentSchemaVersion. It is
 // idempotent: running it on an up-to-date database is a no-op.
 func (db *DB) applyMigrations(ctx context.Context) error {
 	version, err := db.schemaVersion(ctx)
 	if err != nil {
 		return err
 	}
-	if version > currentSchemaVersion {
-		return fmt.Errorf("store: database schema version %d is newer than supported version %d", version, currentSchemaVersion)
+	if version > CurrentSchemaVersion {
+		return fmt.Errorf("store: database schema version %d is newer than supported version %d", version, CurrentSchemaVersion)
 	}
-	for v := version; v < currentSchemaVersion; v++ {
+	var report *MigrationReport
+	if version > 0 && version < CurrentSchemaVersion {
+		// Only an upgrade of an existing database is reported; a fresh
+		// database (version 0) has no rows to change.
+		report = &MigrationReport{FromVersion: version, ToVersion: CurrentSchemaVersion}
+	}
+	for v := version; v < CurrentSchemaVersion; v++ {
 		tx, err := db.sql.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("store: begin migration %d: %w", v+1, err)
 		}
-		for _, stmt := range migrations[v][0] {
+		for _, stmt := range migrations[v].statements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: migration %d: %w", v+1, err)
+			}
+		}
+		if migrations[v].transform != nil {
+			if err := migrations[v].transform(ctx, tx, report); err != nil {
 				tx.Rollback()
 				return fmt.Errorf("store: migration %d: %w", v+1, err)
 			}
@@ -174,6 +245,7 @@ func (db *DB) applyMigrations(ctx context.Context) error {
 			return fmt.Errorf("store: commit migration %d: %w", v+1, err)
 		}
 	}
+	db.migration = report
 	return nil
 }
 

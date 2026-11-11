@@ -163,6 +163,17 @@ func validateCreateRecord(in dnsCreateRecordInput) (dnsRecord, *cloudError) {
 	return dnsRecord{RR: name, Type: recordType, Value: value, TTL: ttl}, nil
 }
 
+// ---- RAM handlers ----
+
+// handleRAMListUsers implements GET /v1/ram/users. It is only ever reached by a
+// credential whose policy allows ram:ListUsers, which the control plane never
+// mints: RenderPolicy appends an explicit deny for ram:* to every document.
+func handleRAMListUsers(h *handler, _ *http.Request, _ *authContext) (int, map[string]any, *cloudError) {
+	return http.StatusOK, map[string]any{
+		"Users": map[string]any{"User": h.state.listRAMUsers()},
+	}, nil
+}
+
 // ---- error helpers ----
 
 // errInstanceNotFound is the Aliyun-shaped 404 for an unknown ECS instance.

@@ -147,10 +147,26 @@ function appendAudit({
 /* Seed: capability catalog (docs/CONTRACT.md §7)                      */
 /* ------------------------------------------------------------------ */
 
+const ACCESS_RANK = { read: 1, write: 2, admin: 3 }
+const ROLE_MAX_ACCESS = { guest: 'read', member: 'write', administrator: 'admin' }
+const VALID_ROLES = new Set(['guest', 'member', 'administrator'])
+const VALID_ACCESS = new Set(['read', 'write', 'admin'])
+
+function rolePermitsAccess(role, access) {
+  return ACCESS_RANK[access] <= ACCESS_RANK[ROLE_MAX_ACCESS[role]]
+}
+
+function defaultGrantsForRole(role) {
+  return state.capabilities
+    .filter((capability) => capability.enabled && rolePermitsAccess(role, capability.access))
+    .map((capability) => capability.id)
+}
+
 function seedCapability({
   id: capabilityId,
   name,
   risk,
+  access,
   description,
   defaultTtl,
   maxTtl,
@@ -164,6 +180,7 @@ function seedCapability({
     description,
     provider_type: 'aliyun',
     risk,
+    access,
     policy_template: JSON.stringify(policy),
     params,
     default_ttl_seconds: defaultTtl,
@@ -179,6 +196,7 @@ seedCapability({
   id: 'aliyun.cloud.read',
   name: 'Cloud read-only inventory',
   risk: 'low',
+  access: 'read',
   description:
     'List ECS instances, DNS zones and records, and verify the caller identity. Read-only and safe for unattended agents.',
   defaultTtl: 900,
@@ -199,6 +217,7 @@ seedCapability({
   id: 'aliyun.dns.manage',
   name: 'Manage DNS records for one domain',
   risk: 'medium',
+  access: 'write',
   description:
     'Create, update and delete DNS records inside a single domain, for certificate challenges and host cutovers.',
   defaultTtl: 900,
@@ -233,6 +252,7 @@ seedCapability({
   id: 'aliyun.cert.dns01',
   name: 'ACME DNS-01 challenge token for one domain',
   risk: 'medium',
+  access: 'write',
   description:
     'Write the single TXT record needed for a certificate challenge, scoped to one domain.',
   defaultTtl: 600,
@@ -261,6 +281,7 @@ seedCapability({
   id: 'aliyun.ecs.instance.ops',
   name: 'Start/stop/restart one ECS instance',
   risk: 'high',
+  access: 'write',
   description:
     'Power operations on exactly one ECS instance. Requires human approval because it can interrupt production.',
   defaultTtl: 900,
@@ -286,11 +307,12 @@ seedCapability({
 })
 
 seedCapability({
-  id: 'aliyun.iam.break_glass',
-  name: 'Emergency account-wide access (break-glass)',
+  id: 'aliyun.account.admin',
+  name: 'Emergency account-wide access, IAM excluded',
   risk: 'critical',
+  access: 'admin',
   description:
-    'AdministratorAccess-equivalent session for a declared emergency. Always requires break-glass flag and human approval; critical-severity audit.',
+    'Account-wide emergency access for a declared incident. Always requires break-glass flag and human approval; critical-severity audit. IAM and RAM remain denied.',
   defaultTtl: 900,
   maxTtl: 1800,
   policy: {
@@ -327,12 +349,13 @@ const agentClaude = {
   name: 'claude-code',
   description: 'Primary coding agent (Claude Code compatible)',
   status: 'active',
+  role: 'administrator',
   grants: [
     'aliyun.cloud.read',
     'aliyun.dns.manage',
     'aliyun.cert.dns01',
     'aliyun.ecs.instance.ops',
-    'aliyun.iam.break_glass',
+    'aliyun.account.admin',
   ],
   max_ttl_seconds: 3600,
   max_concurrent_leases: 3,
@@ -347,6 +370,7 @@ const agentHermes = {
   name: 'hermes-researcher',
   description: 'Read-only research agent',
   status: 'active',
+  role: 'guest',
   grants: ['aliyun.cloud.read'],
   max_ttl_seconds: 900,
   max_concurrent_leases: 1,
@@ -466,14 +490,14 @@ seedLease({
 seedLease({
   id: 'lea_c93d8e11a204',
   agent_id: claudeId,
-  capability_id: 'aliyun.iam.break_glass',
+  capability_id: 'aliyun.account.admin',
   reason: 'Emergency containment: deploy credentials were leaked in a build log.',
   requested_ttl_seconds: 900,
   effective_ttl_seconds: 900,
   status: 'pending',
   break_glass: true,
   decision: decision('require_approval', 900, [
-    ...baseRules('aliyun.iam.break_glass', agentClaude, 900).map((reason) =>
+    ...baseRules('aliyun.account.admin', agentClaude, 900).map((reason) =>
       reason.rule === 'break_glass_required'
         ? { rule: 'break_glass_required', outcome: 'allow', detail: 'break_glass flag set' }
         : reason,
@@ -589,7 +613,7 @@ seedLease({
 seedLease({
   id: 'lea_0f5a9c3d7e21',
   agent_id: claudeId,
-  capability_id: 'aliyun.iam.break_glass',
+  capability_id: 'aliyun.account.admin',
   reason: 'Break-glass approved for the suspected key leak; access window now closed by operator.',
   requested_ttl_seconds: 900,
   effective_ttl_seconds: 900,
@@ -598,7 +622,7 @@ seedLease({
   approved_by: 'admin',
   approval_note: 'Emergency window approved — incident INC-2041.',
   revoke_reason: 'break-glass window closed by operator after containment',
-  decision: decision('require_approval', 900, baseRules('aliyun.iam.break_glass', agentClaude, 900)),
+  decision: decision('require_approval', 900, baseRules('aliyun.account.admin', agentClaude, 900)),
   created_at: iso(-55 * 60_000),
   approved_at: iso(-54 * 60_000),
   issued_at: iso(-54 * 60_000),
@@ -727,7 +751,7 @@ appendAudit({
   target_type: 'lease',
   target_id: 'lea_0f5a9c3d7e21',
   severity: 'critical',
-  metadata: { capability: 'aliyun.iam.break_glass', risk: 'critical', break_glass: true },
+  metadata: { capability: 'aliyun.account.admin', risk: 'critical', break_glass: true },
 })
 appendAudit({
   time: t(54),
@@ -931,7 +955,7 @@ appendAudit({
   target_type: 'lease',
   target_id: 'lea_c93d8e11a204',
   severity: 'critical',
-  metadata: { capability: 'aliyun.iam.break_glass', risk: 'critical', break_glass: true },
+  metadata: { capability: 'aliyun.account.admin', risk: 'critical', break_glass: true },
 })
 
 /* ------------------------------------------------------------------ */
@@ -1108,6 +1132,13 @@ async function handleAdmin(req, res, url, segments) {
     } catch {
       return fail(res, 400, 'invalid_request', 'policy_template must be valid JSON')
     }
+    const access =
+      body.access === undefined || body.access === '' || body.access === null
+        ? 'admin'
+        : body.access
+    if (!VALID_ACCESS.has(access)) {
+      return fail(res, 400, 'invalid_request', `invalid access: ${access}`)
+    }
     const now = new Date().toISOString()
     const capability = {
       id: id('cap'),
@@ -1115,6 +1146,7 @@ async function handleAdmin(req, res, url, segments) {
       description: body.description ?? '',
       provider_type: 'aliyun',
       risk: body.risk ?? 'low',
+      access,
       policy_template: body.policy_template,
       params: body.params ?? [],
       default_ttl_seconds: Number(body.default_ttl_seconds ?? 900),
@@ -1140,6 +1172,34 @@ async function handleAdmin(req, res, url, segments) {
     const capability = state.capabilities.find((item) => item.id === segments[1])
     if (!capability) return fail(res, 404, 'not_found', 'capability not found')
     const body = await readBody(req)
+    if (body.access !== undefined) {
+      if (!VALID_ACCESS.has(body.access)) {
+        return fail(res, 400, 'invalid_request', `invalid access: ${body.access}`)
+      }
+      if (capability.builtin) {
+        if (body.access !== capability.access) {
+          return fail(res, 400, 'invalid_request', 'cannot change access on a built-in capability')
+        }
+      } else {
+        const nextAccess = body.access
+        if (ACCESS_RANK[nextAccess] > ACCESS_RANK[capability.access]) {
+          const blocked = state.agents.filter(
+            (agent) =>
+              agent.grants.includes(capability.id) && !rolePermitsAccess(agent.role, nextAccess),
+          )
+          if (blocked.length > 0) {
+            const names = blocked.map((agent) => agent.name).join(', ')
+            return fail(
+              res,
+              400,
+              'invalid_request',
+              `cannot raise access to ${nextAccess}; granted agents whose role would not permit it: ${names}`,
+            )
+          }
+        }
+        capability.access = nextAccess
+      }
+    }
     for (const field of [
       'enabled',
       'description',
@@ -1170,12 +1230,31 @@ async function handleAdmin(req, res, url, segments) {
   if (path === 'agents' && method === 'POST') {
     const body = await readBody(req)
     if (!body.name) return fail(res, 400, 'invalid_request', 'name is required')
-    const grants = Array.isArray(body.grants) ? body.grants : []
+    const role = body.role === undefined || body.role === '' ? 'guest' : body.role
+    if (!VALID_ROLES.has(role)) {
+      return fail(res, 400, 'invalid_request', `invalid role: ${role}`)
+    }
+    let grants = Array.isArray(body.grants) ? body.grants : []
+    if (grants.length === 0) {
+      grants = defaultGrantsForRole(role)
+    }
     const missing = grants.filter(
       (grant) => !state.capabilities.some((capability) => capability.id === grant),
     )
     if (missing.length > 0) {
       return fail(res, 400, 'invalid_request', `unknown capability grants: ${missing.join(', ')}`)
+    }
+    const outOfRole = grants.filter((grant) => {
+      const capability = state.capabilities.find((item) => item.id === grant)
+      return capability && !rolePermitsAccess(role, capability.access)
+    })
+    if (outOfRole.length > 0) {
+      return fail(
+        res,
+        400,
+        'invalid_request',
+        `grants outside role ${role}: ${outOfRole.join(', ')}`,
+      )
     }
     const now = new Date().toISOString()
     const agent = {
@@ -1183,6 +1262,7 @@ async function handleAdmin(req, res, url, segments) {
       name: body.name,
       description: body.description ?? '',
       status: 'active',
+      role,
       grants,
       max_ttl_seconds: Number(body.max_ttl_seconds ?? state.settings.max_lease_ttl_seconds),
       max_concurrent_leases: Number(
@@ -1200,7 +1280,7 @@ async function handleAdmin(req, res, url, segments) {
       actor_name: 'operator',
       target_type: 'agent',
       target_id: agent.id,
-      metadata: { agent_id: agent.id, grants },
+      metadata: { agent_id: agent.id, role, grants },
     })
     const token = `csg_agt_${crypto.randomBytes(32).toString('base64url')}`
     return ok(res, { agent, token }, 201)
@@ -1251,6 +1331,15 @@ async function handleAdmin(req, res, url, segments) {
     }
     if (method === 'PATCH') {
       const body = await readBody(req)
+      const previousRole = agent.role
+      let nextRole = previousRole
+      if (body.role !== undefined) {
+        if (!VALID_ROLES.has(body.role)) {
+          return fail(res, 400, 'invalid_request', `invalid role: ${body.role}`)
+        }
+        nextRole = body.role
+      }
+      let nextGrants = agent.grants
       if (Array.isArray(body.grants)) {
         const missing = body.grants.filter(
           (grant) => !state.capabilities.some((capability) => capability.id === grant),
@@ -1258,18 +1347,70 @@ async function handleAdmin(req, res, url, segments) {
         if (missing.length > 0) {
           return fail(res, 400, 'invalid_request', `unknown capability grants: ${missing.join(', ')}`)
         }
+        nextGrants = body.grants
+      } else if (body.role !== undefined && body.role !== previousRole) {
+        nextGrants = defaultGrantsForRole(nextRole)
+      }
+      const outOfRole = nextGrants.filter((grant) => {
+        const capability = state.capabilities.find((item) => item.id === grant)
+        return capability && !rolePermitsAccess(nextRole, capability.access)
+      })
+      if (outOfRole.length > 0) {
+        return fail(
+          res,
+          400,
+          'invalid_request',
+          `grants outside role ${nextRole}: ${outOfRole.join(', ')}`,
+        )
+      }
+      const revokedLeaseIds = []
+      if (nextRole !== previousRole) {
+        for (const lease of state.leases) {
+          if (lease.agent_id !== agent.id) continue
+          if (lease.status !== 'pending' && lease.status !== 'active') continue
+          const capability = state.capabilities.find((item) => item.id === lease.capability_id)
+          if (capability && rolePermitsAccess(nextRole, capability.access)) continue
+          lease.status = 'revoked'
+          lease.revoke_reason = `role changed to ${nextRole}`
+          lease.revoked_at = new Date().toISOString()
+          lease.credential_available = false
+          revokedLeaseIds.push(lease.id)
+          appendAudit({
+            action: 'lease.revoked',
+            actor_type: 'admin',
+            actor_id: 'admin',
+            actor_name: 'operator',
+            severity: 'warning',
+            target_type: 'lease',
+            target_id: lease.id,
+            metadata: { reason: lease.revoke_reason, agent_id: agent.id },
+          })
+        }
       }
       for (const field of [
         'name',
         'description',
-        'grants',
         'max_ttl_seconds',
         'max_concurrent_leases',
         'status',
       ]) {
         if (body[field] !== undefined) agent[field] = body[field]
       }
+      agent.role = nextRole
+      agent.grants = nextGrants
       agent.updated_at = new Date().toISOString()
+      if (nextRole !== previousRole) {
+        appendAudit({
+          action: 'agent.role_changed',
+          actor_type: 'admin',
+          actor_id: 'admin',
+          actor_name: 'operator',
+          severity: 'warning',
+          target_type: 'agent',
+          target_id: agent.id,
+          metadata: { from: previousRole, to: nextRole, revoked_lease_ids: revokedLeaseIds },
+        })
+      }
       appendAudit({
         action: 'agent.updated',
         actor_type: 'admin',
@@ -1302,6 +1443,23 @@ async function handleAdmin(req, res, url, segments) {
     const action = segments[2]
     if (action === 'approve' && method === 'POST') {
       if (lease.status !== 'pending') return fail(res, 409, 'conflict', 'lease is not pending')
+      const agent = state.agents.find((item) => item.id === lease.agent_id)
+      const capability = state.capabilities.find((item) => item.id === lease.capability_id)
+      if (!agent || agent.status !== 'active') {
+        return fail(res, 409, 'conflict', 'agent is not active')
+      }
+      if (!capability) {
+        return fail(res, 409, 'conflict', 'capability no longer exists')
+      }
+      if (!capability.enabled) {
+        return fail(res, 409, 'conflict', 'capability is disabled')
+      }
+      if (!agent.grants.includes(lease.capability_id)) {
+        return fail(res, 409, 'conflict', 'capability is not in agent grants')
+      }
+      if (!rolePermitsAccess(agent.role, capability.access)) {
+        return fail(res, 409, 'conflict', 'agent role does not permit capability access')
+      }
       const body = await readBody(req)
       const ttl = Number(body.ttl_seconds) > 0 ? Number(body.ttl_seconds) : lease.effective_ttl_seconds
       const now = new Date().toISOString()

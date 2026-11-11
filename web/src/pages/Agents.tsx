@@ -1,5 +1,5 @@
 /** Agent identities: table, create flow, one-time token, detail drawer. */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   activateAgent,
   createAgent,
@@ -13,8 +13,22 @@ import {
 } from '../api/client'
 import { ApiError } from '../api/client'
 import { useResource } from '../api/hooks'
-import type { Agent, AgentWithToken, Capability, ListResponse, Lease, PolicySettings } from '../api/types'
-import { RISK_ORDER } from '../api/types'
+import type {
+  Agent,
+  AgentRole,
+  AgentWithToken,
+  Capability,
+  ListResponse,
+  Lease,
+  PolicySettings,
+} from '../api/types'
+import {
+  AGENT_ROLE_COPY,
+  AGENT_ROLE_RANK,
+  AGENT_ROLES,
+  RISK_ORDER,
+  rolePermitsAccess,
+} from '../api/types'
 import { formatDateTime, formatTTL, parseDurationInput } from '../lib/format'
 import { navigate } from '../router'
 import { Drawer } from '../components/overlays'
@@ -30,6 +44,7 @@ import {
   LeaseStatusBadge,
   PageHeader,
   RiskBadge,
+  RoleBadge,
   Skeleton,
   StatusBadge,
 } from '../components/primitives'
@@ -55,6 +70,22 @@ interface TokenRevealState {
   token: string
   title: string
   subtitle: string
+}
+
+function capabilitiesForRole(capabilities: Capability[], role: AgentRole): Capability[] {
+  return capabilities.filter((capability) => rolePermitsAccess(role, capability.access))
+}
+
+function defaultGrantIds(capabilities: Capability[], role: AgentRole): Set<string> {
+  return new Set(
+    capabilitiesForRole(capabilities, role)
+      .filter((capability) => capability.enabled)
+      .map((capability) => capability.id),
+  )
+}
+
+function isDemotion(from: AgentRole, to: AgentRole): boolean {
+  return AGENT_ROLE_RANK[to] < AGENT_ROLE_RANK[from]
 }
 
 export function AgentsPage({ refreshKey }: AgentsPageProps) {
@@ -191,6 +222,7 @@ export function AgentsPage({ refreshKey }: AgentsPageProps) {
             <tr>
               <th scope="col">Agent</th>
               <th scope="col">Status</th>
+              <th scope="col">Role</th>
               <th scope="col">Grants</th>
               <th scope="col">Last seen</th>
               <th scope="col">Limits</th>
@@ -203,7 +235,7 @@ export function AgentsPage({ refreshKey }: AgentsPageProps) {
             {agents.loading && items.length === 0 ? (
               Array.from({ length: 3 }).map((_, index) => (
                 <tr key={`skeleton-${index}`}>
-                  {Array.from({ length: 6 }).map((__, cell) => (
+                  {Array.from({ length: 7 }).map((__, cell) => (
                     <td key={cell}>
                       <Skeleton width={cell === 0 ? 160 : 90} />
                     </td>
@@ -212,7 +244,7 @@ export function AgentsPage({ refreshKey }: AgentsPageProps) {
               ))
             ) : filtered.length === 0 ? (
               <tr>
-                <td colSpan={6} style={{ padding: 0, border: 'none' }}>
+                <td colSpan={7} style={{ padding: 0, border: 'none' }}>
                   <div style={{ padding: 20 }}>
                     <EmptyState
                       icon={<IconAgents size={18} />}
@@ -254,6 +286,9 @@ export function AgentsPage({ refreshKey }: AgentsPageProps) {
                   </td>
                   <td>
                     <StatusBadge status={agent.status} />
+                  </td>
+                  <td>
+                    <RoleBadge role={agent.role} />
                   </td>
                   <td>
                     {agent.grants.length === 0 ? (
@@ -430,21 +465,49 @@ function CreateAgentModal({
   const toast = useToast()
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [role, setRole] = useState<AgentRole>('guest')
   const [grants, setGrants] = useState<Set<string>>(new Set())
   const [ttlInput, setTtlInput] = useState('1h')
   const [concurrency, setConcurrency] = useState('3')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // Ref gates late seeding synchronously so a reopen flush cannot re-seed the previous role.
+  const grantsSeededRef = useRef(false)
 
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      grantsSeededRef.current = false
+      return
+    }
     setName('')
     setDescription('')
-    setGrants(new Set())
+    setRole('guest')
     setTtlInput(formatTTL(policy?.max_lease_ttl_seconds ?? 3600))
     setConcurrency(String(policy?.max_concurrent_leases_per_agent ?? 3))
     setError(null)
-  }, [open, policy])
+    // Snapshot available data at open only; late loads must not wipe typed input.
+    if (capabilities.length > 0) {
+      setGrants(defaultGrantIds(capabilities, 'guest'))
+      grantsSeededRef.current = true
+    } else {
+      setGrants(new Set())
+      grantsSeededRef.current = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally [open] only
+  }, [open])
+
+  useEffect(() => {
+    if (!open || grantsSeededRef.current || capabilities.length === 0) return
+    setGrants(defaultGrantIds(capabilities, role))
+    grantsSeededRef.current = true
+  }, [open, capabilities, role])
+
+  function selectRole(next: AgentRole) {
+    setRole(next)
+    if (capabilities.length === 0) return
+    setGrants(defaultGrantIds(capabilities, next))
+    grantsSeededRef.current = true
+  }
 
   function toggleGrant(id: string) {
     setGrants((current) => {
@@ -453,6 +516,7 @@ function CreateAgentModal({
       else next.add(id)
       return next
     })
+    grantsSeededRef.current = true
   }
 
   async function submit() {
@@ -476,6 +540,7 @@ function CreateAgentModal({
       const created = await createAgent({
         name: name.trim(),
         description: description.trim(),
+        role,
         grants: Array.from(grants).sort(),
         max_ttl_seconds: ttl,
         max_concurrent_leases: maxConcurrent,
@@ -489,7 +554,8 @@ function CreateAgentModal({
     }
   }
 
-  const groups = groupByRisk(capabilities)
+  const permitted = capabilitiesForRole(capabilities, role)
+  const groups = groupByRisk(permitted)
 
   return (
     <Drawer
@@ -518,6 +584,51 @@ function CreateAgentModal({
           The agent receives a bearer token once and uses it only to request capability leases.
           It never sees the cloud broker AccessKey.
         </InlineNotice>
+
+        <div className="field">
+          <span className="field__label">Role</span>
+          <div className="field__hint" style={{ marginBottom: 8 }}>
+            Roles cap which capabilities this agent may hold. Grants stay a subset of what the
+            role permits.
+          </div>
+          <div className="role-picker" role="radiogroup" aria-label="Agent role">
+            {AGENT_ROLES.map((option) => {
+              const copy = AGENT_ROLE_COPY[option]
+              const preview = capabilitiesForRole(capabilities, option).filter((cap) => cap.enabled)
+              const selected = role === option
+              return (
+                <label
+                  key={option}
+                  className={`role-picker__option${selected ? ' is-selected' : ''}`}
+                >
+                  <input
+                    type="radio"
+                    name="agent-role"
+                    value={option}
+                    checked={selected}
+                    onChange={() => selectRole(option)}
+                  />
+                  <div className="role-picker__head">
+                    <RoleBadge role={option} />
+                    <span className="role-picker__label">{copy.label}</span>
+                  </div>
+                  <div className="role-picker__summary">{copy.summary}</div>
+                  <div className="role-picker__preview">
+                    {preview.length === 0 ? (
+                      <span className="muted">No enabled capabilities for this role yet.</span>
+                    ) : (
+                      preview.map((capability) => (
+                        <span className="chip" key={capability.id} title={capability.id}>
+                          {capability.name}
+                        </span>
+                      ))
+                    )}
+                  </div>
+                </label>
+              )
+            })}
+          </div>
+        </div>
 
         <div className="form-grid">
           <Field label="Name" htmlFor="agent-name" required className="form-span-2">
@@ -573,12 +684,12 @@ function CreateAgentModal({
           <div className="row-between">
             <span className="field__label">Capability grants</span>
             <span className="muted" style={{ fontSize: 11.5 }}>
-              {grants.size} selected
+              {grants.size} selected · limited to {AGENT_ROLE_COPY[role].label}
             </span>
           </div>
           <div className="field__hint" style={{ marginBottom: 6 }}>
-            Only granted capabilities can be requested. Risk above the auto-approve threshold
-            requires an operator decision.
+            Uncheck a capability to withhold it. If you uncheck all, the role&apos;s default
+            capabilities are granted.
           </div>
           {capabilitiesLoading ? (
             <div className="stack gap-8">
@@ -588,7 +699,10 @@ function CreateAgentModal({
           ) : capabilitiesError ? (
             <ErrorBanner error={capabilitiesError} title="Capabilities unavailable" />
           ) : groups.length === 0 ? (
-            <EmptyState title="No capabilities available" hint="Seed the catalog before creating agents." />
+            <EmptyState
+              title="No capabilities for this role"
+              hint="Raise the role or seed the catalog with matching access levels."
+            />
           ) : (
             <div className="stack" style={{ gap: 14 }}>
               {groups.map((group) => (
@@ -610,7 +724,9 @@ function CreateAgentModal({
                         />
                         <span className="checkbox__text">
                           <strong>{capability.name}</strong>
-                          <span className="mono">{capability.id}</span>
+                          <span className="mono">
+                            {capability.id} · {capability.access}
+                          </span>
                         </span>
                       </label>
                     ))}
@@ -621,7 +737,8 @@ function CreateAgentModal({
           )}
           {grants.size === 0 && groups.length > 0 && (
             <div className="field__hint" style={{ color: 'var(--amber)', marginTop: 4 }}>
-              No grants selected — this agent will not be able to request any capability.
+              Empty grants are treated as the role default — every enabled capability this role
+              permits will be granted.
             </div>
           )}
         </div>
@@ -669,12 +786,30 @@ function AgentDetailDrawer({
   const [savingLimits, setSavingLimits] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [activating, setActivating] = useState(false)
+  const [pendingRole, setPendingRole] = useState<AgentRole | null>(null)
 
   const leases = useResource<ListResponse<Lease>>(
-    (signal) => listLeases({ agent_id: agent?.id ?? '', limit: 8 }, signal),
+    (signal) => listLeases({ agent_id: agent?.id ?? '', limit: 50 }, signal),
     [agent?.id, refreshKey],
     Boolean(agent),
   )
+
+  const capabilityById = useMemo(() => {
+    const map = new Map<string, Capability>()
+    for (const capability of capabilities) map.set(capability.id, capability)
+    return map
+  }, [capabilities])
+
+  const leasesAtRisk = useMemo(() => {
+    if (!pendingRole) return []
+    const items = leases.data?.items ?? []
+    return items.filter((lease) => {
+      if (lease.status !== 'pending' && lease.status !== 'active') return false
+      const capability = capabilityById.get(lease.capability_id)
+      if (!capability) return true
+      return !rolePermitsAccess(pendingRole, capability.access)
+    })
+  }, [pendingRole, leases.data, capabilityById])
 
   useEffect(() => {
     if (!agent) return
@@ -682,12 +817,26 @@ function AgentDetailDrawer({
     setTtlInput(formatTTL(agent.max_ttl_seconds))
     setConcurrency(String(agent.max_concurrent_leases))
     setSaveError(null)
+    setPendingRole(null)
   }, [agent])
+
+  const outsideGrants = useMemo(() => {
+    if (!agent) return [] as { id: string; capability: Capability | null }[]
+    const items: { id: string; capability: Capability | null }[] = []
+    for (const grantId of grantIds) {
+      const capability = capabilityById.get(grantId) ?? null
+      if (capability && rolePermitsAccess(agent.role, capability.access)) continue
+      items.push({ id: grantId, capability })
+    }
+    return items.sort((a, b) => a.id.localeCompare(b.id))
+  }, [agent, grantIds, capabilityById])
 
   if (!agent) return null
   const currentAgent: Agent = agent
+  const displayedRole = pendingRole ?? agent.role
 
-  const groups = groupByRisk(capabilities)
+  const permitted = capabilitiesForRole(capabilities, agent.role)
+  const groups = groupByRisk(permitted)
   const dirtyGrants =
     grantIds.size !== agent.grants.length || agent.grants.some((grant) => !grantIds.has(grant))
 
@@ -698,6 +847,39 @@ function AgentDetailDrawer({
       else next.add(id)
       return next
     })
+  }
+
+  function removeOutsideGrant(id: string) {
+    setGrantIds((current) => {
+      if (!current.has(id)) return current
+      const next = new Set(current)
+      next.delete(id)
+      return next
+    })
+  }
+
+  function requestRoleChange(next: AgentRole) {
+    if (next === currentAgent.role) return
+    setPendingRole(next)
+  }
+
+  async function confirmRoleChange() {
+    if (!pendingRole) return
+    const nextRole = pendingRole
+    setSaveError(null)
+    try {
+      const updated = await updateAgent(currentAgent.id, { role: nextRole })
+      toast.success(
+        'Role updated',
+        `${updated.name} is now ${AGENT_ROLE_COPY[updated.role].label}.`,
+      )
+      setPendingRole(null)
+      onUpdated(updated)
+      void leases.refresh()
+    } catch (cause) {
+      setSaveError(describeError(cause))
+      setPendingRole(null)
+    }
   }
 
   async function saveGrants() {
@@ -756,233 +938,355 @@ function AgentDetailDrawer({
   }
 
   return (
-    <Drawer
-      open={Boolean(agent)}
-      onClose={onClose}
-      title="Agent details"
-      subtitle={agent.id}
-      footer={
-        <>
-          <span className="muted" style={{ fontSize: 11.5, marginRight: 'auto' }}>
-            Changes are audited as agent.updated.
-          </span>
-          <Button variant="secondary" onClick={onClose}>
-            Close
-          </Button>
-        </>
-      }
-    >
-      <div className="drawer-section">
-        <div className="drawer-identity">
-          <span className="drawer-identity__mark" aria-hidden="true">
-            <IconAgents size={22} />
-          </span>
-          <div className="drawer-identity__main">
-            <div className="drawer-identity__name">
-              {agent.name}
-              <StatusBadge status={agent.status} />
+    <>
+      <Drawer
+        open={Boolean(agent)}
+        onClose={onClose}
+        title="Agent details"
+        subtitle={agent.id}
+        dismissible={!pendingRole}
+        footer={
+          <>
+            <span className="muted" style={{ fontSize: 11.5, marginRight: 'auto' }}>
+              Changes are audited as agent.updated / agent.role_changed.
+            </span>
+            <Button variant="secondary" onClick={onClose} disabled={Boolean(pendingRole)}>
+              Close
+            </Button>
+          </>
+        }
+      >
+        <div className="drawer-section">
+          <div className="drawer-identity">
+            <span className="drawer-identity__mark" aria-hidden="true">
+              <IconAgents size={22} />
+            </span>
+            <div className="drawer-identity__main">
+              <div className="drawer-identity__name">
+                {agent.name}
+                <StatusBadge status={agent.status} />
+                <RoleBadge role={agent.role} />
+              </div>
+              <div className="drawer-identity__sub">{agent.id}</div>
             </div>
-            <div className="drawer-identity__sub">{agent.id}</div>
+            <CopyButton value={agent.id} label="Copy ID" />
           </div>
-          <CopyButton value={agent.id} label="Copy ID" />
+          <div className="meta-list">
+            <div className="meta-item">
+              <div className="meta-item__label">Token prefix</div>
+              <div className="meta-item__value mono">{agent.token_prefix || '—'}</div>
+            </div>
+            <div className="meta-item">
+              <div className="meta-item__label">Last seen</div>
+              <div className="meta-item__value">
+                <RelativeTime iso={agent.last_seen_at} />
+              </div>
+            </div>
+            <div className="meta-item">
+              <div className="meta-item__label">Created</div>
+              <div className="meta-item__value">{formatDateTime(agent.created_at)}</div>
+            </div>
+            <div className="meta-item">
+              <div className="meta-item__label">Updated</div>
+              <div className="meta-item__value">{formatDateTime(agent.updated_at)}</div>
+            </div>
+            {agent.description && (
+              <div className="meta-item" style={{ gridColumn: '1 / -1' }}>
+                <div className="meta-item__label">Description</div>
+                <div className="meta-item__value">{agent.description}</div>
+              </div>
+            )}
+          </div>
+          <div className="drawer-actions">
+            {agent.status === 'active' ? (
+              <Button
+                variant="danger"
+                size="sm"
+                icon={<IconBan size={14} />}
+                onClick={() => onRequestSuspend(agent)}
+              >
+                Suspend agent
+              </Button>
+            ) : agent.status === 'suspended' ? (
+              <Button
+                variant="primary"
+                size="sm"
+                icon={<IconCheck size={14} />}
+                loading={activating}
+                onClick={() => void activate()}
+              >
+                Activate agent
+              </Button>
+            ) : null}
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<IconRotate size={14} />}
+              onClick={() => onRequestRotate(agent)}
+            >
+              Rotate token
+            </Button>
+          </div>
+          {agent.status !== 'active' && (
+            <InlineNotice kind="warning">
+              This agent is {agent.status}. Agent API calls are rejected with 403 until it is
+              activated.
+            </InlineNotice>
+          )}
         </div>
-        <div className="meta-list">
-          <div className="meta-item">
-            <div className="meta-item__label">Token prefix</div>
-            <div className="meta-item__value mono">{agent.token_prefix || '—'}</div>
+
+        <div className="drawer-section">
+          <div className="drawer-section__title">
+            <span>Role</span>
           </div>
-          <div className="meta-item">
-            <div className="meta-item__label">Last seen</div>
-            <div className="meta-item__value">
-              <RelativeTime iso={agent.last_seen_at} />
-            </div>
+          <div className="field__hint" style={{ marginBottom: 8 }}>
+            Changing role without an explicit grants list resets grants to every enabled
+            capability the new role permits. Demotion revokes out-of-role pending and active
+            leases.
           </div>
-          <div className="meta-item">
-            <div className="meta-item__label">Created</div>
-            <div className="meta-item__value">{formatDateTime(agent.created_at)}</div>
+          <div className="role-picker role-picker--compact" role="radiogroup" aria-label="Change agent role">
+            {AGENT_ROLES.map((option) => {
+              const copy = AGENT_ROLE_COPY[option]
+              const selected = displayedRole === option
+              return (
+                <label
+                  key={option}
+                  className={`role-picker__option${selected ? ' is-selected' : ''}`}
+                >
+                  <input
+                    type="radio"
+                    name={`agent-role-${agent.id}`}
+                    value={option}
+                    checked={selected}
+                    onChange={() => requestRoleChange(option)}
+                  />
+                  <div className="role-picker__head">
+                    <RoleBadge role={option} />
+                    <span className="role-picker__label">{copy.label}</span>
+                  </div>
+                  <div className="role-picker__summary">{copy.summary}</div>
+                </label>
+              )
+            })}
           </div>
-          <div className="meta-item">
-            <div className="meta-item__label">Updated</div>
-            <div className="meta-item__value">{formatDateTime(agent.updated_at)}</div>
+        </div>
+
+        <div className="drawer-section">
+          <div className="drawer-section__title">
+            <span>Limits</span>
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={savingLimits}
+              onClick={() => void saveLimits()}
+            >
+              Save limits
+            </Button>
           </div>
-          {agent.description && (
-            <div className="meta-item" style={{ gridColumn: '1 / -1' }}>
-              <div className="meta-item__label">Description</div>
-              <div className="meta-item__value">{agent.description}</div>
+          <div className="limit-grid">
+            <Field label="Max TTL" htmlFor="drawer-ttl" hint={`Default ${formatTTL(policy?.max_lease_ttl_seconds ?? 3600)}`}>
+              <input
+                id="drawer-ttl"
+                className="input input--mono"
+                value={ttlInput}
+                onChange={(event) => setTtlInput(event.target.value)}
+              />
+            </Field>
+            <Field label="Max concurrent leases" htmlFor="drawer-concurrency">
+              <input
+                id="drawer-concurrency"
+                className="input input--mono"
+                type="number"
+                min={1}
+                value={concurrency}
+                onChange={(event) => setConcurrency(event.target.value)}
+              />
+            </Field>
+          </div>
+        </div>
+
+        <div className="drawer-section">
+          <div className="drawer-section__title">
+            <span>Capability grants ({grantIds.size})</span>
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={savingGrants}
+              disabled={!dirtyGrants}
+              onClick={() => void saveGrants()}
+            >
+              {dirtyGrants ? 'Save grants' : 'Saved'}
+            </Button>
+          </div>
+          <div className="field__hint" style={{ marginBottom: 8 }}>
+            Limited to capabilities {AGENT_ROLE_COPY[agent.role].label} may hold.
+          </div>
+          <div className="stack" style={{ gap: 12 }}>
+            {groups.length === 0 ? (
+              <EmptyState title="No capabilities for this role" hint="Promote the role to grant write or admin capabilities." />
+            ) : (
+              groups.map((group) => (
+                <div key={group.risk} className="stack" style={{ gap: 4 }}>
+                  <div className="row gap-8">
+                    <RiskBadge risk={group.risk} />
+                  </div>
+                  <div className="checkbox-grid">
+                    {group.items.map((capability) => (
+                      <label className="checkbox" key={capability.id}>
+                        <input
+                          type="checkbox"
+                          checked={grantIds.has(capability.id)}
+                          onChange={() => toggleGrant(capability.id)}
+                        />
+                        <span className="checkbox__text">
+                          <strong>{capability.name}</strong>
+                          <span className="mono">
+                            {capability.id} · {capability.access}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ))
+            )}
+            {outsideGrants.length > 0 && (
+              <div className="stack" style={{ gap: 8 }}>
+                <InlineNotice kind="warning" title="Outside this role">
+                  These grants are still stored on the agent but {AGENT_ROLE_COPY[agent.role].label}{' '}
+                  cannot hold them. Uncheck to remove before saving.
+                </InlineNotice>
+                <div className="checkbox-grid">
+                  {outsideGrants.map(({ id, capability }) => (
+                    <label className="checkbox" key={id}>
+                      <input
+                        type="checkbox"
+                        checked={grantIds.has(id)}
+                        onChange={() => removeOutsideGrant(id)}
+                      />
+                      <span className="checkbox__text">
+                        <strong>{capability?.name ?? id}</strong>
+                        <span className="mono">
+                          {id}
+                          {capability ? ` · ${capability.access}` : ' · unknown capability'}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          {saveError && (
+            <div className="banner banner--error" role="alert">
+              {saveError}
             </div>
           )}
         </div>
-        <div className="drawer-actions">
-          {agent.status === 'active' ? (
-            <Button
-              variant="danger"
-              size="sm"
-              icon={<IconBan size={14} />}
-              onClick={() => onRequestSuspend(agent)}
-            >
-              Suspend agent
-            </Button>
-          ) : agent.status === 'suspended' ? (
-            <Button
-              variant="primary"
-              size="sm"
-              icon={<IconCheck size={14} />}
-              loading={activating}
-              onClick={() => void activate()}
-            >
-              Activate agent
-            </Button>
-          ) : null}
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={<IconRotate size={14} />}
-            onClick={() => onRequestRotate(agent)}
-          >
-            Rotate token
-          </Button>
-        </div>
-        {agent.status !== 'active' && (
-          <InlineNotice kind="warning">
-            This agent is {agent.status}. Agent API calls are rejected with 403 until it is
-            activated.
-          </InlineNotice>
-        )}
-      </div>
 
-      <div className="drawer-section">
-        <div className="drawer-section__title">
-          <span>Limits</span>
-          <Button
-            size="sm"
-            variant="secondary"
-            loading={savingLimits}
-            onClick={() => void saveLimits()}
-          >
-            Save limits
-          </Button>
-        </div>
-        <div className="limit-grid">
-          <Field label="Max TTL" htmlFor="drawer-ttl" hint={`Default ${formatTTL(policy?.max_lease_ttl_seconds ?? 3600)}`}>
-            <input
-              id="drawer-ttl"
-              className="input input--mono"
-              value={ttlInput}
-              onChange={(event) => setTtlInput(event.target.value)}
-            />
-          </Field>
-          <Field label="Max concurrent leases" htmlFor="drawer-concurrency">
-            <input
-              id="drawer-concurrency"
-              className="input input--mono"
-              type="number"
-              min={1}
-              value={concurrency}
-              onChange={(event) => setConcurrency(event.target.value)}
-            />
-          </Field>
-        </div>
-      </div>
-
-      <div className="drawer-section">
-        <div className="drawer-section__title">
-          <span>Capability grants ({grantIds.size})</span>
-          <Button
-            size="sm"
-            variant="secondary"
-            loading={savingGrants}
-            disabled={!dirtyGrants}
-            onClick={() => void saveGrants()}
-          >
-            {dirtyGrants ? 'Save grants' : 'Saved'}
-          </Button>
-        </div>
-        <div className="stack" style={{ gap: 12 }}>
-          {groups.map((group) => (
-            <div key={group.risk} className="stack" style={{ gap: 4 }}>
-              <div className="row gap-8">
-                <RiskBadge risk={group.risk} />
-              </div>
-              <div className="checkbox-grid">
-                {group.items.map((capability) => (
-                  <label className="checkbox" key={capability.id}>
-                    <input
-                      type="checkbox"
-                      checked={grantIds.has(capability.id)}
-                      onChange={() => toggleGrant(capability.id)}
-                    />
-                    <span className="checkbox__text">
-                      <strong>{capability.name}</strong>
-                      <span className="mono">{capability.id}</span>
-                    </span>
-                  </label>
-                ))}
-              </div>
+        <div className="drawer-section">
+          <div className="drawer-section__title">
+            <span>Recent leases</span>
+            <button
+              type="button"
+              className="panel__link"
+              onClick={() => {
+                onClose()
+                navigate('/leases')
+              }}
+            >
+              All leases →
+            </button>
+          </div>
+          {leases.loading && !leases.data ? (
+            <div className="stack gap-8">
+              <Skeleton height={32} />
+              <Skeleton height={32} />
             </div>
-          ))}
-        </div>
-        {saveError && (
-          <div className="banner banner--error" role="alert">
-            {saveError}
-          </div>
-        )}
-      </div>
-
-      <div className="drawer-section">
-        <div className="drawer-section__title">
-          <span>Recent leases</span>
-          <button
-            type="button"
-            className="panel__link"
-            onClick={() => {
-              onClose()
-              navigate('/leases')
-            }}
-          >
-            All leases →
-          </button>
-        </div>
-        {leases.loading && !leases.data ? (
-          <div className="stack gap-8">
-            <Skeleton height={32} />
-            <Skeleton height={32} />
-          </div>
-        ) : leases.error ? (
-          <ErrorBanner error={leases.error} title="Leases unavailable" />
-        ) : (leases.data?.items.length ?? 0) === 0 ? (
-          <EmptyState title="No leases yet" hint="This agent has not requested any capability." />
-        ) : (
-          <div className="table-wrap">
-            <table className="table table--compact">
-              <thead>
-                <tr>
-                  <th scope="col">Capability</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Created</th>
-                </tr>
-              </thead>
-              <tbody>
-                {leases.data?.items.map((lease) => (
-                  <tr key={lease.id}>
-                    <td>
-                      <div className="cell-primary">{lease.capability_name || lease.capability_id}</div>
-                      <div className="mono" style={{ fontSize: 10, color: 'var(--text-faint)' }}>
-                        {lease.id}
-                      </div>
-                    </td>
-                    <td>
-                      <LeaseStatusBadge status={lease.status} />
-                    </td>
-                    <td>
-                      <RelativeTime iso={lease.created_at} />
-                    </td>
+          ) : leases.error ? (
+            <ErrorBanner error={leases.error} title="Leases unavailable" />
+          ) : (leases.data?.items.length ?? 0) === 0 ? (
+            <EmptyState title="No leases yet" hint="This agent has not requested any capability." />
+          ) : (
+            <div className="table-wrap">
+              <table className="table table--compact">
+                <thead>
+                  <tr>
+                    <th scope="col">Capability</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Created</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {(leases.data?.items ?? []).slice(0, 8).map((lease) => (
+                    <tr key={lease.id}>
+                      <td>
+                        <div className="cell-primary">{lease.capability_name || lease.capability_id}</div>
+                        <div className="mono" style={{ fontSize: 10, color: 'var(--text-faint)' }}>
+                          {lease.id}
+                        </div>
+                      </td>
+                      <td>
+                        <LeaseStatusBadge status={lease.status} />
+                      </td>
+                      <td>
+                        <RelativeTime iso={lease.created_at} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </Drawer>
+
+      <ConfirmDialog
+        open={Boolean(pendingRole)}
+        title={
+          pendingRole && isDemotion(currentAgent.role, pendingRole)
+            ? 'Demote this agent?'
+            : 'Change agent role?'
+        }
+        confirmLabel={
+          pendingRole ? `Set role to ${AGENT_ROLE_COPY[pendingRole].label}` : 'Change role'
+        }
+        danger={Boolean(pendingRole && isDemotion(currentAgent.role, pendingRole))}
+        onCancel={() => setPendingRole(null)}
+        onConfirm={() => confirmRoleChange()}
+      >
+        {pendingRole && (
+          <div className="stack gap-8">
+            <div>
+              Change <strong>{currentAgent.name}</strong> from{' '}
+              <strong>{AGENT_ROLE_COPY[currentAgent.role].label}</strong> to{' '}
+              <strong>{AGENT_ROLE_COPY[pendingRole].label}</strong>.
+            </div>
+            <div>{AGENT_ROLE_COPY[pendingRole].summary}</div>
+            <div>
+              Grants reset to every enabled capability the new role permits unless you change
+              them afterward.
+            </div>
+            {isDemotion(currentAgent.role, pendingRole) && (
+              <div style={{ color: 'var(--rose)' }}>
+                {leasesAtRisk.length > 0 ? (
+                  <>
+                    This demotion will revoke {leasesAtRisk.length} pending or active lease
+                    {leasesAtRisk.length === 1 ? '' : 's'} whose capability the new role does not
+                    permit. Already-minted cloud credentials stay valid until they expire.
+                  </>
+                ) : (
+                  <>
+                    This demotion will revoke any pending or active leases whose capability the
+                    new role does not permit. Already-minted cloud credentials stay valid until
+                    they expire.
+                  </>
+                )}
+              </div>
+            )}
           </div>
         )}
-      </div>
-    </Drawer>
+      </ConfirmDialog>
+    </>
   )
 }

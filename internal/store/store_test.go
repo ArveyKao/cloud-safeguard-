@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -57,6 +58,7 @@ func testCapability() model.Capability {
 		Description:       "unit test capability",
 		ProviderType:      model.ProviderAliyun,
 		Risk:              model.RiskLow,
+		Access:            model.AccessRead,
 		PolicyTemplate:    `{"Version":"1","Statement":[]}`,
 		Params:            []model.CapabilityParam{{Name: "domain", Required: true, Pattern: `^[a-z]+\.com$`}},
 		DefaultTTLSeconds: 900,
@@ -74,6 +76,7 @@ func testAgent() model.Agent {
 		Name:                "test-agent",
 		Description:         "unit test agent",
 		Status:              model.AgentActive,
+		Role:                model.RoleGuest,
 		Grants:              []string{"cap_test1"},
 		MaxTTLSeconds:       1800,
 		MaxConcurrentLeases: 3,
@@ -133,8 +136,9 @@ func TestOpenMigratesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMeta(schema_version): %v", err)
 	}
-	if version != "1" {
-		t.Fatalf("schema_version = %q, want \"1\"", version)
+	wantVersion := strconv.Itoa(CurrentSchemaVersion)
+	if version != wantVersion {
+		t.Fatalf("schema_version = %q, want %q", version, wantVersion)
 	}
 	if err := db.SetMeta(ctx, "keepme", "value1"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
@@ -169,8 +173,17 @@ func TestOpenMigratesAndIsIdempotent(t *testing.T) {
 		t.Fatalf("meta value after reopen = %q, want value1", got)
 	}
 	version2, err := db2.GetMeta(ctx, MetaSchemaVersion)
-	if err != nil || version2 != "1" {
+	if err != nil || version2 != wantVersion {
 		t.Fatalf("schema_version after reopen = %q, %v", version2, err)
+	}
+	// A fresh database is seeded by `csg init`, not by the migration: the v2
+	// transform must not invent catalog rows (CONTRACT §16.6).
+	caps, err := db2.ListCapabilities(ctx)
+	if err != nil {
+		t.Fatalf("ListCapabilities: %v", err)
+	}
+	if len(caps) != 0 {
+		t.Fatalf("migrations seeded %d capabilities into a fresh database, want 0: %+v", len(caps), caps)
 	}
 }
 
@@ -289,6 +302,9 @@ func TestCapabilityCRUD(t *testing.T) {
 	if len(got.Params) != 1 || got.Params[0].Name != "domain" || !got.Builtin || !got.Enabled {
 		t.Fatalf("GetCapability = %+v", got)
 	}
+	if got.Access != model.AccessRead {
+		t.Fatalf("GetCapability access = %q, want read", got.Access)
+	}
 	got.Enabled = false
 	got.Description = "updated"
 	got.UpdatedAt = testTime.Add(time.Minute)
@@ -323,6 +339,9 @@ func TestAgentCRUD(t *testing.T) {
 	}
 	if got.Name != a.Name || len(got.Grants) != 1 || got.Grants[0] != "cap_test1" {
 		t.Fatalf("GetAgent = %+v", got)
+	}
+	if got.Role != model.RoleGuest {
+		t.Fatalf("GetAgent role = %q, want guest", got.Role)
 	}
 	// Token hash resolution.
 	byToken, err := db.GetAgentByTokenHash(ctx, hash)
@@ -411,10 +430,29 @@ func TestLeaseCRUDAndQueries(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, want %v", got.ExpiresAt, active.ExpiresAt)
 	}
 
-	// Credential blob lifecycle.
+	// Credential blob lifecycle. A credential is stored while the lease is
+	// still pending (the server activates it right after), never on a lease
+	// that is already active.
 	encCred := "v1:lease-credential-blob"
+	if err := db.SetLeaseCredential(ctx, active.ID, encCred, "LTAI****ABCD"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("SetLeaseCredential on an active lease = %v, want ErrConflict", err)
+	}
+	if err := db.SetLeaseCredential(ctx, "lea_missing", encCred, "LTAI****ABCD"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetLeaseCredential on a missing lease = %v, want ErrNotFound", err)
+	}
+	pendingForCred := active
+	pendingForCred.Status = model.LeasePending
+	if err := db.UpdateLease(ctx, pendingForCred); err != nil {
+		t.Fatalf("UpdateLease(pending): %v", err)
+	}
 	if err := db.SetLeaseCredential(ctx, active.ID, encCred, "LTAI****ABCD"); err != nil {
 		t.Fatalf("SetLeaseCredential: %v", err)
+	}
+	// Activation writes the lease back as active with the stored fingerprint.
+	active.CredentialAvailable = true
+	active.CredentialFingerprint = "LTAI****ABCD"
+	if err := db.UpdateLease(ctx, active); err != nil {
+		t.Fatalf("UpdateLease(active): %v", err)
 	}
 	blob, err := db.GetLeaseCredential(ctx, active.ID)
 	if err != nil || blob != encCred {
@@ -825,7 +863,7 @@ func TestNoPlaintextSecretsInDatabaseFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encrypt lease: %v", err)
 	}
-	lease := testLease("lea_test", model.LeaseActive, testTime)
+	lease := testLease("lea_test", model.LeasePending, testTime)
 	if err := db.CreateLease(ctx, lease); err != nil {
 		t.Fatalf("CreateLease: %v", err)
 	}
@@ -885,5 +923,48 @@ func TestNoPlaintextSecretsInDatabaseFiles(t *testing.T) {
 	}
 	if stored["access_key_secret"] != brokerSecret {
 		t.Fatalf("decrypted secret = %q", stored["access_key_secret"])
+	}
+}
+
+func TestUpdateLeaseIfStatus(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	pending := testLease("lea_cas", model.LeasePending, testTime)
+	if err := db.CreateLease(ctx, pending); err != nil {
+		t.Fatalf("CreateLease: %v", err)
+	}
+
+	// Matching status: the write lands.
+	active := pending
+	active.Status = model.LeaseActive
+	if err := db.UpdateLeaseIfStatus(ctx, active, model.LeasePending); err != nil {
+		t.Fatalf("UpdateLeaseIfStatus(pending→active) = %v, want nil", err)
+	}
+	if got, _ := db.GetLease(ctx, "lea_cas"); got.Status != model.LeaseActive {
+		t.Fatalf("status = %q, want active", got.Status)
+	}
+
+	// Stale expectation: conflict, and the stored row is untouched.
+	revoked := active
+	revoked.Status = model.LeaseRevoked
+	revoked.RevokeReason = "should not land"
+	if err := db.UpdateLeaseIfStatus(ctx, revoked, model.LeasePending); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdateLeaseIfStatus with stale status = %v, want ErrConflict", err)
+	}
+	got, _ := db.GetLease(ctx, "lea_cas")
+	if got.Status != model.LeaseActive || got.RevokeReason != "" {
+		t.Fatalf("conflicting write changed the row: status=%q reason=%q", got.Status, got.RevokeReason)
+	}
+
+	// Missing lease: not found.
+	ghost := testLease("lea_missing", model.LeaseActive, testTime)
+	if err := db.UpdateLeaseIfStatus(ctx, ghost, model.LeasePending); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("UpdateLeaseIfStatus(missing) = %v, want ErrNotFound", err)
+	}
+
+	// An empty expected status is a programming error, never an unconditional write.
+	if err := db.UpdateLeaseIfStatus(ctx, active, ""); err == nil {
+		t.Fatal("UpdateLeaseIfStatus with empty expected status = nil, want error")
 	}
 }

@@ -532,3 +532,328 @@ from a clean data dir, docs accuracy spot-checks.
 Send the Lead: `status` (done/blocked/partial), files added/changed, exact commands run with
 results (verbatim key lines), evidence paths, known limitations/risks, and anything the Lead
 must integrate or resolve. Never claim a command was run if it was not.
+
+## 16. Agent roles and the IAM prohibition (normative; extends §3–§12)
+
+Rationale: ADR-014. Roles apply to agents only; the admin token (§2) is unchanged and is not a
+role. Agent tokens still never reach admin endpoints.
+
+### 16.1 Model
+
+- `AgentRole`: `guest` < `member` < `administrator`. `Agent.role` is required on the wire.
+- `AccessLevel`: `read` < `write` < `admin`. `Capability.access` is required on the wire.
+- A role permits: `guest` → `read`; `member` → `read`, `write`; `administrator` → all.
+- `Agent.grants` stays, and must always be a subset of the capabilities the role permits.
+
+### 16.2 Catalog changes (replaces the last row of §7)
+
+| ID | Access | Risk |
+| --- | --- | --- |
+| `aliyun.cloud.read` | read | low |
+| `aliyun.dns.manage` | write | medium |
+| `aliyun.cert.dns01` | write | medium |
+| `aliyun.ecs.instance.ops` | write | high |
+| `aliyun.account.admin` (new) | admin | critical |
+
+`aliyun.account.admin` replaces `aliyun.iam.break_glass`: template
+`{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`, TTL 900 / 1800,
+name "Emergency account-wide access, IAM excluded". It keeps the §6 break-glass flow
+(`break_glass=true`, always human-approved, critical audit). `aliyun.iam.break_glass` is no
+longer seeded.
+
+### 16.3 IAM prohibition (not configurable)
+
+`capcatalog.CheckPolicy(access AccessLevel, policyJSON []byte) error` rejects a document when
+any of these holds. Service and action comparison is case-insensitive.
+
+0. The document is not an object whose only keys are exactly `Version` and `Statement`
+   (case-sensitive), has no statements, a statement has an element other than exactly `Effect`,
+   `Action`, `Resource` or `Condition`, its `Effect` is not exactly `Allow` or `Deny`, or its
+   `Resource` is missing, `null`, empty, or not a string or list of non-empty strings.
+1. Any statement has a `NotAction` or `NotResource` key (whatever its value, `null` and `[]`
+   included), a statement is `null` or not an object, an Allow statement has no `Action` (missing,
+   `null` or empty), or the document cannot be parsed.
+2. An Allow action's service part is `ram`, or contains `*` or `?`. A bare `*` action is the
+   only exception, and only for `access=admin`.
+3. An Allow action's service is `sts` and the action is anything other than exactly
+   `GetCallerIdentity`.
+4. `access=read`: every Allow action must be `service:` + a verb from `Describe`, `List`,
+   `Get`, `Query`, then optional literal characters, then at most one trailing `*`. The full
+   verb must come before any wildcard, so `ecs:D*` is rejected (it would match `Delete`); no
+   `?`; bare `*` and `service:*` are rejected.
+5. `access=write`: a bare `*` action is rejected. `service:*` is allowed.
+
+`RenderPolicy` must append this statement to every rendered document, and then run
+`CheckPolicy`, returning an error if it fails (fail closed; no credential is minted):
+
+`{"Effect":"Deny","Action":["ram:*","sts:AssumeRole*"],"Resource":"*"}`
+
+`Capability` templates are checked by rendering with sample params, in create and update.
+Violation → 400 `invalid_request` with the offending action named, and audit
+`capability.rejected` (warning). `PATCH` may not change `access` on a builtin. A `PATCH` that raises
+a custom capability's `access` is rejected with 400 `invalid_request`, naming the agents, when
+any agent granted it has a role that would not permit the new level; grants are never left
+outside a role.
+
+### 16.4 Policy engine (§6 additions)
+
+Two rules run directly after rule 1. Reason keys are stable; existing keys are unchanged.
+
+| Rule key | Condition | Outcome |
+| --- | --- | --- |
+| `role_permits` | role does not permit `capability.access` | deny |
+| `iam_prohibited` | `CheckPolicy` fails for the capability's rendered policy, or the capability is retired | deny |
+
+A third rule runs directly after `break_glass_approval` (§6 rule 12):
+
+| Rule key | Condition | Outcome |
+| --- | --- | --- |
+| `admin_requires_approval` | `capability.access == admin` (builtin or custom, whatever its risk) | require_approval |
+
+`policy.Input` gains `PolicyViolation string`, computed by the server, so `internal/policy`
+stays free of the catalog. A denied lease records both reasons as usual.
+
+### 16.5 Admin API and lifecycle
+
+- `POST /admin/agents`: `role` optional, default `guest`, invalid → 400. Omitted or empty
+  `grants` → every enabled capability the role permits (at that moment; later capabilities are
+  not auto-granted). Supplied grants outside the role → 400.
+- `PATCH /admin/agents/{id}`: `role` optional. A role change without `grants` resets grants to
+  the same default. Audit `agent.role_changed` (warning) with `from`, `to`, revoked lease IDs.
+- **Demotion:** every pending or active lease of that agent whose capability the new role does
+  not permit is revoked with reason `role changed to <role>`, in the same request. Real STS
+  credentials stay valid until expiry (existing residual risk, SECURITY.md).
+- **Approval** (`POST /admin/leases/{id}/approve`) must also recheck, returning 409 `conflict`
+  with no mint: agent status active, capability still in grants, role permits it, `CheckPolicy`
+  passes. This closes delivery finding F3.
+- **Authority changes revoke affected leases in the same request:** after an agent update,
+  suspension, capability update, provider disable or policy-settings change commits, the server
+  re-runs the full activation check on every affected pending and active lease and revokes those
+  that fail (agent not active, grant removed, role, capability disabled or retired, prohibited
+  policy, TTL above any ceiling, provider not active). Disabling a capability or a cloud account
+  therefore revokes its live leases. Changing a capability's access, policy or params also revokes
+  its pending leases. Denying a lease also clears any stored ciphertext. The agent-lease sweep runs on every agent update, so retrying a failed update finishes it.
+- **One activation at a time per lease:** approval and auto-approval hold a per-lease lock across
+  mint and activation and re-read the lease under it, so concurrent approvals of one lease mint
+  once; the loser gets 409. A credential is stored only while the lease is still `pending`, and a
+  mint failure marks the lease `failed` only if it is still `pending`.
+- **Capability edits and activations are mutually exclusive:** an activation holds the
+  capability's read lock from reading the capability until the lease is active; a capability edit
+  holds its write lock from reading the capability until its lease sweeps finish. Auto-approval
+  re-reads the capability under the lock and, if it changed since the decision, revokes the lease
+  and returns 409 without minting.
+- **Sweeps read one snapshot:** every authority and startup sweep reads its affected leases with a
+  single query, never LIMIT/OFFSET pages, so leases leaving the set mid-sweep cannot hide others.
+- **Terminal status before scrubbing:** revoke and expiry write the terminal status first and clear
+  the ciphertext after, so no concurrent activation can leave a credential behind. A losing
+  activation never scrubs the credential of a lease that is already active.
+- **Post-mint recheck:** after minting and before activation, the server re-reads the agent,
+  capability and provider and repeats every approval check, including the TTL ceilings; on failure the credential is scrubbed, the lease is
+  revoked, `lease.activation_aborted` is audited and the caller gets 409.
+- **Activation is compare-and-set:** approval and auto-approval write the lease as active only
+  while it is still `pending` in the store. If a revoke, expiry or demotion landed after the checks,
+  the write fails, the stored credential is scrubbed, `lease.activation_aborted` (warning) is
+  audited and the caller gets 409 `conflict`.
+- **Policy documents with duplicate keys** (compared with Unicode simple case folding, the rule
+  Go's JSON decoder uses, at any depth) are rejected, and Allow actions must match `^[A-Za-z0-9][A-Za-z0-9_-]*:[A-Za-z0-9*?_-]+$` or be a
+  bare `*`, so this checker and the cloud cannot read one document two ways.
+- `GET /agent/capabilities` and `csg whoami` include role and access.
+
+### 16.6 Storage (schema version 2)
+
+Migration adds `agents.role` and `capabilities.access`, then in one transaction:
+
+1. Builtins get the §16.2 access; custom capabilities get `admin`.
+2. Custom capabilities whose template fails `CheckPolicy` for `admin`, or whose own template
+   (before the deny is appended) has an Allow statement with a bare `*` action, are set disabled:
+   v1 credentials were minted without the deny statement. Render
+   them with sample params. (Do this at server startup if the store cannot reach capcatalog.)
+3. `aliyun.iam.break_glass` is set disabled and kept, because old leases reference it.
+4. Agents: replace that grant with `aliyun.account.admin`; drop grants to custom capabilities
+   that step 2 disabled (they can never be leased again); role = the lowest role permitting every
+   remaining grant; no grants → `guest`. Grants never widen.
+5. After an upgrade (by `csg serve` or `csg init --force`), one `schema.migrated` system audit event is appended (warning) with
+   the versions, the disabled capabilities and each agent's resulting role and dropped grants.
+
+On every startup, pending and active leases on `aliyun.iam.break_glass` are revoked with reason
+`capability retired`, and so is any pending or active lease whose capability is missing or now
+renders a policy that fails `CheckPolicy` (reason `policy violates the IAM prohibition`), or whose
+capability is disabled (reason `capability disabled`), audited as usual; if that fails the server refuses to start. The retired
+row can never be re-enabled (400), granted (400), given as a default grant, or leased (denied by
+`iam_prohibited`). Migrating a v1 database must be tested.
+
+### 16.7 CLI, console, mock cloud, demo
+
+- CLI: `csg agents create --role R` (default guest); `csg agents set-role ID R`; role shown in
+  `agents list/get` and `whoami`; access shown in `caps list/show`. `--grant` still works.
+- Console, Agents page: create modal leads with a role picker that explains each role in plain
+  language and previews its capabilities, with grant checkboxes limited to that role and all
+  ticked by default; role badge in the table; changing role uses `ConfirmDialog`, which warns
+  when a demotion will revoke leases. Capabilities page: access column. Update
+  `web/devmock/server.mjs`.
+- Mock cloud: add `GET /v1/ram/users`, action `ram:ListUsers`, resource `*`, so a denial can be
+  shown end to end. An `aliyun.account.admin` lease must get 403 `Forbidden.RAM` on it.
+- Demo seed: `claude-code` → `administrator` with all five capabilities, `hermes-researcher` →
+  `guest`. `scripts/demo.sh`: S7 uses `aliyun.account.admin`; new S9 shows guest write denied
+  by `role_permits`, administrator denied on `/v1/ram/users`, and a `ram:*` custom capability
+  rejected with 400.
+
+### 16.8 Required tests
+
+- `CheckPolicy` table: every rule above, including `RAM:CreateUser`, `r*:*`, `*:*`, `ram:*`,
+  `sts:Assume*`, `sts:AssumeRole`, `ecs:D*` as read, `NotAction`, string and array `Action`.
+- Every builtin rendered carries the Deny statement and passes `CheckPolicy` at its own access.
+- Role × access matrix through the HTTP API for all three roles and five capabilities.
+- Agent create/patch: default grants, out-of-role grants rejected, role reset.
+- Demotion revokes exactly the out-of-role pending and active leases.
+- Approval returns 409 and mints nothing after demotion, suspension or grant removal.
+- Migration from a real v1 database, covering step 2 and "grants never widen".
+- Mock cloud: account-admin lease is allowed on ECS and gets 403 on RAM.
+
+## 17. Supervisors, people, per-account roles and the access request (accepted, not yet implemented)
+
+Status: accepted by the project owner on 2026-11-09 and revised on 2026-11-10 (supervisors,
+inherited agent rights, three permission levels, owner approval). Implementation follows the §16
+merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR-015.
+
+### 17.1 Identities
+
+- **Person**: a human account (username, password stored with Argon2id, required TOTP). Status
+  `active` / `suspended`. No global cloud role.
+- **Supervisor**: a person with the platform flag `supervisor`. `csg init` creates the first one
+  (replaces the single admin token, §2). Only supervisors may add, change or disable cloud
+  accounts, create or suspend people, grant or remove the supervisor flag, bind people to cloud
+  accounts, and change global settings. The flag gives no cloud access: a supervisor needs a
+  role binding like anyone else, and binding oneself is audited at warning level.
+- The last active supervisor cannot be suspended or lose the flag. A supervisor locked out of
+  the console is restored with a local `csg` command on the server host, which needs the vault
+  master key and is audited at critical.
+- **Agent**: a non-human identity owned by exactly one person (`Agent.owner_id`, required,
+  immutable). Its token is valid only while the agent and its owner are both active. An agent
+  has no role of its own.
+
+### 17.2 Roles are bound to cloud accounts
+
+- A **cloud account** is today's provider (§8), identified by the cloud's own account ID (for
+  Alibaba Cloud the numeric UID). `cloud_account_id` is unique across providers.
+- A **role binding** is `(person, cloud_account) → role`, set only by a supervisor. A person may
+  hold different roles on different accounts. No binding means no access to that account.
+- Roles and the highest permission level each allows:
+
+| Role | Highest permission | Meaning |
+| --- | --- | --- |
+| `guest` | `read` | Look at resources. |
+| `member` | `write` | Also change existing resources. |
+| `administrator` | `full` | Also create new resources and delete existing ones. |
+
+- An agent **inherits** its owner's role on each account. The role is read from the binding at
+  every request, approval and credential fetch; it is never copied onto the agent. The agent
+  role and per-agent grants of §16 are removed.
+- The IAM prohibition (§16.3) applies at every role and to supervisors.
+
+### 17.3 Authentication
+
+1. **Console**: a person logs in with password + TOTP and gets a short-lived session cookie
+   (HttpOnly, SameSite=Strict, CSRF token); the console no longer keeps a bearer token in
+   `localStorage`.
+   - **Setup.** Creating or resetting a person returns a one-time setup code (valid 72 h,
+     stored only as a hash). With it the person chooses a password (at least 12 characters)
+     and enrolls an authenticator app; a correct first code activates the account, consumes
+     the setup code and signs them in. Supervisors never see or set passwords.
+   - **Login.** Every failure returns the same 401, whatever the cause. A TOTP code works
+     once: the accepted time step is consumed atomically. Five consecutive failures lock the
+     account for 15 minutes.
+   - **Session.** 30 minutes idle, 12 hours at most. State-changing requests need the
+     session's token in `X-CSRF-Token` and must be same-origin. Suspending or resetting a
+     person ends their sessions at once.
+   - **Storage.** Passwords are Argon2id hashes; TOTP secrets are encrypted in the vault.
+2. **Agent-first sign-in**: the agent (CLI or MCP) starts a sign-in and receives a short user
+   code and a link. The person logs in, checks that the code and agent name match, and approves;
+   the token is then issued to the agent already bound to that person. There is nothing else to
+   choose. Codes expire after 10 minutes and are single-use.
+
+### 17.4 Access request (agent API and MCP)
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `cloud_account_id` | yes | Cloud account to act in. |
+| `resource` | yes | Resource type from a fixed list (`ecs`, `dns`, `oss`, …). |
+| `permission` | yes | `read`, `write` or `full`. |
+| `ttl_seconds` | yes | Validity period. No default; missing or non-positive → 400. |
+| `resource_name` | no | Narrows the policy to one resource (domain, instance ID, bucket). |
+| `reason` | yes for `write` and `full` | Shown to the owner on the approval. |
+
+- Each `(resource, permission)` pair maps to one vetted capability template (§7, §16); agents
+  cannot submit IAM actions. The account-wide `aliyun.account.admin` capability is retired:
+  `full` is always scoped to one resource type.
+- `ttl_seconds` must be within the capability and global maximums and at least the provider
+  minimum (real STS 900 s); otherwise 400 naming the limit.
+
+**Permission levels.** A *resource* is the top-level object of a resource type: an ECS instance,
+a DNS domain, an OSS bucket. An *item* lives inside one: a DNS record, an OSS object.
+
+| Level | Allows |
+| --- | --- |
+| `read` | `Describe*`, `List*`, `Get*`, `Query*` actions only (§16.3 read rule). |
+| `write` | `read`, plus changing an existing resource: its settings and state, and adding, changing or removing items inside it. |
+| `full` | `write`, plus creating a new resource and deleting an existing one. |
+
+Every action in a template is classified by an explicit per-resource-type table kept next to the
+catalog. An action missing from the table is treated as `full`. A template whose actions exceed
+its declared level is rejected at startup and at capability edit.
+
+Verification order (deny on the first failure, recorded as decision reasons): token valid →
+agent and owner active → owner bound to the cloud account → `permission` within the owner's role
+there → IAM prohibition → existing §6 rules (TTL, concurrency, rate). A request above the
+owner's role is denied at once; it never reaches approval.
+
+### 17.5 Approval
+
+- `read` requests that pass verification are approved automatically.
+- `write` and `full` requests always wait for approval. The approver is the **agent's owner**,
+  signed in to the console. Nobody else can approve, including supervisors.
+- The approval shows the agent, cloud account, resource type, resource name, permission, validity
+  period and reason exactly as they will be issued.
+- Approval rechecks everything in §17.4 and §16.5 at decision time. A pending request expires
+  after the §6 approval timeout.
+
+### 17.6 Lifecycle
+
+- **Expiry timer.** Every issued credential has a deadline = issue time + `ttl_seconds`. The
+  clock starts when the credential is issued (for `write` and `full`, at approval), not when
+  the request is made. The cloud token is minted with exactly that lifetime, so the cloud
+  rejects it after the deadline even if Cloud Safeguard is down. At the deadline the server
+  marks the lease `expired`, erases its stored credential and writes an audit event (§10
+  sweep). A credential cannot be extended; the agent sends a new request.
+- Suspending a person suspends their agents and revokes their pending and active leases.
+- Removing or lowering a binding revokes that person's agents' leases on that account that the
+  new role does not permit (as §16.5 demotion). Real STS credentials stay valid until expiry.
+- Every audit event names the person (owner, approver or supervisor) as well as the agent.
+
+### 17.7 MCP server
+
+Tools: `request_access` (the §17.4 fields), `check_status`, `get_credential`, `revoke`,
+`list_accounts` (accounts and the owner's role on each). The MCP server is a thin client of the
+agent API; it holds the agent token and no cloud credentials beyond the lease it fetched.
+
+### 17.8 Implementation status
+
+| Part | Status |
+| --- | --- |
+| People, supervisors, setup, login, sessions (§17.1, §17.3 item 1) | implemented, schema version 3 |
+| Role bindings and the supervisor API (§17.2) | implemented; not yet enforced on requests |
+| `csg init` first supervisor, `csg supervisor recover` | implemented |
+| Agent ownership and agent-first sign-in (§17.3 item 2) | not started |
+| Five-field request, permission levels, owner approval (§17.4, §17.5) | not started |
+| Lifecycle revocation for owned agents (§17.6), MCP server (§17.7) | not started |
+| Console redesign | not started |
+
+Until the remaining parts ship, the §2 admin token and the §16 agent API keep working
+unchanged alongside the new endpoints:
+
+- `POST /api/v1/auth/setup/begin`, `POST /api/v1/auth/setup/finish`, `POST /api/v1/auth/login`,
+  `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`
+- `GET|POST /api/v1/supervisor/people`, `PATCH /api/v1/supervisor/people/{id}`,
+  `POST /api/v1/supervisor/people/{id}/reset`
+- `GET /api/v1/supervisor/bindings`,
+  `PUT|DELETE /api/v1/supervisor/accounts/{provider_id}/people/{person_id}`

@@ -133,6 +133,7 @@ Shows the identity behind the configured token.
 		}
 		fmt.Fprintf(a.Stdout, "agent:         %s (%s)\n", me.Agent.Name, me.Agent.ID)
 		fmt.Fprintf(a.Stdout, "status:        %s\n", me.Agent.Status)
+		fmt.Fprintf(a.Stdout, "role:          %s\n", me.Agent.Role)
 		fmt.Fprintf(a.Stdout, "grants:        %s\n", joinOrDash(me.Agent.Grants))
 		fmt.Fprintf(a.Stdout, "max ttl:       %s\n", formatSeconds(me.Agent.MaxTTLSeconds))
 		fmt.Fprintf(a.Stdout, "max concurrent:%s\n", fmt.Sprintf(" %d", me.Agent.MaxConcurrentLeases))

@@ -33,8 +33,19 @@ func (s *Server) handleAgentMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// agentCapabilitiesResponse is the payload of GET /api/v1/agent/capabilities.
+// It keeps the standard items/total list shape and adds the agent's role, so a
+// caller can explain why a capability is or is not available to it
+// (CONTRACT §16.5). Each capability carries its access level.
+type agentCapabilitiesResponse struct {
+	Items []model.Capability `json:"items"`
+	Total int                `json:"total"`
+	Role  model.AgentRole    `json:"role"`
+}
+
 // handleAgentCapabilities implements GET /api/v1/agent/capabilities. Only
-// enabled capabilities granted to the authenticated agent are returned.
+// enabled capabilities granted to the authenticated agent and permitted by its
+// role are returned.
 func (s *Server) handleAgentCapabilities(w http.ResponseWriter, r *http.Request) {
 	ag, ok := agentFromContext(r.Context())
 	if !ok {
@@ -52,11 +63,15 @@ func (s *Server) handleAgentCapabilities(w http.ResponseWriter, r *http.Request)
 	}
 	items := make([]model.Capability, 0, len(all))
 	for _, c := range all {
-		if c.Enabled && granted[c.ID] {
+		if c.Enabled && granted[c.ID] && ag.Role.Permits(c.Access) {
 			items = append(items, c)
 		}
 	}
-	writeList(s, w, http.StatusOK, items, len(items))
+	s.writeData(w, http.StatusOK, agentCapabilitiesResponse{
+		Items: items,
+		Total: len(items),
+		Role:  ag.Role,
+	})
 }
 
 // heartbeatResponse is the payload of POST /api/v1/agent/heartbeat.

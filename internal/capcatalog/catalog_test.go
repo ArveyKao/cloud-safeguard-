@@ -13,11 +13,11 @@ import (
 // docs/CONTRACT.md §7. They are acceptance-relevant: the demo and the mock
 // cloud rely on their IAM actions and resources.
 var expectedPolicyTemplates = map[string]string{
-	IDCloudRead:  `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:Describe*","alidns:Describe*","oss:List*","sts:GetCallerIdentity"],"Resource":["*"]}]}`,
-	IDDNSManage:  `{"Version":"1","Statement":[{"Effect":"Allow","Action":["alidns:DescribeDomainRecords","alidns:AddDomainRecord","alidns:UpdateDomainRecord","alidns:DeleteDomainRecord","alidns:SetDomainRecordStatus"],"Resource":["acs:alidns:*:*:domain/{{domain}}"]}]}`,
-	IDCertDNS01:  `{"Version":"1","Statement":[{"Effect":"Allow","Action":["alidns:DescribeDomainRecords","alidns:AddDomainRecord","alidns:DeleteDomainRecord"],"Resource":["acs:alidns:*:*:domain/{{domain}}"]}]}`,
-	IDECSOps:     `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:StartInstance","ecs:StopInstance","ecs:RebootInstance","ecs:DescribeInstances"],"Resource":["acs:ecs:*:*:instance/{{instance_id}}"]}]}`,
-	IDBreakGlass: `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`,
+	IDCloudRead:    `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:Describe*","alidns:Describe*","oss:List*","sts:GetCallerIdentity"],"Resource":["*"]}]}`,
+	IDDNSManage:    `{"Version":"1","Statement":[{"Effect":"Allow","Action":["alidns:DescribeDomainRecords","alidns:AddDomainRecord","alidns:UpdateDomainRecord","alidns:DeleteDomainRecord","alidns:SetDomainRecordStatus"],"Resource":["acs:alidns:*:*:domain/{{domain}}"]}]}`,
+	IDCertDNS01:    `{"Version":"1","Statement":[{"Effect":"Allow","Action":["alidns:DescribeDomainRecords","alidns:AddDomainRecord","alidns:DeleteDomainRecord"],"Resource":["acs:alidns:*:*:domain/{{domain}}"]}]}`,
+	IDECSOps:       `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:StartInstance","ecs:StopInstance","ecs:RebootInstance","ecs:DescribeInstances"],"Resource":["acs:ecs:*:*:instance/{{instance_id}}"]}]}`,
+	IDAccountAdmin: `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`,
 }
 
 func TestBuiltinCatalogIsExact(t *testing.T) {
@@ -28,15 +28,16 @@ func TestBuiltinCatalogIsExact(t *testing.T) {
 
 	want := map[string]struct {
 		risk       model.RiskTier
+		access     model.AccessLevel
 		defaultTTL int
 		maxTTL     int
 		paramNames []string
 	}{
-		IDCloudRead:  {model.RiskLow, 900, 1800, nil},
-		IDDNSManage:  {model.RiskMedium, 900, 1800, []string{"domain"}},
-		IDCertDNS01:  {model.RiskMedium, 600, 1200, []string{"domain"}},
-		IDECSOps:     {model.RiskHigh, 900, 1800, []string{"instance_id"}},
-		IDBreakGlass: {model.RiskCritical, 900, 1800, nil},
+		IDCloudRead:    {model.RiskLow, model.AccessRead, 900, 1800, nil},
+		IDDNSManage:    {model.RiskMedium, model.AccessWrite, 900, 1800, []string{"domain"}},
+		IDCertDNS01:    {model.RiskMedium, model.AccessWrite, 600, 1200, []string{"domain"}},
+		IDECSOps:       {model.RiskHigh, model.AccessWrite, 900, 1800, []string{"instance_id"}},
+		IDAccountAdmin: {model.RiskCritical, model.AccessAdmin, 900, 1800, nil},
 	}
 
 	seen := make(map[string]bool, len(caps))
@@ -61,6 +62,9 @@ func TestBuiltinCatalogIsExact(t *testing.T) {
 		}
 		if c.Risk != spec.risk {
 			t.Errorf("%s: risk = %q, want %q", c.ID, c.Risk, spec.risk)
+		}
+		if c.Access != spec.access {
+			t.Errorf("%s: access = %q, want %q", c.ID, c.Access, spec.access)
 		}
 		if !c.Enabled || !c.Builtin {
 			t.Errorf("%s: enabled=%v builtin=%v, want both true", c.ID, c.Enabled, c.Builtin)
@@ -138,6 +142,11 @@ func TestLookup(t *testing.T) {
 	if _, ok := Lookup("does.not.exist"); ok {
 		t.Fatalf("Lookup of unknown ID returned ok")
 	}
+	// The retired break-glass capability is no longer part of the catalog
+	// (CONTRACT §16.2); only the stored row of an upgraded install keeps it.
+	if _, ok := Lookup(IDBreakGlass); ok {
+		t.Fatalf("Lookup(%q) still returns a seeded capability", IDBreakGlass)
+	}
 }
 
 func TestValidateParams(t *testing.T) {
@@ -214,11 +223,11 @@ func TestValidateParamsRejectsInvalidPattern(t *testing.T) {
 
 func TestRenderPolicyAllBuiltins(t *testing.T) {
 	samples := map[string]map[string]string{
-		IDCloudRead:  nil,
-		IDDNSManage:  {"domain": "arveykao.com"},
-		IDCertDNS01:  {"domain": "example.org"},
-		IDECSOps:     {"instance_id": "i-2ze0demo001"},
-		IDBreakGlass: nil,
+		IDCloudRead:    nil,
+		IDDNSManage:    {"domain": "arveykao.com"},
+		IDCertDNS01:    {"domain": "example.org"},
+		IDECSOps:       {"instance_id": "i-2ze0demo001"},
+		IDAccountAdmin: nil,
 	}
 
 	for _, cap := range Builtin() {
@@ -282,8 +291,11 @@ func TestRenderPolicySubstitutesCorrectResource(t *testing.T) {
 }
 
 func TestRenderPolicyErrors(t *testing.T) {
+	// The base template allows a bare "*", so it is only renderable at admin
+	// access (CONTRACT §16.3 rule 2).
 	base := model.Capability{
 		ID:             "cap_test",
+		Access:         model.AccessAdmin,
 		PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":["{{res}}"]}]}`,
 		Params:         []model.CapabilityParam{{Name: "res"}},
 	}
@@ -294,33 +306,53 @@ func TestRenderPolicyErrors(t *testing.T) {
 		params  map[string]string
 		wantErr string
 	}{
-		{"empty template", model.Capability{ID: "cap_empty"}, nil, "empty policy template"},
+		{"empty template", model.Capability{ID: "cap_empty", Access: model.AccessAdmin}, nil, "empty policy template"},
 		{"missing value", base, nil, "missing value"},
 		{"empty value", base, map[string]string{"res": ""}, "missing value"},
 		{"undeclared placeholder", base, map[string]string{"res": "*", "other": "x"}, ""}, // extra params are harmless
 		{
 			"template references undeclared param",
-			model.Capability{ID: "cap_u", PolicyTemplate: `{"x":"{{nope}}"}`},
+			model.Capability{ID: "cap_u", Access: model.AccessAdmin, PolicyTemplate: `{"x":"{{nope}}"}`},
 			map[string]string{"nope": "v"},
 			"undeclared parameter",
 		},
 		{
 			"malformed placeholder",
-			model.Capability{ID: "cap_m", PolicyTemplate: `{"x":"{{ res }}"}`},
+			model.Capability{ID: "cap_m", Access: model.AccessAdmin, PolicyTemplate: `{"x":"{{ res }}"}`},
 			map[string]string{"res": "v"},
 			"unresolved placeholder",
 		},
 		{
 			"invalid JSON template",
-			model.Capability{ID: "cap_bad", PolicyTemplate: `not json`},
+			model.Capability{ID: "cap_bad", Access: model.AccessAdmin, PolicyTemplate: `not json`},
 			nil,
 			"valid JSON",
 		},
 		{
 			"unquoted placeholder yields invalid JSON",
-			model.Capability{ID: "cap_raw", PolicyTemplate: `{"x":{{v}}}`, Params: []model.CapabilityParam{{Name: "v"}}},
+			model.Capability{
+				ID: "cap_raw", Access: model.AccessAdmin, PolicyTemplate: `{"x":{{v}}}`,
+				Params: []model.CapabilityParam{{Name: "v"}},
+			},
 			map[string]string{"v": "abc"},
 			"valid JSON",
+		},
+		{
+			"invalid access level fails closed",
+			model.Capability{
+				ID: "cap_noaccess", PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:DescribeInstances"],"Resource":"*"}]}`,
+			},
+			nil,
+			"not valid",
+		},
+		{
+			"read template that allows a write action is rejected",
+			model.Capability{
+				ID: "cap_read_write", Access: model.AccessRead,
+				PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:StopInstance"],"Resource":"*"}]}`,
+			},
+			nil,
+			"ecs:StopInstance",
 		},
 	}
 
@@ -349,6 +381,7 @@ func TestRenderPolicyErrors(t *testing.T) {
 func TestRenderPolicyEscapesInjectedStructures(t *testing.T) {
 	cap := model.Capability{
 		ID:             "cap_inject",
+		Access:         model.AccessAdmin,
 		PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":["{{res}}"]}]}`,
 		Params:         []model.CapabilityParam{{Name: "res"}},
 	}
@@ -362,20 +395,33 @@ func TestRenderPolicyEscapesInjectedStructures(t *testing.T) {
 		t.Fatalf("injected value broke JSON validity: %s", out)
 	}
 
+	// Resource may be a string ("*") or an array; the mandatory Deny uses the
+	// string form, so the decode type must accept both.
 	var doc struct {
 		Statement []struct {
-			Effect   string   `json:"Effect"`
-			Resource []string `json:"Resource"`
+			Effect   string          `json:"Effect"`
+			Resource json.RawMessage `json:"Resource"`
 		} `json:"Statement"`
 	}
 	if err := json.Unmarshal(out, &doc); err != nil {
 		t.Fatalf("unmarshal rendered policy: %v", err)
 	}
-	if len(doc.Statement) != 1 {
-		t.Fatalf("injection added statements: got %d", len(doc.Statement))
+	// One Allow statement from the template plus the mandatory deny (§16.3).
+	if len(doc.Statement) != 2 {
+		t.Fatalf("injection changed the statement count: got %d, want 2", len(doc.Statement))
 	}
-	if len(doc.Statement[0].Resource) != 1 || doc.Statement[0].Resource[0] != attack {
-		t.Fatalf("injected value was not preserved as a literal string: %+v", doc.Statement[0].Resource)
+	resources, err := jsonStringList(doc.Statement[0].Resource)
+	if err != nil {
+		t.Fatalf("decode Allow Resource: %v", err)
+	}
+	if len(resources) != 1 || resources[0] != attack {
+		t.Fatalf("injected value was not preserved as a literal string: %+v", resources)
+	}
+	if doc.Statement[1].Effect != "Deny" {
+		t.Fatalf("second statement = %+v, want the mandatory deny", doc.Statement[1])
+	}
+	if _, err := jsonStringList(doc.Statement[1].Resource); err != nil {
+		t.Fatalf("decode Deny Resource: %v", err)
 	}
 	if strings.Contains(string(out), `},{"Effect":"Allow"`) {
 		t.Fatalf("injection escaped its string literal: %s", out)
@@ -383,12 +429,15 @@ func TestRenderPolicyEscapesInjectedStructures(t *testing.T) {
 }
 
 func TestRenderPolicyNoParamsForStaticTemplate(t *testing.T) {
-	bg, _ := Lookup(IDBreakGlass)
-	out, err := RenderPolicy(bg, nil)
+	admin, ok := Lookup(IDAccountAdmin)
+	if !ok {
+		t.Fatalf("Lookup(%q) = not found", IDAccountAdmin)
+	}
+	out, err := RenderPolicy(admin, nil)
 	if err != nil {
 		t.Fatalf("RenderPolicy() error = %v", err)
 	}
-	want := `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`
+	want := `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"},` + DenyStatement + `]}`
 	if string(out) != want {
 		t.Fatalf("RenderPolicy() = %s, want %s", out, want)
 	}

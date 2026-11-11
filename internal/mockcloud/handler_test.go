@@ -97,6 +97,14 @@ const (
 
 	readPolicyTemplate = `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:Describe*","alidns:Describe*","oss:List*","sts:GetCallerIdentity"],"Resource":["*"]}]}`
 	breakGlassPolicy   = `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`
+
+	// accountAdminPolicy is what the control plane actually mints for
+	// aliyun.account.admin: account-wide Allow plus the mandatory IAM deny that
+	// capcatalog.RenderPolicy appends to every document (CONTRACT §16.3). It is
+	// spelled out literally here so this package documents the exact wire form
+	// the mock cloud must enforce.
+	accountAdminPolicy = `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"},` +
+		`{"Effect":"Deny","Action":["ram:*","sts:AssumeRole"],"Resource":"*"}]}`
 )
 
 func dnsManagePolicy(domain string) string {
@@ -907,5 +915,110 @@ func TestECSTransitionInvalidStatusNoOp(t *testing.T) {
 	}
 	if code := stringField(t, body, "Code"); code != "InvalidInstance.NotFound" {
 		t.Fatalf("Code = %q", code)
+	}
+}
+
+// TestAccountAdminLeaseIsDeniedOnRAM is the end-to-end proof of the IAM
+// prohibition inside the mock cloud (CONTRACT §16.8): the account-wide admin
+// credential works on ECS and is still refused on RAM, because every minted
+// document carries the mandatory deny for ram:*.
+func TestAccountAdminLeaseIsDeniedOnRAM(t *testing.T) {
+	env := newTestEnv(t)
+	token := env.token(accountAdminPolicy, nil)
+
+	// ECS read is allowed.
+	rec, body := env.request(http.MethodGet, "/v1/ecs/instances", token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ECS list status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if instances, ok := body["Instances"].([]any); !ok || len(instances) != 3 {
+		t.Fatalf("ECS list = %v, want 3 fixtures", body["Instances"])
+	}
+	// So is an ECS write: this credential really is account-wide.
+	rec, _ = env.request(http.MethodPost, "/v1/ecs/instances/i-2ze0demo002/start", token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ECS start status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	// RAM is not, even though the Allow statement covers every action.
+	rec, body = env.request(http.MethodGet, "/v1/ram/users", token, "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("RAM list status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+	if code := stringField(t, body, "Code"); code != "Forbidden.RAM" {
+		t.Fatalf("RAM list Code = %q, want Forbidden.RAM", code)
+	}
+	if got := rec.Header().Get("X-Csg-Error-Code"); got != "Forbidden.RAM" {
+		t.Fatalf("X-Csg-Error-Code = %q, want Forbidden.RAM", got)
+	}
+	if body["Users"] != nil {
+		t.Fatalf("denied RAM response leaked a user list: %v", body["Users"])
+	}
+
+	// The denial is attributable: a warning-severity cloud.api_called naming
+	// the RAM action.
+	denied := false
+	for _, ev := range env.events() {
+		if ev.Action != "cloud.api_called" || ev.Status != "denied" {
+			continue
+		}
+		if action, _ := ev.Metadata["action"].(string); action != "ram:ListUsers" {
+			continue
+		}
+		denied = true
+		if ev.Severity != "warning" {
+			t.Fatalf("RAM denial severity = %q, want warning", ev.Severity)
+		}
+		if service, _ := ev.Metadata["service"].(string); service != "ram" {
+			t.Fatalf("RAM denial service = %q, want ram", service)
+		}
+		if ev.TargetID != testLeaseID {
+			t.Fatalf("RAM denial target = %q, want the lease", ev.TargetID)
+		}
+	}
+	if !denied {
+		t.Fatal("RAM denial was not audited as cloud.api_called/denied")
+	}
+}
+
+// TestRAMRouteNeedsTheDenyStatement shows what the mandatory deny buys: the
+// mock cloud enforces exactly the document it is handed, so RAM is only
+// unreachable because RenderPolicy always appends the deny.
+func TestRAMRouteNeedsTheDenyStatement(t *testing.T) {
+	env := newTestEnv(t)
+
+	// A read-only credential has no Allow covering ram:ListUsers.
+	rec, body := env.request(http.MethodGet, "/v1/ram/users", env.token(readPolicyTemplate, nil), "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("read credential on RAM status = %d, want 403", rec.Code)
+	}
+	if code := stringField(t, body, "Code"); code != "Forbidden.RAM" {
+		t.Fatalf("Code = %q, want Forbidden.RAM", code)
+	}
+
+	// A hand-made document that allows RAM and omits the deny would pass: the
+	// control plane is what makes that document impossible to mint.
+	ramAllow := `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ram:ListUsers"],"Resource":["*"]}]}`
+	rec, body = env.request(http.MethodGet, "/v1/ram/users", env.token(ramAllow, nil), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hand-made ram:ListUsers policy status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	users, ok := body["Users"].(map[string]any)
+	if !ok {
+		t.Fatalf("RAM list body = %v, want a Users object", body)
+	}
+	if list, ok := users["User"].([]any); !ok || len(list) != 2 {
+		t.Fatalf("RAM fixtures = %v, want 2 users", users["User"])
+	}
+
+	// Add the mandatory deny and the same request is refused.
+	ramAllowWithDeny := `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ram:ListUsers"],"Resource":["*"]},` +
+		`{"Effect":"Deny","Action":["ram:*","sts:AssumeRole"],"Resource":"*"}]}`
+	rec, body = env.request(http.MethodGet, "/v1/ram/users", env.token(ramAllowWithDeny, nil), "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("ram:ListUsers with the mandatory deny status = %d, want 403", rec.Code)
+	}
+	if code := stringField(t, body, "Code"); code != "Forbidden.RAM" {
+		t.Fatalf("Code = %q, want Forbidden.RAM", code)
 	}
 }

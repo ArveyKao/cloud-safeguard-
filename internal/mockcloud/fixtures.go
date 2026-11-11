@@ -20,6 +20,7 @@ const (
 	instanceStopped = "stopped"
 	ecsService      = "ecs"
 	dnsService      = "alidns"
+	ramService      = "ram"
 )
 
 // ecsInstance is one in-memory ECS fixture instance. RegionId is filled from
@@ -47,6 +48,16 @@ type dnsRecord struct {
 	Status   string `json:"Status"`
 }
 
+// ramUser is one in-memory RAM (identity) fixture user. RAM exists in the mock
+// cloud only so the IAM prohibition can be demonstrated end to end: every
+// credential the control plane mints carries a deny for ram:*, so this route
+// must always answer 403 Forbidden.RAM.
+type ramUser struct {
+	UserID      string `json:"UserId"`
+	UserName    string `json:"UserName"`
+	DisplayName string `json:"DisplayName"`
+}
+
 // cloudState is the mutable, per-handler fixture state. It resets whenever the
 // process (or handler) is recreated.
 type cloudState struct {
@@ -57,6 +68,7 @@ type cloudState struct {
 	zoneOrder     []string
 	records       map[string][]*dnsRecord
 	nextRecordSeq int
+	ramUsers      []ramUser
 }
 
 // newCloudState builds the frozen fixtures.
@@ -89,7 +101,18 @@ func newCloudState() *cloudState {
 		{RecordID: "dns-rec-0003", RR: "_acme-challenge", Type: "TXT", Value: "demo-token-123", TTL: 600, Status: recordStatusUp},
 	}
 	st.records[zoneGuanlan] = nil
+	st.ramUsers = []ramUser{
+		{UserID: "ram-demo-0001", UserName: "ops-admin", DisplayName: "Operations admin"},
+		{UserID: "ram-demo-0002", UserName: "csg-broker", DisplayName: "Cloud Safeguard broker"},
+	}
 	return st
+}
+
+// listRAMUsers returns a copy of the RAM fixture users in stable order.
+func (st *cloudState) listRAMUsers() []ramUser {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return append([]ramUser(nil), st.ramUsers...)
 }
 
 // listInstances returns a copy of the ECS fixture list in stable order.

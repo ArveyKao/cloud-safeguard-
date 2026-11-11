@@ -14,6 +14,7 @@ func baseAgent() model.Agent {
 		ID:                  "agt_test",
 		Name:                "test-agent",
 		Status:              model.AgentActive,
+		Role:                model.RoleAdministrator,
 		Grants:              []string{"cap.read", "cap.medium", "cap.high", "cap.critical"},
 		MaxTTLSeconds:       1800,
 		MaxConcurrentLeases: 3,
@@ -26,6 +27,7 @@ func baseCapability() model.Capability {
 		Name:              "Read",
 		ProviderType:      model.ProviderAliyun,
 		Risk:              model.RiskLow,
+		Access:            model.AccessRead,
 		PolicyTemplate:    `{"Version":"1"}`,
 		DefaultTTLSeconds: 900,
 		MaxTTLSeconds:     1800,
@@ -91,6 +93,8 @@ func TestEvaluateRules(t *testing.T) {
 			wantTTL:      900,
 			wantRules: map[string]string{
 				RuleCapabilityGranted:   OutcomeAllow,
+				RuleRolePermits:         OutcomeAllow,
+				RuleIAMProhibited:       OutcomeAllow,
 				RuleCapabilityEnabled:   OutcomeAllow,
 				RuleProviderAvailable:   OutcomeAllow,
 				RuleProviderActive:      OutcomeAllow,
@@ -123,6 +127,71 @@ func TestEvaluateRules(t *testing.T) {
 			},
 			wantDetail: map[string][]string{
 				RuleCapabilityGranted: {"cap.not-granted", "agt_test"},
+			},
+		},
+		{
+			name: "role that does not permit the access level denies",
+			mutate: func(in *Input) {
+				in.Agent.Role = model.RoleGuest
+				in.Capability = mediumCapability() // write access
+			},
+			wantDecision: model.OutcomeDeny,
+			wantTTL:      900,
+			wantRules: map[string]string{
+				RuleCapabilityGranted: OutcomeAllow,
+				RuleRolePermits:       OutcomeDeny,
+			},
+			wantDetail: map[string][]string{
+				RuleRolePermits: {"guest", "write", "cap.medium"},
+			},
+		},
+		{
+			name: "guest may hold a read capability",
+			mutate: func(in *Input) {
+				in.Agent.Role = model.RoleGuest
+			},
+			wantDecision: model.OutcomeAutoApprove,
+			wantTTL:      900,
+			wantRules: map[string]string{
+				RuleRolePermits: OutcomeAllow,
+			},
+		},
+		{
+			name: "member may not hold an admin capability",
+			mutate: func(in *Input) {
+				in.Agent.Role = model.RoleMember
+				in.Capability = criticalCapability()
+				in.BreakGlass = true
+			},
+			wantDecision: model.OutcomeDeny,
+			wantTTL:      900,
+			wantRules: map[string]string{
+				RuleRolePermits: OutcomeDeny,
+			},
+		},
+		{
+			name: "an empty role permits nothing (fail closed)",
+			mutate: func(in *Input) {
+				in.Agent.Role = ""
+			},
+			wantDecision: model.OutcomeDeny,
+			wantTTL:      900,
+			wantRules: map[string]string{
+				RuleRolePermits: OutcomeDeny,
+			},
+		},
+		{
+			name: "a prohibited rendered policy denies",
+			mutate: func(in *Input) {
+				in.PolicyViolation = `action "ram:CreateUser" targets RAM`
+			},
+			wantDecision: model.OutcomeDeny,
+			wantTTL:      900,
+			wantRules: map[string]string{
+				RuleIAMProhibited: OutcomeDeny,
+			},
+			wantDetail: map[string][]string{
+				RuleIAMProhibited: {"cap.read", "ram:CreateUser"},
 			},
 		},
 		{
@@ -460,8 +529,8 @@ func TestEvaluateRecordsEveryRule(t *testing.T) {
 	if d.Outcome != model.OutcomeAutoApprove {
 		t.Fatalf("baseline outcome = %q, want auto_approve", d.Outcome)
 	}
-	if len(d.Reasons) != 15 {
-		t.Fatalf("len(Reasons) = %d, want 15 (14 guardrails + auto_approve)", len(d.Reasons))
+	if len(d.Reasons) != 18 {
+		t.Fatalf("len(Reasons) = %d, want 18 (17 guardrails + auto_approve)", len(d.Reasons))
 	}
 	seen := make(map[string]bool, len(d.Reasons))
 	for _, r := range d.Reasons {
@@ -471,11 +540,12 @@ func TestEvaluateRecordsEveryRule(t *testing.T) {
 		seen[r.Rule] = true
 	}
 	wantRules := []string{
-		RuleCapabilityGranted, RuleCapabilityEnabled, RuleProviderAvailable,
+		RuleCapabilityGranted, RuleRolePermits, RuleIAMProhibited,
+		RuleCapabilityEnabled, RuleProviderAvailable,
 		RuleProviderActive, RuleReasonRequired, RuleBreakGlassRequired,
 		RuleTTLWithinCapability, RuleTTLWithinAgent, RuleTTLWithinGlobal,
 		RuleConcurrency, RuleRateLimit, RuleBreakGlassApproval,
-		RuleRiskAboveAuto, RuleTTLAboveAuto, RuleAutoApprove,
+		RuleAdminApproval, RuleRiskAboveAuto, RuleTTLAboveAuto, RuleAutoApprove,
 	}
 	for _, rule := range wantRules {
 		if !seen[rule] {
@@ -486,12 +556,16 @@ func TestEvaluateRecordsEveryRule(t *testing.T) {
 
 func TestEvaluateRuleOrderIsStable(t *testing.T) {
 	d := Evaluate(baseInput())
+	// role_permits and iam_prohibited run directly after capability_granted,
+	// and admin_requires_approval directly after break_glass_approval
+	// (CONTRACT §16.4); every other key keeps its position.
 	want := []string{
-		RuleCapabilityGranted, RuleCapabilityEnabled, RuleProviderAvailable,
+		RuleCapabilityGranted, RuleRolePermits, RuleIAMProhibited,
+		RuleCapabilityEnabled, RuleProviderAvailable,
 		RuleProviderActive, RuleReasonRequired, RuleBreakGlassRequired,
 		RuleTTLWithinCapability, RuleTTLWithinAgent, RuleTTLWithinGlobal,
 		RuleConcurrency, RuleRateLimit, RuleBreakGlassApproval,
-		RuleRiskAboveAuto, RuleTTLAboveAuto, RuleAutoApprove,
+		RuleAdminApproval, RuleRiskAboveAuto, RuleTTLAboveAuto, RuleAutoApprove,
 	}
 	if len(d.Reasons) != len(want) {
 		t.Fatalf("len(Reasons) = %d, want %d", len(d.Reasons), len(want))
@@ -573,13 +647,35 @@ func mediumCapability() model.Capability {
 	c.ID = "cap.medium"
 	c.Name = "Manage DNS"
 	c.Risk = model.RiskMedium
+	c.Access = model.AccessWrite
 	return c
 }
 
 func criticalCapability() model.Capability {
 	c := baseCapability()
 	c.ID = "cap.critical"
-	c.Name = "Break glass"
+	c.Name = "Account admin"
 	c.Risk = model.RiskCritical
+	c.Access = model.AccessAdmin
 	return c
+}
+
+func TestAdminAccessAlwaysRequiresApproval(t *testing.T) {
+	in := baseInput()
+	in.Agent.Role = model.RoleAdministrator
+	in.Capability.Access = model.AccessAdmin
+	in.Capability.Risk = model.RiskLow // a custom admin capability declared low risk
+	d := Evaluate(in)
+	if d.Outcome != model.OutcomeRequireApproval {
+		t.Fatalf("outcome = %q, want require_approval for admin access", d.Outcome)
+	}
+	found := false
+	for _, r := range d.Reasons {
+		if r.Rule == RuleAdminApproval && r.Outcome == OutcomeRequireApproval {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reasons lack %s=require_approval: %+v", RuleAdminApproval, d.Reasons)
+	}
 }

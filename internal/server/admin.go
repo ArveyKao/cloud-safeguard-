@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -326,8 +325,23 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 		s.writeHandlerError(w, err)
 		return
 	}
+	if s.hookAfterAuthorityWrite != nil {
+		s.hookAfterAuthorityWrite("provider")
+	}
+	// Disabling a cloud account stops it: its pending and active leases are
+	// revoked (the re-check fails on "provider is not active").
+	revoked := []string{}
+	if prov.Status != model.ProviderActive {
+		ids, err := s.revalidateLeases(r.Context(), store.LeaseFilter{}, "provider "+prov.ID+" disabled")
+		if err != nil {
+			s.writeHandlerError(w, err)
+			return
+		}
+		revoked = ids
+	}
 	s.adminAudit(r.Context(), "provider.updated", "ok", "info", "provider", prov.ID, map[string]any{
-		"changed_fields": changed,
+		"changed_fields":    changed,
+		"revoked_lease_ids": revoked,
 	})
 	s.writeData(w, http.StatusOK, prov)
 }
@@ -487,8 +501,18 @@ func (s *Server) handleAdminCreateCapability(w http.ResponseWriter, r *http.Requ
 		s.badRequest(w, "provider_type must be aliyun")
 		return
 	}
+	// An unspecified access level is classified as admin: that is both the most
+	// restrictive classification (only administrators may hold it) and what the
+	// schema-2 migration assigns to custom capabilities.
+	if in.Access == "" {
+		in.Access = model.AccessAdmin
+	}
 	if err := validateCapabilityDefinition(in, settings); err != nil {
 		s.badRequest(w, err.Error())
+		return
+	}
+	if err := s.checkCapabilityPolicy(r.Context(), in, "capability.create"); err != nil {
+		s.writeHandlerError(w, err)
 		return
 	}
 	now := s.nowUTC()
@@ -512,6 +536,7 @@ func (s *Server) handleAdminCreateCapability(w http.ResponseWriter, r *http.Requ
 	s.adminAudit(r.Context(), "capability.created", "ok", "info", "capability", in.ID, map[string]any{
 		"capability_id": in.ID,
 		"risk":          string(in.Risk),
+		"access":        string(in.Access),
 		"builtin":       false,
 	})
 	s.writeData(w, http.StatusCreated, in)
@@ -524,6 +549,7 @@ type capabilityPatch struct {
 	DefaultTTLSeconds *int                     `json:"default_ttl_seconds,omitempty"`
 	MaxTTLSeconds     *int                     `json:"max_ttl_seconds,omitempty"`
 	Risk              *model.RiskTier          `json:"risk,omitempty"`
+	Access            *model.AccessLevel       `json:"access,omitempty"`
 	PolicyTemplate    *string                  `json:"policy_template,omitempty"`
 	Params            *[]model.CapabilityParam `json:"params,omitempty"`
 }
@@ -535,6 +561,9 @@ func (s *Server) handleAdminUpdateCapability(w http.ResponseWriter, r *http.Requ
 		s.badRequest(w, "invalid request body: "+err.Error())
 		return
 	}
+	// Exclusive with activations of this capability until the sweeps finish.
+	unlockCapability := s.lockCapabilityWrite(r.PathValue("id"))
+	defer unlockCapability()
 	capability, err := s.db.GetCapability(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -548,10 +577,20 @@ func (s *Server) handleAdminUpdateCapability(w http.ResponseWriter, r *http.Requ
 		s.badRequest(w, "risk, policy_template and params of builtin capabilities cannot be modified")
 		return
 	}
+	// The access level of a builtin is part of the frozen catalog: changing it
+	// would silently re-open a capability to roles that must not hold it.
+	if capability.Builtin && in.Access != nil && *in.Access != capability.Access {
+		s.badRequest(w, "access of builtin capabilities cannot be modified")
+		return
+	}
 	changed := make([]string, 0, 4)
 	if in.Description != nil && capability.Description != *in.Description {
 		capability.Description = *in.Description
 		changed = append(changed, "description")
+	}
+	if in.Enabled != nil && *in.Enabled && isRetiredCapability(capability.ID) {
+		s.badRequest(w, "capability "+capability.ID+" is retired and cannot be enabled")
+		return
 	}
 	if in.Enabled != nil && capability.Enabled != *in.Enabled {
 		capability.Enabled = *in.Enabled
@@ -562,12 +601,27 @@ func (s *Server) handleAdminUpdateCapability(w http.ResponseWriter, r *http.Requ
 		changed = append(changed, "default_ttl_seconds")
 	}
 	if in.MaxTTLSeconds != nil {
+		if *in.MaxTTLSeconds < capability.MaxTTLSeconds {
+			changed = append(changed, "max_ttl_lowered")
+		}
 		capability.MaxTTLSeconds = *in.MaxTTLSeconds
 		changed = append(changed, "max_ttl_seconds")
 	}
 	if in.Risk != nil {
 		capability.Risk = *in.Risk
 		changed = append(changed, "risk")
+	}
+	if in.Access != nil && capability.Access != *in.Access {
+		// Raising access on a custom capability must not leave any granted
+		// agent holding a level its role cannot use (CONTRACT §16.3).
+		if !capability.Builtin && in.Access.Rank() > capability.Access.Rank() {
+			if err := s.checkAccessRaiseAgainstGrants(r.Context(), capability.ID, *in.Access); err != nil {
+				s.writeHandlerError(w, err)
+				return
+			}
+		}
+		capability.Access = *in.Access
+		changed = append(changed, "access")
 	}
 	if in.PolicyTemplate != nil {
 		capability.PolicyTemplate = *in.PolicyTemplate
@@ -586,24 +640,75 @@ func (s *Server) handleAdminUpdateCapability(w http.ResponseWriter, r *http.Requ
 		s.badRequest(w, err.Error())
 		return
 	}
+	if err := s.checkCapabilityPolicy(r.Context(), capability, "capability.update"); err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
 	capability.UpdatedAt = s.nowUTC()
 	if err := s.db.UpdateCapability(r.Context(), capability); err != nil {
 		s.writeHandlerError(w, err)
 		return
 	}
+	if s.hookAfterAuthorityWrite != nil {
+		s.hookAfterAuthorityWrite("capability")
+	}
+	// An edit that disables or changes what a capability grants invalidates
+	// requests approved against the old definition: revoke its pending leases
+	// so an approval racing this edit loses its compare-and-set.
+	revokedPending := []string{}
+	if narrowsCapability(changed, capability) {
+		ids, err := s.revokePendingLeasesForCapability(r.Context(), capability.ID, "capability "+capability.ID+" changed")
+		if err != nil {
+			s.writeHandlerError(w, err)
+			return
+		}
+		revokedPending = ids
+	}
+	// Then re-check every remaining pending and active lease against the new
+	// definition (disabled, lower TTL ceiling, prohibited policy). This also
+	// catches a lease an approval activated between its post-mint recheck and
+	// this edit's commit.
+	revalidated, err := s.revalidateLeases(r.Context(), store.LeaseFilter{CapabilityID: capability.ID}, "capability "+capability.ID+" changed")
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	revokedPending = append(revokedPending, revalidated...)
 	s.adminAudit(r.Context(), "capability.updated", "ok", "info", "capability", capability.ID, map[string]any{
-		"changed_fields": changed,
+		"changed_fields":         changed,
+		"revoked_pending_leases": revokedPending,
 	})
 	s.writeData(w, http.StatusOK, capability)
 }
 
-// validateCapabilityDefinition enforces CONTRACT §4 capability validation.
+// narrowsCapability reports whether a capability edit can make an already
+// requested lease wrong: disabling it, or changing its access, policy or params.
+func narrowsCapability(changed []string, capability model.Capability) bool {
+	for _, field := range changed {
+		switch field {
+		case "access", "policy_template", "params", "max_ttl_lowered":
+			return true
+		case "enabled":
+			if !capability.Enabled {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validateCapabilityDefinition enforces CONTRACT §4 capability validation. The
+// IAM prohibition is checked separately by checkCapabilityPolicy, which audits
+// its rejections.
 func validateCapabilityDefinition(c model.Capability, settings model.PolicySettings) error {
 	if !c.ProviderType.Valid() {
 		return fmt.Errorf("provider_type must be aliyun")
 	}
 	if !c.Risk.Valid() {
 		return fmt.Errorf("risk %q is not a valid risk tier", c.Risk)
+	}
+	if !c.Access.Valid() {
+		return fmt.Errorf("access %q is not a valid access level (read, write, admin)", c.Access)
 	}
 	if c.DefaultTTLSeconds <= 0 {
 		return fmt.Errorf("default_ttl_seconds must be positive")
@@ -614,47 +719,62 @@ func validateCapabilityDefinition(c model.Capability, settings model.PolicySetti
 	if c.MaxTTLSeconds > settings.MaxLeaseTTLSeconds {
 		return fmt.Errorf("max_ttl_seconds must not exceed the global maximum %d", settings.MaxLeaseTTLSeconds)
 	}
-	if _, err := renderSamplePolicy(c); err != nil {
-		return err
-	}
 	return nil
 }
 
-// sampleParamValue returns a safe sample value for a declared parameter.
-func sampleParamValue(p model.CapabilityParam) string {
-	candidates := []string{"sample"}
-	switch p.Name {
-	case "domain":
-		candidates = append(candidates, "example.com")
-	case "instance_id":
-		candidates = append(candidates, "i-sample123")
+// checkAccessRaiseAgainstGrants rejects a custom-capability access raise when
+// any agent already granted it has a role that would not permit the new level
+// (CONTRACT §16.3). The error names every such agent so the operator can
+// demote grants or promote roles before retrying; grants are never left
+// outside a role.
+func (s *Server) checkAccessRaiseAgainstGrants(ctx context.Context, capabilityID string, newAccess model.AccessLevel) error {
+	agents, err := s.db.ListAgents(ctx)
+	if err != nil {
+		return err
 	}
-	for _, candidate := range candidates {
-		if p.Pattern == "" {
-			return candidate
+	blocked := make([]string, 0)
+	for _, ag := range agents {
+		if !agentHasGrant(ag, capabilityID) {
+			continue
 		}
-		if re, err := regexp.Compile(p.Pattern); err == nil && re.MatchString(candidate) {
-			return candidate
+		if ag.Role.Permits(newAccess) {
+			continue
 		}
+		blocked = append(blocked, fmt.Sprintf("%s (%s)", ag.Name, ag.Role))
 	}
-	return candidates[0]
+	if len(blocked) == 0 {
+		return nil
+	}
+	return errBadRequestAPI(fmt.Sprintf(
+		"cannot raise access to %s: agents %s have roles that do not permit the new level",
+		newAccess, strings.Join(blocked, ", ")))
 }
 
-// renderSamplePolicy renders the policy template with sample params and
-// requires the result to be valid JSON.
-func renderSamplePolicy(c model.Capability) ([]byte, error) {
-	samples := make(map[string]string, len(c.Params))
-	for _, p := range c.Params {
-		samples[p.Name] = sampleParamValue(p)
+// checkCapabilityPolicy renders the capability's policy template with sample
+// params and requires the result to satisfy the IAM prohibition (CONTRACT
+// §16.3). A violation is a 400 invalid_request naming the offending action and
+// is audited as capability.rejected, because a capability that cannot render a
+// permitted policy would otherwise sit in the catalog and fail at mint time.
+func (s *Server) checkCapabilityPolicy(ctx context.Context, c model.Capability, intent string) error {
+	rendered, err := capcatalog.RenderSample(c)
+	if err == nil && !json.Valid(rendered) {
+		err = errors.New("the template does not render to valid JSON")
 	}
-	rendered, err := capcatalog.RenderPolicy(c, samples)
-	if err != nil {
-		return nil, fmt.Errorf("policy_template is not valid: %v", err)
+	if err == nil {
+		return nil
 	}
-	if !json.Valid(rendered) {
-		return nil, fmt.Errorf("policy_template does not render to valid JSON")
+	target := c.ID
+	if target == "" {
+		target = "new"
 	}
-	return rendered, nil
+	s.adminAudit(ctx, "capability.rejected", "denied", "warning", "capability", target, map[string]any{
+		"capability_id": target,
+		"name":          c.Name,
+		"access":        string(c.Access),
+		"intent":        intent,
+		"reason":        sanitizeMessage(err.Error()),
+	})
+	return errBadRequestAPI("policy_template is not permitted: " + sanitizeMessage(err.Error()))
 }
 
 // ================= agents =================
@@ -669,8 +789,10 @@ func (s *Server) handleAdminListAgents(w http.ResponseWriter, r *http.Request) {
 	writeList(s, w, http.StatusOK, items, len(items))
 }
 
-// validateGrants checks that every granted capability exists and dedupes IDs.
-func (s *Server) validateGrants(ctx context.Context, grants []string) ([]string, error) {
+// validateGrants checks that every granted capability exists and is permitted
+// by the agent's role, and dedupes IDs. Grants are always a subset of what the
+// role permits (CONTRACT §16.1).
+func (s *Server) validateGrants(ctx context.Context, role model.AgentRole, grants []string) ([]string, error) {
 	out := make([]string, 0, len(grants))
 	seen := make(map[string]bool, len(grants))
 	for _, grant := range grants {
@@ -681,16 +803,62 @@ func (s *Server) validateGrants(ctx context.Context, grants []string) ([]string,
 		if seen[grant] {
 			continue
 		}
-		if _, err := s.db.GetCapability(ctx, grant); err != nil {
+		capability, err := s.db.GetCapability(ctx, grant)
+		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return nil, errBadRequestAPI("unknown capability " + grant)
 			}
 			return nil, err
 		}
+		if isRetiredCapability(capability.ID) {
+			return nil, errBadRequestAPI("capability " + grant + " is retired and cannot be granted")
+		}
+		if !role.Permits(capability.Access) {
+			return nil, errBadRequestAPI(fmt.Sprintf(
+				"capability %s requires %s access, which role %s does not permit",
+				grant, capability.Access, role))
+		}
 		seen[grant] = true
 		out = append(out, grant)
 	}
 	return out, nil
+}
+
+// defaultGrantsForRole returns every enabled capability the role permits, in
+// catalog order. It is the grant set an agent gets when a create or a role
+// change does not name grants explicitly; later capabilities are not granted
+// retroactively (CONTRACT §16.5).
+func (s *Server) defaultGrantsForRole(ctx context.Context, role model.AgentRole) ([]string, error) {
+	capabilities, err := s.db.ListCapabilities(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(capabilities))
+	for _, c := range capabilities {
+		if c.Enabled && !isRetiredCapability(c.ID) && role.Permits(c.Access) {
+			out = append(out, c.ID)
+		}
+	}
+	return out, nil
+}
+
+// parseRole validates a role from an admin request body.
+func parseRole(raw model.AgentRole) (model.AgentRole, error) {
+	role, ok := model.ParseAgentRole(strings.TrimSpace(string(raw)))
+	if !ok {
+		return "", errBadRequestAPI("role must be one of guest, member, administrator")
+	}
+	return role, nil
+}
+
+// agentHasGrant reports whether the agent currently holds a capability.
+func agentHasGrant(ag model.Agent, capabilityID string) bool {
+	for _, grant := range ag.Grants {
+		if grant == capabilityID {
+			return true
+		}
+	}
+	return false
 }
 
 // handleAdminCreateAgent implements POST /api/v1/admin/agents.
@@ -710,7 +878,21 @@ func (s *Server) handleAdminCreateAgent(w http.ResponseWriter, r *http.Request) 
 		s.writeHandlerError(w, err)
 		return
 	}
-	grants, err := s.validateGrants(r.Context(), in.Grants)
+	// Role is optional and defaults to the least privileged one.
+	if in.Role == "" {
+		in.Role = model.RoleGuest
+	}
+	role, err := parseRole(in.Role)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	var grants []string
+	if len(in.Grants) == 0 {
+		grants, err = s.defaultGrantsForRole(r.Context(), role)
+	} else {
+		grants, err = s.validateGrants(r.Context(), role, in.Grants)
+	}
 	if err != nil {
 		s.writeHandlerError(w, err)
 		return
@@ -747,6 +929,7 @@ func (s *Server) handleAdminCreateAgent(w http.ResponseWriter, r *http.Request) 
 		Name:                in.Name,
 		Description:         in.Description,
 		Status:              model.AgentActive,
+		Role:                role,
 		Grants:              grants,
 		MaxTTLSeconds:       maxTTL,
 		MaxConcurrentLeases: maxConcurrent,
@@ -760,6 +943,7 @@ func (s *Server) handleAdminCreateAgent(w http.ResponseWriter, r *http.Request) 
 	}
 	s.adminAudit(r.Context(), "agent.created", "ok", "info", "agent", ag.ID, map[string]any{
 		"agent_id": ag.ID,
+		"role":     string(ag.Role),
 		"grants":   grants,
 	})
 	s.writeData(w, http.StatusCreated, model.AgentWithToken{Agent: ag, Token: plainToken})
@@ -811,8 +995,35 @@ func (s *Server) handleAdminUpdateAgent(w http.ResponseWriter, r *http.Request) 
 		ag.Description = *in.Description
 		changed = append(changed, "description")
 	}
-	if in.Grants != nil {
-		grants, err := s.validateGrants(r.Context(), *in.Grants)
+	// The role is resolved before grants: grants are always validated against
+	// the role the agent ends up with.
+	previousRole := ag.Role
+	roleChanged := false
+	if in.Role != nil {
+		role, err := parseRole(*in.Role)
+		if err != nil {
+			s.writeHandlerError(w, err)
+			return
+		}
+		if role != ag.Role {
+			ag.Role = role
+			roleChanged = true
+			changed = append(changed, "role")
+		}
+	}
+	switch {
+	case in.Grants != nil:
+		grants, err := s.validateGrants(r.Context(), ag.Role, *in.Grants)
+		if err != nil {
+			s.writeHandlerError(w, err)
+			return
+		}
+		ag.Grants = grants
+		changed = append(changed, "grants")
+	case roleChanged:
+		// A role change without explicit grants resets them to the new role's
+		// default set (CONTRACT §16.5).
+		grants, err := s.defaultGrantsForRole(r.Context(), ag.Role)
 		if err != nil {
 			s.writeHandlerError(w, err)
 			return
@@ -851,10 +1062,47 @@ func (s *Server) handleAdminUpdateAgent(w http.ResponseWriter, r *http.Request) 
 		s.writeHandlerError(w, err)
 		return
 	}
+	if s.hookAfterAuthorityWrite != nil {
+		s.hookAfterAuthorityWrite("agent")
+	}
+	// Any change that removes authority takes effect in this request: every
+	// pending or active lease the agent is no longer authorized for is revoked
+	// before the response is written. The sweep runs on every update, not only
+	// when this request changed something, so retrying an update whose sweep
+	// failed half-way finishes the job.
+	reason := "agent authorization changed"
+	if roleChanged {
+		reason = "role changed to " + string(ag.Role)
+	}
+	revoked, err := s.revokeUnauthorizedLeases(r.Context(), ag, reason)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
 	s.adminAudit(r.Context(), "agent.updated", "ok", "info", "agent", ag.ID, map[string]any{
 		"changed_fields": changed,
 	})
+	if roleChanged {
+		s.adminAudit(r.Context(), "agent.role_changed", "ok", "warning", "agent", ag.ID, map[string]any{
+			"agent_id":          ag.ID,
+			"from":              string(previousRole),
+			"to":                string(ag.Role),
+			"revoked_lease_ids": revoked,
+		})
+	}
 	s.writeData(w, http.StatusOK, ag)
+}
+
+// revokeUnauthorizedLeases revokes every pending or active lease the agent is
+// no longer authorized for (agent not active, capability retired, missing or no
+// longer granted, or not permitted by the role) and returns the revoked lease
+// IDs. It is idempotent, so callers run it on every authority change.
+//
+// Note (SECURITY.md residual risk): already-minted real STS credentials stay
+// valid until they expire. Revocation stops the control plane from handing the
+// credential out again and makes the mock cloud reject it immediately.
+func (s *Server) revokeUnauthorizedLeases(ctx context.Context, ag model.Agent, reason string) ([]string, error) {
+	return s.revalidateLeases(ctx, store.LeaseFilter{AgentID: ag.ID}, reason)
 }
 
 // handleAdminSuspendAgent implements POST /api/v1/admin/agents/{id}/suspend.
@@ -884,9 +1132,17 @@ func (s *Server) setAgentStatus(w http.ResponseWriter, r *http.Request, status m
 		s.writeHandlerError(w, err)
 		return
 	}
+	// Suspension revokes the agent's pending and active leases in the same
+	// request; activation revokes nothing (the sweep finds nothing to do).
+	revoked, err := s.revokeUnauthorizedLeases(r.Context(), ag, "agent "+string(status))
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
 	s.adminAudit(r.Context(), action, "ok", "info", "agent", ag.ID, map[string]any{
-		"agent_id": ag.ID,
-		"status":   string(status),
+		"agent_id":          ag.ID,
+		"status":            string(status),
+		"revoked_lease_ids": revoked,
 	})
 	s.writeData(w, http.StatusOK, ag)
 }
@@ -996,9 +1252,16 @@ func (s *Server) handleAdminPutPolicy(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
+	// A lower global TTL ceiling applies to pending and active leases too.
+	revoked, err := s.revalidateLeases(r.Context(), store.LeaseFilter{}, "policy settings changed")
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
 	s.adminAudit(r.Context(), "policy.updated", "ok", "warning", "policy", "policy", map[string]any{
-		"before": before,
-		"after":  in,
+		"before":            before,
+		"after":             in,
+		"revoked_lease_ids": revoked,
 	})
 	s.writeData(w, http.StatusOK, in)
 }

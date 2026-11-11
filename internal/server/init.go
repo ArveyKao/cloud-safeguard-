@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arveykao/cloud-safeguard/internal/authn"
 	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/store"
@@ -33,6 +34,9 @@ type InitOptions struct {
 	Force bool
 	// MasterKey optionally supplies the master key instead of generating one.
 	MasterKey []byte
+	// SupervisorUsername names the first supervisor (default "admin"). It is
+	// only used when no person holds the supervisor flag yet.
+	SupervisorUsername string
 }
 
 // InitAgent is one demo agent created by Init with its one-time token.
@@ -51,6 +55,9 @@ type InitResult struct {
 	ProviderIDs      []string    `json:"provider_ids"`
 	CapabilityIDs    []string    `json:"capability_ids"`
 	Agents           []InitAgent `json:"agents"`
+	// Supervisor is the first supervisor with a one-time setup code, or nil
+	// when a supervisor already existed (CONTRACT §17.1).
+	Supervisor *model.PersonWithSetupCode `json:"supervisor,omitempty"`
 }
 
 // Demo seed constants (frozen by CONTRACT §11).
@@ -109,6 +116,11 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		return InitResult{}, err
 	}
 	defer db.Close()
+	// `csg init --force` on an older data dir performs the schema upgrade, so it
+	// must record it too; a later `csg serve` would see no migration to report.
+	if err := auditMigrationReport(ctx, db); err != nil {
+		return InitResult{}, err
+	}
 
 	now := time.Now().UTC()
 	// ---- meta ----
@@ -135,7 +147,7 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		store.MetaAdminTokenPrefix: adminPrefix,
 		store.MetaBootstrapTime:    now.Format(time.RFC3339Nano),
 		store.MetaDemoMode:         strconv.FormatBool(opts.Demo),
-		store.MetaSchemaVersion:    "1",
+		store.MetaSchemaVersion:    strconv.Itoa(store.CurrentSchemaVersion),
 	} {
 		if err := db.SetMeta(ctx, key, value); err != nil {
 			return InitResult{}, err
@@ -172,7 +184,13 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		return InitResult{}, err
 	}
 
+	supervisor, err := bootstrapSupervisor(ctx, db, opts.SupervisorUsername, now)
+	if err != nil {
+		return InitResult{}, err
+	}
+
 	result := InitResult{
+		Supervisor:       supervisor,
 		DataDir:          dir,
 		AdminToken:       adminToken,
 		AdminTokenPrefix: adminPrefix,
@@ -293,10 +311,11 @@ func seedDemoProvider(ctx context.Context, db *store.DB, v *vault.Vault, now tim
 	return provider.ID, nil
 }
 
-// demoAgentSpec is one seeded demo agent definition (CONTRACT §11).
+// demoAgentSpec is one seeded demo agent definition (CONTRACT §11, §16.7).
 type demoAgentSpec struct {
 	name          string
 	description   string
+	role          model.AgentRole
 	grants        []string
 	maxTTLSeconds int
 	maxConcurrent int
@@ -305,23 +324,23 @@ type demoAgentSpec struct {
 // seedDemoAgents creates the demo agents when missing and returns the one-time
 // tokens of the agents it created. Existing agents are left untouched.
 func seedDemoAgents(ctx context.Context, db *store.DB, capabilityIDs []string, now time.Time) ([]InitAgent, error) {
+	// claude-code is an administrator and holds the whole catalog;
+	// hermes-researcher is a guest, so it may only hold read capabilities
+	// (CONTRACT §16.7). Never widen a guest's grants to make the seed
+	// non-empty: an out-of-role grant would be rejected everywhere else.
 	claudeGrants := append([]string(nil), capabilityIDs...)
 	hermesGrants := make([]string, 0, 1)
-	readCapability := "aliyun.cloud.read"
 	for _, id := range capabilityIDs {
-		if id == readCapability {
+		if id == capcatalog.IDCloudRead {
 			hermesGrants = append(hermesGrants, id)
 			break
 		}
-	}
-	if len(hermesGrants) == 0 && len(capabilityIDs) > 0 {
-		// The catalog is the source of truth; fall back to its first capability.
-		hermesGrants = append(hermesGrants, capabilityIDs[0])
 	}
 	specs := []demoAgentSpec{
 		{
 			name:          demoAgentClaudeCode,
 			description:   "Primary coding agent (Claude Code compatible)",
+			role:          model.RoleAdministrator,
 			grants:        claudeGrants,
 			maxTTLSeconds: 3600,
 			maxConcurrent: 3,
@@ -329,6 +348,7 @@ func seedDemoAgents(ctx context.Context, db *store.DB, capabilityIDs []string, n
 		{
 			name:          demoAgentHermes,
 			description:   "Read-only research agent",
+			role:          model.RoleGuest,
 			grants:        hermesGrants,
 			maxTTLSeconds: 900,
 			maxConcurrent: 1,
@@ -362,6 +382,7 @@ func seedDemoAgents(ctx context.Context, db *store.DB, capabilityIDs []string, n
 			Name:                spec.name,
 			Description:         spec.description,
 			Status:              model.AgentActive,
+			Role:                spec.role,
 			Grants:              spec.grants,
 			MaxTTLSeconds:       spec.maxTTLSeconds,
 			MaxConcurrentLeases: spec.maxConcurrent,
@@ -387,4 +408,179 @@ func fileExists(path string) bool {
 		return false
 	}
 	return !info.IsDir()
+}
+
+// auditMigrationReport appends one schema.migrated system audit event when
+// store.Open upgraded an existing database. The report is converted to plain
+// JSON values first, so the audit hash is computed over exactly what is stored.
+func auditMigrationReport(ctx context.Context, db *store.DB) error {
+	report := db.MigrationReport()
+	if report == nil {
+		return nil
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("encode migration report: %w", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return fmt.Errorf("decode migration report: %w", err)
+	}
+	return db.AppendAudit(ctx, &model.AuditEvent{
+		ActorType:  "system",
+		ActorID:    "system",
+		ActorName:  model.ProductName,
+		Action:     "schema.migrated",
+		Status:     "ok",
+		Severity:   "warning",
+		TargetType: "store",
+		TargetID:   "schema",
+		Metadata:   metadata,
+	})
+}
+
+// DefaultSupervisorUsername is the first supervisor's username when Init is
+// not given one.
+const DefaultSupervisorUsername = "admin"
+
+// bootstrapSupervisor creates the first supervisor (pending, with a setup
+// code) when no person holds the supervisor flag. It returns nil otherwise.
+func bootstrapSupervisor(ctx context.Context, db *store.DB, username string, now time.Time) (*model.PersonWithSetupCode, error) {
+	people, err := db.ListPersons(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range people {
+		if p.Supervisor {
+			return nil, nil
+		}
+	}
+	if strings.TrimSpace(username) == "" {
+		username = DefaultSupervisorUsername
+	}
+	name, ok := normalizeUsername(username)
+	if !ok {
+		return nil, fmt.Errorf("server: invalid supervisor username %q", username)
+	}
+	created, err := newPersonWithSetupCode(ctx, db, name, "", true, now)
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			return nil, fmt.Errorf("server: username %q exists but is not a supervisor; run `csg supervisor recover`", name)
+		}
+		return nil, err
+	}
+	ev := model.AuditEvent{
+		ActorType: "system", ActorID: "system", ActorName: model.ProductName,
+		Action: "person.supervisor_bootstrapped", Status: "ok", Severity: "critical",
+		TargetType: "person", TargetID: created.Person.ID,
+		Metadata: map[string]any{"username": name},
+	}
+	if err := db.AppendAudit(ctx, &ev); err != nil {
+		return nil, err
+	}
+	return &created, nil
+}
+
+// RecoverOptions configures RecoverSupervisor.
+type RecoverOptions struct {
+	DataDir string
+	// Username is the supervisor to restore; it is created when missing.
+	Username string
+	// MasterKey optionally overrides the master key loaded from DataDir.
+	MasterKey []byte
+}
+
+// RecoverSupervisor restores console access for a locked-out supervisor
+// (CONTRACT §17.1). It runs locally on the server host and needs the vault
+// master key: it makes the named person a supervisor, erases their password,
+// TOTP secret and sessions, and returns a new one-time setup code. The
+// recovery is audited at critical severity.
+func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWithSetupCode, error) {
+	var zero model.PersonWithSetupCode
+	username, ok := normalizeUsername(opts.Username)
+	if !ok {
+		return zero, fmt.Errorf("server: invalid username %q", opts.Username)
+	}
+	if opts.DataDir == "" || !fileExists(filepath.Join(opts.DataDir, store.DBFileName)) {
+		return zero, notInitializedErr(opts.DataDir)
+	}
+	// Holding the master key is the proof of authority for local recovery.
+	key, err := loadMasterKeyForServe(Config{DataDir: opts.DataDir, MasterKey: opts.MasterKey})
+	if err != nil {
+		return zero, err
+	}
+	v, err := vault.New(key)
+	if err != nil {
+		return zero, err
+	}
+	db, err := store.Open(ctx, opts.DataDir)
+	if err != nil {
+		return zero, err
+	}
+	defer db.Close()
+	if err := verifyVaultKey(ctx, db, v); err != nil {
+		return zero, err
+	}
+
+	now := time.Now().UTC()
+	var out model.PersonWithSetupCode
+	person, err := db.GetPersonByUsername(ctx, username)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		if out, err = newPersonWithSetupCode(ctx, db, username, "", true, now); err != nil {
+			return zero, err
+		}
+	case err != nil:
+		return zero, err
+	default:
+		code, hash, err := authn.NewSecret(24)
+		if err != nil {
+			return zero, err
+		}
+		expires := now.Add(setupCodeTTL)
+		if err := db.SetSupervisorFlag(ctx, person.ID, true, now); err != nil {
+			return zero, err
+		}
+		if err := db.ResetPersonSetup(ctx, person.ID, hash, expires, now, false); err != nil {
+			return zero, err
+		}
+		if person, err = db.GetPerson(ctx, person.ID); err != nil {
+			return zero, err
+		}
+		out = model.PersonWithSetupCode{Person: person, SetupCode: code, SetupExpiresAt: expires}
+	}
+	ev := model.AuditEvent{
+		ActorType: "system", ActorID: "system", ActorName: model.ProductName,
+		Action: "person.supervisor_recovered", Status: "ok", Severity: "critical",
+		TargetType: "person", TargetID: out.Person.ID,
+		Metadata: map[string]any{"username": username},
+	}
+	if err := db.AppendAudit(ctx, &ev); err != nil {
+		return zero, err
+	}
+	return out, nil
+}
+
+// verifyVaultKey proves the supplied master key is the one this data
+// directory was encrypted with, by decrypting a stored provider credential.
+// With nothing encrypted yet there is nothing to protect and it passes.
+func verifyVaultKey(ctx context.Context, db *store.DB, v *vault.Vault) error {
+	providers, err := db.ListProviders(ctx)
+	if err != nil {
+		return err
+	}
+	for _, p := range providers {
+		blob, err := db.GetProviderCredential(ctx, p.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := v.Decrypt(blob, providerAAD(p.ID)); err != nil {
+			return errors.New("server: the master key does not match this data directory")
+		}
+		return nil
+	}
+	return nil
 }

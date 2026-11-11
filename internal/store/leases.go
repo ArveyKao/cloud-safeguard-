@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -99,31 +100,7 @@ func (db *DB) GetLease(ctx context.Context, id string) (model.Lease, error) {
 // number of matching records.
 func (db *DB) ListLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, int, error) {
 	limit, offset := pageParams(f.Limit, f.Offset)
-
-	var (
-		where []string
-		args  []any
-	)
-	if len(f.Statuses) > 0 {
-		placeholders := make([]string, 0, len(f.Statuses))
-		for _, s := range f.Statuses {
-			placeholders = append(placeholders, "?")
-			args = append(args, string(s))
-		}
-		where = append(where, "status IN ("+strings.Join(placeholders, ", ")+")")
-	}
-	if f.AgentID != "" {
-		where = append(where, "agent_id = ?")
-		args = append(args, f.AgentID)
-	}
-	if f.CapabilityID != "" {
-		where = append(where, "capability_id = ?")
-		args = append(args, f.CapabilityID)
-	}
-	whereSQL := ""
-	if len(where) > 0 {
-		whereSQL = " WHERE " + strings.Join(where, " AND ")
-	}
+	whereSQL, args := leaseWhere(f)
 
 	var total int
 	if err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases`+whereSQL, args...).Scan(&total); err != nil {
@@ -153,10 +130,87 @@ func (db *DB) ListLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, int
 	return items, total, nil
 }
 
+// ListAllLeases returns every lease matching f (Limit and Offset are ignored)
+// from one query, i.e. one consistent snapshot. Security sweeps use it: paging
+// with LIMIT/OFFSET over a set that changes between pages can skip rows.
+func (db *DB) ListAllLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, error) {
+	whereSQL, args := leaseWhere(f)
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+leaseColumns+` FROM leases`+whereSQL+` ORDER BY created_at DESC, id DESC`, args...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	var items []model.Lease
+	for rows.Next() {
+		l, err := scanLease(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+	return items, nil
+}
+
+// leaseWhere builds the WHERE clause and arguments for a lease filter.
+func leaseWhere(f LeaseFilter) (string, []any) {
+	var (
+		where []string
+		args  []any
+	)
+	if len(f.Statuses) > 0 {
+		placeholders := make([]string, 0, len(f.Statuses))
+		for _, s := range f.Statuses {
+			placeholders = append(placeholders, "?")
+			args = append(args, string(s))
+		}
+		where = append(where, "status IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if f.AgentID != "" {
+		where = append(where, "agent_id = ?")
+		args = append(args, f.AgentID)
+	}
+	if f.CapabilityID != "" {
+		where = append(where, "capability_id = ?")
+		args = append(args, f.CapabilityID)
+	}
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " WHERE " + strings.Join(where, " AND ")
+	}
+	return whereSQL, args
+}
+
 // UpdateLease persists all mutable lifecycle fields of a lease. The encrypted
 // credential blob is managed separately by SetLeaseCredential /
 // ClearLeaseCredential.
 func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
+	return db.updateLease(ctx, l, "")
+}
+
+// UpdateLeaseIfStatus implements Store.UpdateLeaseIfStatus as a single
+// compare-and-set UPDATE, so the status check and the write are atomic.
+func (db *DB) UpdateLeaseIfStatus(ctx context.Context, l model.Lease, expected model.LeaseStatus) error {
+	if expected == "" {
+		return fmt.Errorf("store: UpdateLeaseIfStatus needs an expected status")
+	}
+	err := db.updateLease(ctx, l, expected)
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	// Zero rows: tell a missing lease apart from one that changed status.
+	if _, gerr := db.GetLease(ctx, l.ID); gerr == nil {
+		return ErrConflict
+	}
+	return ErrNotFound
+}
+
+// updateLease writes every mutable lease field. A non-empty expected status
+// adds "AND status = expected" to the WHERE clause.
+func (db *DB) updateLease(ctx context.Context, l model.Lease, expected model.LeaseStatus) error {
 	paramsJSON, err := marshalJSON(l.Params, "{}")
 	if err != nil {
 		return err
@@ -173,7 +227,7 @@ func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
 			denied_reason = ?, revoke_reason = ?, failure_reason = ?, session_name = ?,
 			credential_available = ?, credential_fingerprint = ?, approved_at = ?, issued_at = ?,
 			expires_at = ?, revoked_at = ?
-		 WHERE id = ?`,
+		 WHERE id = ? AND (? = '' OR status = ?)`,
 		l.AgentID, l.AgentName, l.CapabilityID, l.CapabilityName,
 		l.ProviderID, l.ProviderName, string(l.ProviderMode), string(l.Risk), paramsJSON,
 		l.Reason, l.RequestedTTLSeconds, l.EffectiveTTLSeconds, string(l.Status),
@@ -181,7 +235,7 @@ func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
 		l.DeniedReason, l.RevokeReason, l.FailureReason, l.SessionName,
 		boolInt(l.CredentialAvailable), l.CredentialFingerprint,
 		millisPtr(l.ApprovedAt), millisPtr(l.IssuedAt), millisPtr(l.ExpiresAt), millisPtr(l.RevokedAt),
-		l.ID,
+		l.ID, string(expected), string(expected),
 	)
 	if err != nil {
 		return mapErr(err)
@@ -191,16 +245,27 @@ func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
 
 // SetLeaseCredential stores the encrypted credential blob and its non-secret
 // display fingerprint, marking the credential as available.
+//
+// It writes only while the lease is still pending, so a minting attempt that
+// lost a race can never overwrite the credential of a lease another attempt
+// already activated (or one that was revoked or expired). It returns
+// ErrConflict when the lease exists but is no longer pending.
 func (db *DB) SetLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string) error {
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE leases SET encrypted_credential = ?, credential_fingerprint = ?,
 			credential_available = 1
-		 WHERE id = ?`,
-		encryptedCredential, fingerprint, leaseID)
+		 WHERE id = ? AND status = ?`,
+		encryptedCredential, fingerprint, leaseID, string(model.LeasePending))
 	if err != nil {
 		return mapErr(err)
 	}
-	return affectedOrNotFound(res)
+	if err := affectedOrNotFound(res); !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if _, gerr := db.GetLease(ctx, leaseID); gerr == nil {
+		return ErrConflict
+	}
+	return ErrNotFound
 }
 
 // GetLeaseCredential returns the encrypted credential blob.

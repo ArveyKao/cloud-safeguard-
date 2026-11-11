@@ -24,16 +24,18 @@ func (a *App) defaultDataDir() string {
 
 // runInit implements `csg init`.
 func (a *App) runInit(args []string) error {
-	fs := a.newFlagSet("init", `Usage: csg init [--data-dir DIR] [--demo] [--force] [--admin-token-file PATH] [--json]
+	fs := a.newFlagSet("init", `Usage: csg init [--data-dir DIR] [--demo] [--force] [--supervisor NAME] [--admin-token-file PATH] [--json]
 
-Bootstraps a data directory: master key, SQLite database, admin token and the
-built-in capability catalog. --demo also seeds the mock provider and two demo
+Bootstraps a data directory: master key, SQLite database, admin token, the
+built-in capability catalog and the first supervisor (with a one-time setup
+code for choosing a password and enrolling an authenticator app). --demo also seeds the mock provider and two demo
 agents and prints their one-time tokens.
 `)
 	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
 	demo := fs.Bool("demo", false, "seed the mock provider and demo agents")
 	force := fs.Bool("force", false, "re-initialize an existing data directory (rotates the admin token)")
 	adminTokenFile := fs.String("admin-token-file", "", "also write the admin token to this 0600 file")
+	supervisor := fs.String("supervisor", server.DefaultSupervisorUsername, "username of the first supervisor")
 	jsonOut := fs.Bool("json", false, "print the InitResult as JSON")
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
@@ -50,6 +52,8 @@ agents and prints their one-time tokens.
 		DataDir: *dataDir,
 		Demo:    *demo,
 		Force:   *force,
+
+		SupervisorUsername: *supervisor,
 	})
 	if err != nil {
 		return fmt.Errorf("cannot initialize data directory %s: %v", *dataDir, err)
@@ -83,6 +87,9 @@ agents and prints their one-time tokens.
 		for _, agent := range res.Agents {
 			fmt.Fprintf(a.Stdout, "  %-20s %-12s %s\n", agent.Name, agent.ID, agent.Token)
 		}
+	}
+	if res.Supervisor != nil {
+		a.printSetupCode("First supervisor", *res.Supervisor)
 	}
 	fmt.Fprintln(a.Stdout)
 	fmt.Fprintln(a.Stdout, "Store these tokens now: they cannot be retrieved later.")
@@ -135,5 +142,51 @@ SIGTERM, then shuts down gracefully.
 		return fmt.Errorf("server error: %v", serveErr)
 	}
 	fmt.Fprintln(a.Stdout, "shutting down: control plane stopped")
+	return nil
+}
+
+// printSetupCode prints a person's one-time setup code.
+func (a *App) printSetupCode(label string, p model.PersonWithSetupCode) {
+	fmt.Fprintln(a.Stdout)
+	fmt.Fprintf(a.Stdout, "%s: %s\n", label, p.Person.Username)
+	fmt.Fprintf(a.Stdout, "Setup code (shown once, valid until %s): %s\n",
+		p.SetupExpiresAt.Local().Format("2006-01-02 15:04"), p.SetupCode)
+	fmt.Fprintln(a.Stdout, "Open the console, choose a password and enroll an authenticator app with this code.")
+}
+
+// runSupervisor implements `csg supervisor recover`.
+func (a *App) runSupervisor(args []string) error {
+	if len(args) == 0 || args[0] != "recover" {
+		return usagef("usage: csg supervisor recover --username NAME [--data-dir DIR] [--json]")
+	}
+	fs := a.newFlagSet("supervisor recover", `Usage: csg supervisor recover --username NAME [--data-dir DIR] [--json]
+
+Restores console access for a locked-out supervisor. Run it on the server
+host: it needs the data directory and its master key. The named person
+becomes a supervisor (created if missing); their password, authenticator and
+sessions are erased and a new one-time setup code is printed. The recovery is
+recorded in the audit log at critical severity.
+`)
+	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
+	username := fs.String("username", "", "supervisor to restore (required)")
+	jsonOut := fs.Bool("json", false, "print the result as JSON")
+	positionals, err := parseFlags(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usagef("supervisor recover takes no positional arguments")
+	}
+	if strings.TrimSpace(*username) == "" {
+		return usagef("--username is required")
+	}
+	out, err := server.RecoverSupervisor(context.Background(), server.RecoverOptions{DataDir: *dataDir, Username: *username})
+	if err != nil {
+		return fmt.Errorf("cannot recover supervisor: %v", err)
+	}
+	if *jsonOut {
+		return a.printJSON(map[string]any{"data": out})
+	}
+	a.printSetupCode("Supervisor restored", out)
 	return nil
 }

@@ -122,6 +122,16 @@ func parseRiskTier(value string) (model.RiskTier, error) {
 	return r, nil
 }
 
+// parseAgentRole parses an agent role flag (case-insensitive).
+func parseAgentRole(value string) (model.AgentRole, error) {
+	v := strings.ToLower(strings.TrimSpace(value))
+	role, ok := model.ParseAgentRole(v)
+	if !ok {
+		return "", fmt.Errorf("unknown role %q (valid: guest, member, administrator)", value)
+	}
+	return role, nil
+}
+
 // paramValues collects repeated --param key=value flags.
 type paramValues map[string]string
 

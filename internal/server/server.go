@@ -21,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arveykao/cloud-safeguard/internal/authn"
+	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/mockcloud"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
@@ -62,6 +64,12 @@ type Config struct {
 	MinterFactory func(p model.Provider) (provider.Minter, error)
 	// Now optionally overrides the clock (tests use a fixed clock).
 	Now func() time.Time
+	// PasswordParams optionally overrides the Argon2id cost (tests lower it).
+	PasswordParams *authn.Params
+	// SecureCookies marks the session cookie Secure even when the server
+	// itself speaks plain HTTP (set it behind a TLS-terminating proxy).
+	// Cookies are always Secure on TLS connections.
+	SecureCookies bool
 }
 
 // Server is a running control-plane instance.
@@ -76,6 +84,13 @@ type Server struct {
 	now           func() time.Time
 	minterFactory func(model.Provider) (provider.Minter, error)
 
+	// pwParams is the Argon2id cost for new password hashes; dummyHash is
+	// verified against for unknown accounts so they take the same time;
+	// hashSlots bounds concurrent Argon2id computations.
+	pwParams  authn.Params
+	dummyHash string
+	hashSlots chan struct{}
+
 	handler   http.Handler
 	mockCloud http.Handler
 	startedAt time.Time
@@ -86,6 +101,27 @@ type Server struct {
 	httpServer   *http.Server
 	listener     net.Listener
 	returnedAddr string
+
+	// leaseLocks serializes minting and activation per lease, so two approvals
+	// of one lease (double click, retry, approval racing auto-approval) never
+	// mint twice. The server is a single process per data dir (ADR-002).
+	leaseLocksMu sync.Mutex
+	leaseLocks   map[string]*leaseLock
+	// capLocks make capability edits and activations of that capability
+	// mutually exclusive: an activation holds the read side from reading the
+	// capability until the lease is active; an edit holds the write side from
+	// reading the capability until its lease sweeps finish.
+	capLocksMu sync.Mutex
+	capLocks   map[string]*capLock
+
+	// Test-only hooks that pause the lease pipeline at exact points, so
+	// tests can reproduce races deterministically. Always nil in production.
+	hookBeforeAutoLock    func(leaseID string)
+	hookAfterLeaseRecheck func(leaseID string)
+	// hookAfterAuthorityWrite runs after an authority-reducing edit commits
+	// and before its lease re-check sweep (kind: capability, agent, provider,
+	// policy).
+	hookAfterAuthorityWrite func(kind string)
 
 	sweepCancel context.CancelFunc
 	sweepDone   chan struct{}
@@ -184,11 +220,35 @@ func New(cfg Config) (*Server, error) {
 		startedAt:     now().UTC(),
 		logWriter:     log.New(os.Stderr, "", log.LstdFlags),
 	}
+	s.pwParams = authn.DefaultParams
+	if cfg.PasswordParams != nil {
+		s.pwParams = *cfg.PasswordParams
+	}
+	s.hashSlots = make(chan struct{}, maxConcurrentHashes)
+	if s.dummyHash, err = authn.HashPassword("timing-equalizer-not-a-password", s.pwParams); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: prepare password hashing: %w", err)
+	}
 	s.mockCloud = mockcloud.NewHandler(mockcloud.Deps{Store: db, SigningKey: s.signingKey})
 	s.handler = s.buildHandler()
+	// Retired capabilities must not keep live leases across a restart, even if
+	// the schema-2 migration already disabled them (CONTRACT §16.6).
+	// Record what an upgrade migration changed, so role assignments and
+	// disabled capabilities are attributable in the audit chain.
+	if err := auditMigrationReport(context.Background(), db); err != nil {
+		s.logf("audit schema migration: %v", err)
+	}
+	if err := s.retireCapabilityLeases(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: revoke leases that violate the IAM prohibition: %w", err)
+	}
 	s.startSweeper()
 	return s, nil
 }
+
+// retiredCapabilityIDs are capabilities that are kept in the catalog for
+// historic leases but may never be leased again.
+var retiredCapabilityIDs = []string{capcatalog.IDBreakGlass}
 
 // notInitializedErr builds the clear bootstrap error required by CONTRACT §11.
 func notInitializedErr(dataDir string) error {

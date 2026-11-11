@@ -19,6 +19,8 @@ import (
 // lease decision reasons and tests assert on them); do not rename.
 const (
 	RuleCapabilityGranted   = "capability_granted"
+	RuleRolePermits         = "role_permits"
+	RuleIAMProhibited       = "iam_prohibited"
 	RuleCapabilityEnabled   = "capability_enabled"
 	RuleProviderAvailable   = "provider_available"
 	RuleProviderActive      = "provider_active"
@@ -30,6 +32,7 @@ const (
 	RuleConcurrency         = "concurrency_available"
 	RuleRateLimit           = "rate_limit"
 	RuleBreakGlassApproval  = "break_glass_approval"
+	RuleAdminApproval       = "admin_requires_approval"
 	RuleRiskAboveAuto       = "risk_above_auto"
 	RuleTTLAboveAuto        = "ttl_above_auto"
 	RuleAutoApprove         = "auto_approve"
@@ -60,6 +63,11 @@ type Input struct {
 	Reason string
 	// BreakGlass must be true for critical capabilities.
 	BreakGlass bool
+	// PolicyViolation is non-empty when the capability's rendered IAM policy
+	// violates the IAM prohibition (CONTRACT §16.3). It is computed by the
+	// server — the policy engine never reaches into the capability catalog — and
+	// its value is the human-readable violation used as the rule detail.
+	PolicyViolation string
 	// ActiveLeaseCount is the number of currently active leases the agent holds.
 	ActiveLeaseCount int
 	// LeasesCreatedLastMinute is the number of leases the agent created in the
@@ -80,7 +88,7 @@ func CandidateTTL(capability model.Capability, requestedTTLSeconds int) int {
 func Evaluate(in Input) model.PolicyDecision {
 	ttl := CandidateTTL(in.Capability, in.RequestedTTLSeconds)
 
-	reasons := make([]model.DecisionReason, 0, 15)
+	reasons := make([]model.DecisionReason, 0, 17)
 	denied := false
 	needsApproval := false
 
@@ -103,7 +111,27 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("capability %s is not granted to agent %s", in.Capability.ID, in.Agent.ID))
 	}
 
-	// Rule 2: capability_enabled
+	// Rule 2: role_permits
+	if in.Agent.Role.Permits(in.Capability.Access) {
+		add(RuleRolePermits, OutcomeAllow,
+			fmt.Sprintf("role %s permits %s access required by capability %s",
+				in.Agent.Role, in.Capability.Access, in.Capability.ID))
+	} else {
+		add(RuleRolePermits, OutcomeDeny,
+			fmt.Sprintf("role %s does not permit %s access required by capability %s",
+				in.Agent.Role, in.Capability.Access, in.Capability.ID))
+	}
+
+	// Rule 3: iam_prohibited
+	if in.PolicyViolation == "" {
+		add(RuleIAMProhibited, OutcomeAllow,
+			fmt.Sprintf("capability %s renders a policy that respects the IAM prohibition", in.Capability.ID))
+	} else {
+		add(RuleIAMProhibited, OutcomeDeny,
+			fmt.Sprintf("capability %s renders a prohibited policy: %s", in.Capability.ID, in.PolicyViolation))
+	}
+
+	// Rule 4: capability_enabled
 	if in.Capability.Enabled {
 		add(RuleCapabilityEnabled, OutcomeAllow,
 			fmt.Sprintf("capability %s is enabled", in.Capability.ID))
@@ -112,7 +140,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("capability %s is disabled", in.Capability.ID))
 	}
 
-	// Rule 3: provider_available
+	// Rule 5: provider_available
 	if in.Provider != nil {
 		add(RuleProviderAvailable, OutcomeAllow,
 			fmt.Sprintf("provider %s available for provider type %s", in.Provider.ID, in.Capability.ProviderType))
@@ -121,7 +149,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("no active provider of type %s exists for capability %s", in.Capability.ProviderType, in.Capability.ID))
 	}
 
-	// Rule 4: provider_active
+	// Rule 6: provider_active
 	switch {
 	case in.Provider == nil:
 		add(RuleProviderActive, OutcomeAllow, "provider status check skipped: no provider available")
@@ -133,7 +161,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("provider %s is %s", in.Provider.ID, in.Provider.Status))
 	}
 
-	// Rule 5: reason_required
+	// Rule 7: reason_required
 	threshold := in.Settings.RequireReasonForRisk
 	switch {
 	case strings.TrimSpace(in.Reason) != "":
@@ -147,7 +175,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("reason not required for %s risk (threshold %s)", in.Capability.Risk, threshold))
 	}
 
-	// Rule 6: break_glass_required
+	// Rule 8: break_glass_required
 	if in.Capability.Risk == model.RiskCritical {
 		if in.BreakGlass {
 			add(RuleBreakGlassRequired, OutcomeAllow,
@@ -161,7 +189,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("break-glass flag not required for %s risk", in.Capability.Risk))
 	}
 
-	// Rule 7: ttl_within_capability
+	// Rule 9: ttl_within_capability
 	if ttl > in.Capability.MaxTTLSeconds {
 		add(RuleTTLWithinCapability, OutcomeDeny,
 			fmt.Sprintf("requested %ds exceeds capability max %ds", ttl, in.Capability.MaxTTLSeconds))
@@ -170,7 +198,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("requested %ds within capability max %ds", ttl, in.Capability.MaxTTLSeconds))
 	}
 
-	// Rule 8: ttl_within_agent
+	// Rule 10: ttl_within_agent
 	if ttl > in.Agent.MaxTTLSeconds {
 		add(RuleTTLWithinAgent, OutcomeDeny,
 			fmt.Sprintf("requested %ds exceeds agent max %ds", ttl, in.Agent.MaxTTLSeconds))
@@ -179,7 +207,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("requested %ds within agent max %ds", ttl, in.Agent.MaxTTLSeconds))
 	}
 
-	// Rule 9: ttl_within_global
+	// Rule 11: ttl_within_global
 	if ttl > in.Settings.MaxLeaseTTLSeconds {
 		add(RuleTTLWithinGlobal, OutcomeDeny,
 			fmt.Sprintf("requested %ds exceeds global max %ds", ttl, in.Settings.MaxLeaseTTLSeconds))
@@ -188,7 +216,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("requested %ds within global max %ds", ttl, in.Settings.MaxLeaseTTLSeconds))
 	}
 
-	// Rule 10: concurrency_available
+	// Rule 12: concurrency_available
 	concurrencyLimit := in.Settings.MaxConcurrentLeasesPerAgent
 	if in.Agent.MaxConcurrentLeases > 0 && in.Agent.MaxConcurrentLeases < concurrencyLimit {
 		concurrencyLimit = in.Agent.MaxConcurrentLeases
@@ -201,7 +229,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("agent holds %d active leases, below limit %d", in.ActiveLeaseCount, concurrencyLimit))
 	}
 
-	// Rule 11: rate_limit
+	// Rule 13: rate_limit
 	rateLimit := in.Settings.LeasesPerMinutePerAgent
 	if in.LeasesCreatedLastMinute >= rateLimit {
 		add(RuleRateLimit, OutcomeDeny,
@@ -211,7 +239,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("agent created %d leases in the last 60s, below limit %d", in.LeasesCreatedLastMinute, rateLimit))
 	}
 
-	// Rule 12: break_glass_approval
+	// Rule 14: break_glass_approval
 	if in.BreakGlass {
 		add(RuleBreakGlassApproval, OutcomeRequireApproval,
 			"break-glass requests always require human approval")
@@ -220,7 +248,17 @@ func Evaluate(in Input) model.PolicyDecision {
 			"human approval not required by break-glass flag")
 	}
 
-	// Rule 13: risk_above_auto
+	// Rule 14b: admin_requires_approval — admin-level access (account-wide,
+	// custom or builtin) is never auto-approved, whatever its declared risk.
+	if in.Capability.Access == model.AccessAdmin {
+		add(RuleAdminApproval, OutcomeRequireApproval,
+			"admin-level access always requires human approval")
+	} else {
+		add(RuleAdminApproval, OutcomeAllow,
+			fmt.Sprintf("%s access does not by itself require approval", in.Capability.Access))
+	}
+
+	// Rule 15: risk_above_auto
 	autoRisk := in.Settings.AutoApproveMaxRisk
 	if in.Capability.Risk.Rank() > autoRisk.Rank() {
 		add(RuleRiskAboveAuto, OutcomeRequireApproval,
@@ -230,7 +268,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("risk %s within auto-approve maximum %s", in.Capability.Risk, autoRisk))
 	}
 
-	// Rule 14: ttl_above_auto
+	// Rule 16: ttl_above_auto
 	if ttl > in.Settings.AutoApproveMaxTTLSeconds {
 		add(RuleTTLAboveAuto, OutcomeRequireApproval,
 			fmt.Sprintf("requested %ds exceeds auto-approve TTL %ds", ttl, in.Settings.AutoApproveMaxTTLSeconds))
@@ -239,7 +277,7 @@ func Evaluate(in Input) model.PolicyDecision {
 			fmt.Sprintf("requested %ds within auto-approve TTL %ds", ttl, in.Settings.AutoApproveMaxTTLSeconds))
 	}
 
-	// Rule 15: auto_approve — recorded only when nothing blocked the request, so
+	// Rule 17: auto_approve — recorded only when nothing blocked the request, so
 	// the reason list reads as a clean justification.
 	decision := model.OutcomeAutoApprove
 	switch {

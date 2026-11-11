@@ -109,7 +109,7 @@ func TestInitForcePreservesDataAndRotatesAdminToken(t *testing.T) {
 	if agents, err := db.ListAgents(context.Background()); err != nil || len(agents) != 2 {
 		t.Fatalf("agents after force = %d, %v", len(agents), err)
 	}
-	if result, err := db.VerifyAudit(context.Background()); err != nil || !result.OK || result.Events != 1 {
+	if result, err := db.VerifyAudit(context.Background()); err != nil || !result.OK || result.Events != 2 { // the test's own event + the supervisor bootstrap
 		t.Fatalf("audit chain after force = %+v, %v", result, err)
 	}
 	if hash, _ := db.GetMeta(context.Background(), store.MetaAdminTokenHash); hash != token.Hash(second.AdminToken) {

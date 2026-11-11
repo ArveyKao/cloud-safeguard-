@@ -139,7 +139,10 @@ func TestLoginAdminThenWhoami(t *testing.T) {
 }
 
 func TestLoginAgentThenWhoamiJSON(t *testing.T) {
-	agent := model.Agent{ID: "agt_demo1", Name: "claude-code", Status: model.AgentActive, Grants: []string{"aliyun.cloud.read"}, MaxTTLSeconds: 3600, MaxConcurrentLeases: 3}
+	agent := model.Agent{
+		ID: "agt_demo1", Name: "claude-code", Status: model.AgentActive, Role: model.RoleMember,
+		Grants: []string{"aliyun.cloud.read"}, MaxTTLSeconds: 3600, MaxConcurrentLeases: 3,
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/agent/me" {
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -170,6 +173,18 @@ func TestLoginAgentThenWhoamiJSON(t *testing.T) {
 	}
 	if payload.Agent.Name != "claude-code" || payload.ActiveLeases != 2 {
 		t.Fatalf("whoami payload = %+v", payload)
+	}
+	if payload.Agent.Role != model.RoleMember {
+		t.Fatalf("whoami payload role = %q, want member", payload.Agent.Role)
+	}
+
+	// The human-readable form shows the role too (CONTRACT §16.7).
+	ta.stdout.Reset()
+	if code := ta.run("whoami"); code != ExitOK {
+		t.Fatalf("whoami exit = %d, stderr = %s", code, ta.errOut())
+	}
+	if !strings.Contains(ta.out(), "role:") || !strings.Contains(ta.out(), "member") {
+		t.Fatalf("whoami output has no role line: %q", ta.out())
 	}
 }
 

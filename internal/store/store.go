@@ -95,9 +95,19 @@ type Store interface {
 	GetLease(ctx context.Context, id string) (model.Lease, error)
 	// ListLeases returns a page and the total number of matching records.
 	ListLeases(ctx context.Context, f LeaseFilter) (items []model.Lease, total int, err error)
+	// ListAllLeases returns every matching lease from one query (a consistent
+	// snapshot); Limit and Offset are ignored. Use it for security sweeps.
+	ListAllLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, error)
 	UpdateLease(ctx context.Context, l model.Lease) error
-	// SetLeaseCredential stores the encrypted credential blob for an active
-	// lease together with its display fingerprint.
+	// UpdateLeaseIfStatus persists l like UpdateLease, but only while the stored
+	// lease still has status expected. It returns ErrConflict when the lease has
+	// moved to another status in the meantime and ErrNotFound when it does not
+	// exist. Use it for every transition into active so a concurrent revoke,
+	// expiry or demotion can never be overwritten.
+	UpdateLeaseIfStatus(ctx context.Context, l model.Lease, expected model.LeaseStatus) error
+	// SetLeaseCredential stores the encrypted credential blob for a lease that
+	// is being activated, together with its display fingerprint. It writes only
+	// while the lease is pending and returns ErrConflict otherwise.
 	SetLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string) error
 	GetLeaseCredential(ctx context.Context, leaseID string) (string, error)
 	// ClearLeaseCredential scrubs the stored credential blob (revoke/expire).
@@ -133,7 +143,35 @@ type DB struct {
 	// race-free across goroutines. VerifyAudit also takes it for a consistent
 	// snapshot.
 	appendMu sync.Mutex
+	// migration describes the data changes made by migrations during Open,
+	// or is nil when the database was already current.
+	migration *MigrationReport
 }
+
+// MigrationReport describes what data migrations changed while opening the
+// database, so the server can record it in the audit log.
+type MigrationReport struct {
+	FromVersion int `json:"from_version"`
+	ToVersion   int `json:"to_version"`
+	// DisabledCapabilities lists capabilities the migration disabled (retired,
+	// or a custom template that violates the IAM prohibition).
+	DisabledCapabilities []string `json:"disabled_capabilities"`
+	// Agents lists every agent the role migration touched.
+	Agents []AgentMigration `json:"agents"`
+}
+
+// AgentMigration is one agent's outcome in the schema-2 role migration.
+type AgentMigration struct {
+	AgentID       string          `json:"agent_id"`
+	Role          model.AgentRole `json:"role"`
+	DroppedGrants []string        `json:"dropped_grants,omitempty"`
+	// ReplacedRetiredGrant is true when aliyun.iam.break_glass was swapped
+	// for aliyun.account.admin.
+	ReplacedRetiredGrant bool `json:"replaced_retired_grant,omitempty"`
+}
+
+// MigrationReport returns what migrations changed during Open, or nil.
+func (db *DB) MigrationReport() *MigrationReport { return db.migration }
 
 // DBFileName is the SQLite database file inside the data directory.
 const DBFileName = "csg.db"

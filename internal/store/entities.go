@@ -139,7 +139,7 @@ func (db *DB) CountProviderCredentials(ctx context.Context) (int, error) {
 
 // ================= Capabilities =================
 
-const capabilityColumns = `id, name, description, provider_type, risk, policy_template,
+const capabilityColumns = `id, name, description, provider_type, risk, access, policy_template,
 	params_json, default_ttl_seconds, max_ttl_seconds, enabled, builtin, created_at, updated_at`
 
 // scanCapability scans one capability row.
@@ -153,7 +153,7 @@ func scanCapability(row rowScanner) (model.Capability, error) {
 		updatedAt  int64
 	)
 	err := row.Scan(
-		&c.ID, &c.Name, &c.Description, &c.ProviderType, &c.Risk, &c.PolicyTemplate,
+		&c.ID, &c.Name, &c.Description, &c.ProviderType, &c.Risk, &c.Access, &c.PolicyTemplate,
 		&paramsJSON, &c.DefaultTTLSeconds, &c.MaxTTLSeconds, &enabled, &builtin,
 		&createdAt, &updatedAt,
 	)
@@ -180,9 +180,10 @@ func (db *DB) CreateCapability(ctx context.Context, c model.Capability) error {
 	}
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO capabilities(`+capabilityColumns+`)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.Name, c.Description, string(c.ProviderType), string(c.Risk), c.PolicyTemplate,
-		paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds, boolInt(c.Enabled), boolInt(c.Builtin),
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.Name, c.Description, string(c.ProviderType), string(c.Risk), string(c.Access),
+		c.PolicyTemplate, paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds,
+		boolInt(c.Enabled), boolInt(c.Builtin),
 		toMillis(c.CreatedAt), toMillis(c.UpdatedAt),
 	)
 	return mapErr(err)
@@ -225,11 +226,12 @@ func (db *DB) UpdateCapability(ctx context.Context, c model.Capability) error {
 	}
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE capabilities SET name = ?, description = ?, provider_type = ?, risk = ?,
-			policy_template = ?, params_json = ?, default_ttl_seconds = ?, max_ttl_seconds = ?,
-			enabled = ?, builtin = ?, updated_at = ?
+			access = ?, policy_template = ?, params_json = ?, default_ttl_seconds = ?,
+			max_ttl_seconds = ?, enabled = ?, builtin = ?, updated_at = ?
 		 WHERE id = ?`,
-		c.Name, c.Description, string(c.ProviderType), string(c.Risk), c.PolicyTemplate,
-		paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds, boolInt(c.Enabled), boolInt(c.Builtin),
+		c.Name, c.Description, string(c.ProviderType), string(c.Risk), string(c.Access),
+		c.PolicyTemplate, paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds,
+		boolInt(c.Enabled), boolInt(c.Builtin),
 		toMillis(c.UpdatedAt), c.ID,
 	)
 	if err != nil {
@@ -240,7 +242,7 @@ func (db *DB) UpdateCapability(ctx context.Context, c model.Capability) error {
 
 // ================= Agents =================
 
-const agentColumns = `id, name, description, status, grants_json, max_ttl_seconds,
+const agentColumns = `id, name, description, status, role, grants_json, max_ttl_seconds,
 	max_concurrent_leases, token_prefix, last_seen_at, created_at, updated_at`
 
 // scanAgent scans one agent row (token hash excluded).
@@ -253,7 +255,7 @@ func scanAgent(row rowScanner) (model.Agent, error) {
 		updatedAt  int64
 	)
 	err := row.Scan(
-		&a.ID, &a.Name, &a.Description, &a.Status, &grantsJSON, &a.MaxTTLSeconds,
+		&a.ID, &a.Name, &a.Description, &a.Status, &a.Role, &grantsJSON, &a.MaxTTLSeconds,
 		&a.MaxConcurrentLeases, &a.TokenPrefix, &lastSeenAt, &createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -280,10 +282,10 @@ func (db *DB) CreateAgent(ctx context.Context, a model.Agent, tokenHash string) 
 		return err
 	}
 	_, err = db.sql.ExecContext(ctx,
-		`INSERT INTO agents(id, name, description, status, grants_json, max_ttl_seconds,
+		`INSERT INTO agents(id, name, description, status, role, grants_json, max_ttl_seconds,
 			max_concurrent_leases, token_hash, token_prefix, last_seen_at, created_at, updated_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.Name, a.Description, string(a.Status), grantsJSON, a.MaxTTLSeconds,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.Name, a.Description, string(a.Status), string(a.Role), grantsJSON, a.MaxTTLSeconds,
 		a.MaxConcurrentLeases, tokenHash, a.TokenPrefix, millisPtr(a.LastSeenAt),
 		toMillis(a.CreatedAt), toMillis(a.UpdatedAt),
 	)
@@ -332,11 +334,11 @@ func (db *DB) UpdateAgent(ctx context.Context, a model.Agent) error {
 		return err
 	}
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE agents SET name = ?, description = ?, status = ?, grants_json = ?,
+		`UPDATE agents SET name = ?, description = ?, status = ?, role = ?, grants_json = ?,
 			max_ttl_seconds = ?, max_concurrent_leases = ?, token_prefix = ?,
 			last_seen_at = ?, updated_at = ?
 		 WHERE id = ?`,
-		a.Name, a.Description, string(a.Status), grantsJSON, a.MaxTTLSeconds,
+		a.Name, a.Description, string(a.Status), string(a.Role), grantsJSON, a.MaxTTLSeconds,
 		a.MaxConcurrentLeases, a.TokenPrefix, millisPtr(a.LastSeenAt), toMillis(a.UpdatedAt), a.ID,
 	)
 	if err != nil {

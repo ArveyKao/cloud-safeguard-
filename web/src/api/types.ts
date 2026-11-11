@@ -11,6 +11,10 @@ export type ProviderType = 'aliyun'
 export type ProviderMode = 'sts' | 'mock'
 export type ProviderStatus = 'active' | 'disabled'
 export type AgentStatus = 'active' | 'suspended' | 'revoked'
+/** Agent identity role (CONTRACT §16). Ordered: guest < member < administrator. */
+export type AgentRole = 'guest' | 'member' | 'administrator'
+/** Capability access level (CONTRACT §16). Ordered: read < write < admin. */
+export type AccessLevel = 'read' | 'write' | 'admin'
 export type LeaseStatus = 'pending' | 'active' | 'denied' | 'expired' | 'revoked' | 'failed'
 export type DecisionOutcome = 'auto_approve' | 'require_approval' | 'deny'
 export type RuleOutcome = 'allow' | 'require_approval' | 'deny'
@@ -73,6 +77,8 @@ export interface Capability {
   description: string
   provider_type: ProviderType
   risk: RiskTier
+  /** Required on the wire (CONTRACT §16). */
+  access: AccessLevel
   policy_template: string
   params: CapabilityParam[] | null
   default_ttl_seconds: number
@@ -110,6 +116,8 @@ export interface Agent {
   name: string
   description: string
   status: AgentStatus
+  /** Required on the wire (CONTRACT §16). */
+  role: AgentRole
   grants: string[]
   max_ttl_seconds: number
   max_concurrent_leases: number
@@ -122,6 +130,8 @@ export interface Agent {
 export interface CreateAgentInput {
   name: string
   description: string
+  /** Optional; server defaults to guest. */
+  role?: AgentRole
   grants: string[]
   max_ttl_seconds: number
   max_concurrent_leases: number
@@ -130,6 +140,7 @@ export interface CreateAgentInput {
 export interface UpdateAgentInput {
   name?: string
   description?: string
+  role?: AgentRole
   grants?: string[]
   max_ttl_seconds?: number
   max_concurrent_leases?: number
@@ -321,6 +332,52 @@ export const RISK_RANK: Record<RiskTier, number> = {
   medium: 2,
   high: 3,
   critical: 4,
+}
+
+export const AGENT_ROLES: AgentRole[] = ['guest', 'member', 'administrator']
+
+export const AGENT_ROLE_RANK: Record<AgentRole, number> = {
+  guest: 1,
+  member: 2,
+  administrator: 3,
+}
+
+export const ACCESS_LEVELS: AccessLevel[] = ['read', 'write', 'admin']
+
+export const ACCESS_RANK: Record<AccessLevel, number> = {
+  read: 1,
+  write: 2,
+  admin: 3,
+}
+
+/** Highest AccessLevel each AgentRole is allowed to hold. */
+export const ROLE_MAX_ACCESS: Record<AgentRole, AccessLevel> = {
+  guest: 'read',
+  member: 'write',
+  administrator: 'admin',
+}
+
+export function rolePermitsAccess(role: AgentRole, access: AccessLevel): boolean {
+  return ACCESS_RANK[access] <= ACCESS_RANK[ROLE_MAX_ACCESS[role]]
+}
+
+export const AGENT_ROLE_COPY: Record<
+  AgentRole,
+  { label: string; summary: string }
+> = {
+  guest: {
+    label: 'Guest',
+    summary: 'Can look but not change anything',
+  },
+  member: {
+    label: 'Member',
+    summary: 'Can read and change resources. Risky changes still need human approval.',
+  },
+  administrator: {
+    label: 'Administrator',
+    summary:
+      'Can be granted every access level, including emergency account-wide access. Can never manage IAM or RAM.',
+  },
 }
 
 export const LEASE_STATUSES: LeaseStatus[] = [

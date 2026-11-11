@@ -150,6 +150,15 @@ func NewHandler(deps Deps) http.Handler {
 		resource: func(r *http.Request, ac *authContext) string { return ac.alidnsResource(r.PathValue("zone")) },
 		handle:   handleDNSDeleteRecord,
 	}))
+	// RAM is reachable but never allowed: the mandatory deny statement carried
+	// by every minted credential (CONTRACT §16.3) makes this route the
+	// end-to-end proof of the IAM prohibition.
+	mux.HandleFunc("GET /v1/ram/users", h.wrap(route{
+		service:  ramService,
+		action:   "ram:ListUsers",
+		resource: func(_ *http.Request, _ *authContext) string { return "*" },
+		handle:   handleRAMListUsers,
+	}))
 	mux.HandleFunc("/", h.handleUnknownRoute)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

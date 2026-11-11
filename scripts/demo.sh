@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Cloud Safeguard end-to-end demo (docs/SPEC.md §6.2, scenarios S1-S8).
+# Cloud Safeguard end-to-end demo (docs/SPEC.md §6.2, scenarios S1-S9).
 #
 # What it does:
 #   1. builds bin/csg from the current tree
 #   2. creates a clean throwaway data directory and bootstraps it with
 #      `csg init --demo --json` (mock provider + demo agents)
 #   3. starts `csg serve` on the requested loopback port in the background
-#   4. runs scenarios S1-S8 through the real CLI and mock cloud
+#   4. runs scenarios S1-S9 through the real CLI and mock cloud
 #   5. prints PASS/FAIL lines, stops the server via a cleanup trap, and exits
 #      non-zero if any scenario failed
 #
@@ -32,6 +32,7 @@ INIT_JSON=""
 ADMIN_TOKEN=""
 CLAUDE_TOKEN=""
 HERMES_TOKEN=""
+HERMES_ID=""
 S1_LEASE=""
 S1_TOKEN=""
 DNS_LEASE=""
@@ -212,7 +213,7 @@ fail_detail() {
 }
 
 # ---------------------------------------------------------------------------
-# scenarios S1-S8
+# scenarios S1-S9
 # ---------------------------------------------------------------------------
 scenario_s1() {
   local rc lease status outcome token token_env
@@ -368,7 +369,7 @@ scenario_s7() {
   local rc status rules audit_json critical bg_token
   # 7a: break-glass request without the explicit break_glass flag is denied.
   run_agent "$CLAUDE_TOKEN" "$TMP/s7a.json" "$TMP/s7a.err" \
-    request --capability aliyun.iam.break_glass --reason "demo S7: emergency access" --json
+    request --capability aliyun.account.admin --reason "demo S7: emergency access" --json
   rc=$?
   [ $rc -eq 1 ] || { echo "S7a: denied request exit code=$rc, want 1" >&2; fail_detail "S7a request" "$TMP/s7a.json" "$TMP/s7a.err"; }
   status=$(json_get "$(cat "$TMP/s7a.json")" status) || return 1
@@ -381,7 +382,7 @@ scenario_s7() {
 
   # 7b: with --break-glass the lease requires human approval.
   run_agent "$CLAUDE_TOKEN" "$TMP/s7b.json" "$TMP/s7b.err" \
-    request --capability aliyun.iam.break_glass --break-glass --reason "demo S7: emergency access" --json
+    request --capability aliyun.account.admin --break-glass --reason "demo S7: emergency access" --json
   rc=$?
   [ $rc -eq 0 ] || fail_detail "S7b request" "$TMP/s7b.json" "$TMP/s7b.err"
   BG_LEASE=$(json_get "$(cat "$TMP/s7b.json")" id) || { echo "S7b: no lease id" >&2; return 1; }
@@ -439,6 +440,81 @@ scenario_s8() {
   [ "$ok" = "true" ] || { echo "S8: audit chain ok=$ok, want true" >&2; return 1; }
   [ "$events" -gt 0 ] 2>/dev/null || { echo "S8: audit event count=$events, want > 0" >&2; return 1; }
   echo "audit chain verified: $events events, ok=true"
+}
+
+# S9 (CONTRACT §16.7): guest write denied by role_permits; administrator with
+# an aliyun.account.admin lease is blocked on GET /v1/ram/users; a custom
+# capability whose template allows ram:* is rejected with 400.
+scenario_s9() {
+  local rc status rules lease bg_token http_code body
+
+  # 9a: guest requesting a write capability is denied by role_permits.
+  run_agent "$HERMES_TOKEN" "$TMP/s9a.json" "$TMP/s9a.err" \
+    request --capability aliyun.dns.manage --param domain=arveykao.com \
+    --reason "demo S9: guest write attempt" --json
+  rc=$?
+  [ $rc -eq 1 ] || { echo "S9a: denied request exit code=$rc, want 1" >&2; fail_detail "S9a request" "$TMP/s9a.json" "$TMP/s9a.err"; }
+  status=$(json_get "$(cat "$TMP/s9a.json")" status) || return 1
+  [ "$status" = "denied" ] || { echo "S9a: lease status=$status, want denied" >&2; return 1; }
+  rules=$(json_deny_rules "$(cat "$TMP/s9a.json")") || return 1
+  case ",$rules," in
+    *,role_permits,*) : ;;
+    *) echo "S9a: deny rules=$rules, want role_permits" >&2; return 1 ;;
+  esac
+
+  # 9b: administrator holding aliyun.account.admin still cannot list RAM users.
+  run_agent "$CLAUDE_TOKEN" "$TMP/s9b.json" "$TMP/s9b.err" \
+    request --capability aliyun.account.admin --break-glass \
+    --reason "demo S9: account-admin for IAM denial" --json
+  rc=$?
+  [ $rc -eq 0 ] || fail_detail "S9b request" "$TMP/s9b.json" "$TMP/s9b.err"
+  lease=$(json_get "$(cat "$TMP/s9b.json")" id) || { echo "S9b: no lease id" >&2; return 1; }
+  status=$(json_get "$(cat "$TMP/s9b.json")" status) || return 1
+  [ "$status" = "pending" ] || { echo "S9b: status=$status, want pending" >&2; return 1; }
+
+  run_admin "$TMP/s9bapprove.json" "$TMP/s9bapprove.err" \
+    leases approve "$lease" --note "demo S9: show IAM prohibition" --json
+  rc=$?
+  [ $rc -eq 0 ] || fail_detail "S9b approve" "$TMP/s9bapprove.json" "$TMP/s9bapprove.err"
+
+  run_agent "$CLAUDE_TOKEN" "$TMP/s9bcred.env" "$TMP/s9bcred.err" credential --lease "$lease" --export
+  rc=$?
+  [ $rc -eq 0 ] || fail_detail "S9b credential fetch" "$TMP/s9bcred.env" "$TMP/s9bcred.err"
+  bg_token=$(sed -n "s/^export ALIBABA_CLOUD_SECURITY_TOKEN='\(.*\)'$/\1/p" "$TMP/s9bcred.env")
+  [ -n "$bg_token" ] || { echo "S9b: no account-admin security token" >&2; return 1; }
+
+  run_mock "$bg_token" "$TMP/s9bram.json" "$TMP/s9bram.err" GET /v1/ram/users
+  rc=$?
+  [ $rc -ne 0 ] || { echo "S9b: account-admin token listed RAM users" >&2; return 1; }
+  grep -q 'Forbidden.RAM' "$TMP/s9bram.json" || {
+    echo "S9b: expected Forbidden.RAM, got: $(head -c 200 "$TMP/s9bram.json")" >&2
+    return 1
+  }
+
+  # 9c: creating a custom capability that allows ram:* returns 400.
+  http_code=$(curl -sS -o "$TMP/s9c.json" -w '%{http_code}' \
+    -X POST "$SERVER_URL/api/v1/admin/capabilities" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"name":"demo-ram","provider_type":"aliyun","risk":"high","access":"admin","policy_template":"{\"Version\":\"1\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ram:*\"],\"Resource\":[\"*\"]}]}","default_ttl_seconds":300,"max_ttl_seconds":600}') || {
+    echo "S9c: curl failed" >&2
+    return 1
+  }
+  [ "$http_code" = "400" ] || {
+    echo "S9c: create ram:* capability HTTP $http_code, want 400; body: $(head -c 200 "$TMP/s9c.json")" >&2
+    return 1
+  }
+  body=$(cat "$TMP/s9c.json")
+  case "$body" in
+    *invalid_request*) : ;;
+    *) echo "S9c: body missing invalid_request: $body" >&2; return 1 ;;
+  esac
+  case "$body" in
+    *ram:*) : ;;
+    *) echo "S9c: body does not name ram:*: $body" >&2; return 1 ;;
+  esac
+
+  echo "guest write denied (role_permits); account-admin blocked on RAM; ram:* create rejected 400"
 }
 
 # ---------------------------------------------------------------------------
@@ -547,6 +623,7 @@ run_scenario "S5 operator denial is durable + audited" scenario_s5
 run_scenario "S6 ungranted capability denied" scenario_s6
 run_scenario "S7 break-glass approval + live revoke" scenario_s7
 run_scenario "S8 audit chain verify" scenario_s8
+run_scenario "S9 roles and IAM prohibition" scenario_s9
 echo
 
 echo "== cleanup =="
@@ -564,5 +641,5 @@ if [ "$FAIL" -ne 0 ]; then
   echo "failed scenarios:$FAILED_SCENARIOS" >&2
   exit 1
 fi
-echo "all S1-S8 scenarios passed"
+echo "all S1-S9 scenarios passed"
 exit 0

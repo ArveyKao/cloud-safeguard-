@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/store"
 )
@@ -427,8 +428,10 @@ func TestBreakGlassFlow(t *testing.T) {
 	env := newTestEnv(t, true)
 
 	// Critical capability without the break-glass flag is denied.
+	// aliyun.account.admin replaces the retired aliyun.iam.break_glass and keeps
+	// the §6 break-glass flow (CONTRACT §16.2).
 	denied, rec := env.createLease("claude-code", model.CreateLeaseInput{
-		CapabilityID: "aliyun.iam.break_glass",
+		CapabilityID: "aliyun.account.admin",
 		Reason:       "emergency",
 	})
 	requireStatus(t, rec, http.StatusCreated)
@@ -439,7 +442,7 @@ func TestBreakGlassFlow(t *testing.T) {
 
 	// With the flag it requires approval.
 	pending, _ := env.createLease("claude-code", model.CreateLeaseInput{
-		CapabilityID: "aliyun.iam.break_glass",
+		CapabilityID: "aliyun.account.admin",
 		Reason:       "emergency account recovery",
 		BreakGlass:   true,
 	})
@@ -457,6 +460,11 @@ func TestBreakGlassFlow(t *testing.T) {
 	approved := decodeEnvelope[model.Lease](t, approveRec)
 	if approved.Status != model.LeaseActive {
 		t.Fatalf("approved break-glass lease status = %q, want active", approved.Status)
+	}
+	// Even an account-wide admin credential carries the mandatory IAM deny
+	// (CONTRACT §16.3): RAM and sts:AssumeRole are never reachable.
+	if minted := string(env.minter.lastRequest(t).PolicyJSON); !strings.Contains(minted, capcatalog.DenyStatement) {
+		t.Fatalf("minted account-admin policy does not carry the IAM deny statement: %s", minted)
 	}
 	critical := false
 	for _, ev := range env.listAudit("lease.approved") {

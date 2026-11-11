@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -197,21 +198,48 @@ func TestAgentMeAndCapabilities(t *testing.T) {
 	if len(me.Agent.Grants) != 5 {
 		t.Fatalf("claude-code grants = %v, want all 5 builtins", me.Agent.Grants)
 	}
+	if me.Agent.Role != model.RoleAdministrator {
+		t.Fatalf("claude-code role = %q, want administrator", me.Agent.Role)
+	}
 
-	// Claude-code sees exactly its granted + enabled capabilities.
+	// Claude-code sees exactly its granted + enabled capabilities, and the
+	// response carries the agent's role and every capability's access level
+	// (CONTRACT §16.5).
 	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/capabilities", nil)
 	requireStatus(t, rec, http.StatusOK)
-	claudeCaps := decodeEnvelope[model.ListResponse[model.Capability]](t, rec)
+	claudeCaps := decodeEnvelope[agentCapabilitiesResponse](t, rec)
 	if claudeCaps.Total != 5 || len(claudeCaps.Items) != 5 {
 		t.Fatalf("claude-code capabilities total=%d len=%d, want 5/5", claudeCaps.Total, len(claudeCaps.Items))
 	}
+	if claudeCaps.Role != model.RoleAdministrator {
+		t.Fatalf("capabilities response role = %q, want administrator", claudeCaps.Role)
+	}
+	wantAccess := map[string]model.AccessLevel{
+		"aliyun.cloud.read":       model.AccessRead,
+		"aliyun.dns.manage":       model.AccessWrite,
+		"aliyun.cert.dns01":       model.AccessWrite,
+		"aliyun.ecs.instance.ops": model.AccessWrite,
+		"aliyun.account.admin":    model.AccessAdmin,
+	}
+	for _, c := range claudeCaps.Items {
+		want, ok := wantAccess[c.ID]
+		if !ok {
+			t.Fatalf("unexpected capability %s in the agent list", c.ID)
+		}
+		if c.Access != want {
+			t.Fatalf("%s access = %q, want %q", c.ID, c.Access, want)
+		}
+	}
 
-	// Hermes only sees its one granted capability.
+	// Hermes is a guest and only sees its one granted read capability.
 	rec = env.agent("hermes-researcher", http.MethodGet, "/api/v1/agent/capabilities", nil)
 	requireStatus(t, rec, http.StatusOK)
-	hermesCaps := decodeEnvelope[model.ListResponse[model.Capability]](t, rec)
+	hermesCaps := decodeEnvelope[agentCapabilitiesResponse](t, rec)
 	if hermesCaps.Total != 1 || len(hermesCaps.Items) != 1 || hermesCaps.Items[0].ID != "aliyun.cloud.read" {
 		t.Fatalf("hermes capabilities = %+v, want only aliyun.cloud.read", hermesCaps)
+	}
+	if hermesCaps.Role != model.RoleGuest {
+		t.Fatalf("hermes capabilities role = %q, want guest", hermesCaps.Role)
 	}
 
 	// Heartbeat works.
@@ -323,8 +351,9 @@ func TestInitBootstrapArtifacts(t *testing.T) {
 	if mode, _ := db.GetMeta(ctx, store.MetaDemoMode); mode != "true" {
 		t.Errorf("demo_mode = %q, want true", mode)
 	}
-	if version, _ := db.GetMeta(ctx, store.MetaSchemaVersion); version != "1" {
-		t.Errorf("schema_version = %q, want 1", version)
+	wantSchema := strconv.Itoa(store.CurrentSchemaVersion)
+	if version, _ := db.GetMeta(ctx, store.MetaSchemaVersion); version != wantSchema {
+		t.Errorf("schema_version = %q, want %s", version, wantSchema)
 	}
 	caps, err := db.ListCapabilities(ctx)
 	if err != nil || len(caps) != 5 {

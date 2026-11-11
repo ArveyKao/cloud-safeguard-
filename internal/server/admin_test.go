@@ -264,8 +264,14 @@ func TestCapabilityAdminCRUD(t *testing.T) {
 		t.Fatal("missing capability.created audit event")
 	}
 
-	// Grant it to claude-code and lease it.
-	grants := append([]string{"aliyun.cloud.read", "aliyun.dns.manage", "aliyun.cert.dns01", "aliyun.ecs.instance.ops", "aliyun.iam.break_glass"}, created.ID)
+	// A custom capability with no declared access level is classified admin,
+	// the most restrictive classification (CONTRACT §16.6 step 1).
+	if created.Access != model.AccessAdmin {
+		t.Fatalf("created capability access = %q, want admin", created.Access)
+	}
+
+	// Grant it to claude-code (an administrator) and lease it.
+	grants := append([]string{"aliyun.cloud.read", "aliyun.dns.manage", "aliyun.cert.dns01", "aliyun.ecs.instance.ops", "aliyun.account.admin"}, created.ID)
 	grantRec := env.admin(http.MethodPatch, "/api/v1/admin/agents/"+env.agentIDs["claude-code"], model.UpdateAgentInput{Grants: &grants})
 	requireStatus(t, grantRec, http.StatusOK)
 	lease, _ := env.createLease("claude-code", model.CreateLeaseInput{
@@ -273,8 +279,15 @@ func TestCapabilityAdminCRUD(t *testing.T) {
 		Params:       map[string]string{"bucket": "demo-bucket"},
 		Reason:       "inspect bucket",
 	})
-	if lease.Status != model.LeaseActive {
-		t.Fatalf("custom-capability lease status = %q (reasons %v)", lease.Status, lease.Decision.Reasons)
+	// Admin-level access is never auto-approved, even when a custom capability
+	// declares low risk (CONTRACT §16.4 admin_requires_approval).
+	if lease.Status != model.LeasePending {
+		t.Fatalf("custom admin-capability lease status = %q, want pending (reasons %v)", lease.Status, lease.Decision.Reasons)
+	}
+	approveRec := env.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", model.ApproveLeaseInput{Note: "ok"})
+	requireStatus(t, approveRec, http.StatusOK)
+	if got := env.getLease(lease.ID); got.Status != model.LeaseActive {
+		t.Fatalf("approved custom-capability lease status = %q, want active", got.Status)
 	}
 	if policy := string(env.minter.lastRequest(t).PolicyJSON); !strings.Contains(policy, "acs:oss:*:*:demo-bucket") {
 		t.Fatalf("custom policy not rendered with params: %s", policy)
@@ -298,6 +311,11 @@ func TestCapabilityAdminCRUD(t *testing.T) {
 	risk := model.RiskCritical
 	builtinPatch := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/aliyun.cloud.read", map[string]any{"risk": risk})
 	requireErrorCode(t, builtinPatch, http.StatusBadRequest, model.ErrCodeInvalidRequest)
+	// So is the access level: raising it would re-open the capability to roles
+	// that must not hold it (CONTRACT §16.3).
+	accessPatch := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/aliyun.cloud.read",
+		map[string]any{"access": model.AccessAdmin})
+	requireErrorCode(t, accessPatch, http.StatusBadRequest, model.ErrCodeInvalidRequest)
 	// Builtin TTLs and enabled toggles are allowed.
 	ttlUpdate := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/aliyun.cloud.read", map[string]any{"default_ttl_seconds": 300})
 	requireStatus(t, ttlUpdate, http.StatusOK)
@@ -338,6 +356,7 @@ func TestCapabilityValidation(t *testing.T) {
 		{"undeclared placeholder", func(c *model.Capability) {
 			c.PolicyTemplate = `{"Resource":["{{nope}}"]}`
 		}},
+		{"invalid access level", func(c *model.Capability) { c.Access = "root" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -347,6 +366,198 @@ func TestCapabilityValidation(t *testing.T) {
 			requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
 		})
 	}
+}
+
+// TestCapabilityTemplateIAMProhibition covers CONTRACT §16.3 at the admin API:
+// a template that violates the IAM prohibition is a 400 naming the offending
+// action, is audited as capability.rejected, and never reaches the catalog.
+func TestCapabilityTemplateIAMProhibition(t *testing.T) {
+	env := newTestEnv(t, true)
+
+	tests := []struct {
+		name          string
+		access        model.AccessLevel
+		template      string
+		wantInMessage string
+	}{
+		{
+			name:          "ram wildcard",
+			access:        model.AccessAdmin,
+			template:      `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ram:*"],"Resource":["*"]}]}`,
+			wantInMessage: "ram:*",
+		},
+		{
+			name:          "ram create user",
+			access:        model.AccessWrite,
+			template:      `{"Version":"1","Statement":[{"Effect":"Allow","Action":"RAM:CreateUser","Resource":"*"}]}`,
+			wantInMessage: "RAM:CreateUser",
+		},
+		{
+			name:          "role chaining",
+			access:        model.AccessWrite,
+			template:      `{"Version":"1","Statement":[{"Effect":"Allow","Action":["sts:AssumeRole"],"Resource":["*"]}]}`,
+			wantInMessage: "sts:AssumeRole",
+		},
+		{
+			name:          "wildcard service",
+			access:        model.AccessAdmin,
+			template:      `{"Version":"1","Statement":[{"Effect":"Allow","Action":["r*:*"],"Resource":["*"]}]}`,
+			wantInMessage: "r*:*",
+		},
+		{
+			name:          "not action",
+			access:        model.AccessAdmin,
+			template:      `{"Version":"1","Statement":[{"Effect":"Allow","NotAction":["ram:*"],"Resource":["*"]}]}`,
+			wantInMessage: "NotAction",
+		},
+		{
+			name:          "write action on a read capability",
+			access:        model.AccessRead,
+			template:      `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:StopInstance"],"Resource":["*"]}]}`,
+			wantInMessage: "ecs:StopInstance",
+		},
+		{
+			name:          "bare wildcard below admin",
+			access:        model.AccessWrite,
+			template:      `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`,
+			wantInMessage: `"*"`,
+		},
+	}
+
+	before := len(env.listAudit("capability.rejected"))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := env.admin(http.MethodPost, "/api/v1/admin/capabilities", model.Capability{
+				Name:              "Prohibited " + tt.name,
+				ProviderType:      model.ProviderAliyun,
+				Risk:              model.RiskHigh,
+				Access:            tt.access,
+				PolicyTemplate:    tt.template,
+				DefaultTTLSeconds: 300,
+				MaxTTLSeconds:     600,
+			})
+			requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
+			if msg := decodeError(t, rec).Error.Message; !strings.Contains(msg, tt.wantInMessage) {
+				t.Fatalf("error message = %q, want it to name %q", msg, tt.wantInMessage)
+			}
+		})
+	}
+
+	rejected := env.listAudit("capability.rejected")
+	if len(rejected)-before != len(tests) {
+		t.Fatalf("capability.rejected events = %d, want %d", len(rejected)-before, len(tests))
+	}
+	for _, ev := range rejected {
+		if ev.Severity != "warning" || ev.Status != "denied" {
+			t.Fatalf("capability.rejected severity/status = %q/%q, want warning/denied", ev.Severity, ev.Status)
+		}
+	}
+
+	// Nothing was added to the catalog.
+	listRec := env.admin(http.MethodGet, "/api/v1/admin/capabilities", nil)
+	requireStatus(t, listRec, http.StatusOK)
+	if total := decodeEnvelope[model.ListResponse[model.Capability]](t, listRec).Total; total != 5 {
+		t.Fatalf("capabilities = %d, want the 5 builtins only", total)
+	}
+
+	// A PATCH that would introduce a prohibited template is refused the same way.
+	okRec := env.admin(http.MethodPost, "/api/v1/admin/capabilities", model.Capability{
+		Name:              "Bucket read",
+		ProviderType:      model.ProviderAliyun,
+		Risk:              model.RiskLow,
+		Access:            model.AccessRead,
+		PolicyTemplate:    `{"Version":"1","Statement":[{"Effect":"Allow","Action":["oss:List*"],"Resource":["*"]}]}`,
+		DefaultTTLSeconds: 300,
+		MaxTTLSeconds:     600,
+	})
+	requireStatus(t, okRec, http.StatusCreated)
+	custom := decodeEnvelope[model.Capability](t, okRec)
+	patchRec := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+custom.ID, map[string]any{
+		"policy_template": `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ram:ListUsers"],"Resource":["*"]}]}`,
+	})
+	requireErrorCode(t, patchRec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
+	stored, err := env.srv.db.GetCapability(context.Background(), custom.ID)
+	if err != nil {
+		t.Fatalf("GetCapability: %v", err)
+	}
+	if strings.Contains(stored.PolicyTemplate, "ram:") {
+		t.Fatalf("refused PATCH still persisted the prohibited template: %s", stored.PolicyTemplate)
+	}
+	env.verifyAudit()
+}
+
+// TestCapabilityAccessRaiseRejectsOutOfRoleAgents covers CONTRACT §16.3: a
+// PATCH that raises a custom capability's access must return 400 naming every
+// granted agent whose role would not permit the new level, and must not persist
+// the raise. Lowering access, or raising when every holder can use the new
+// level, still succeeds.
+func TestCapabilityAccessRaiseRejectsOutOfRoleAgents(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t, true)
+
+	createRec := env.admin(http.MethodPost, "/api/v1/admin/capabilities", model.Capability{
+		Name:              "Scoped OSS read",
+		ProviderType:      model.ProviderAliyun,
+		Risk:              model.RiskLow,
+		Access:            model.AccessRead,
+		PolicyTemplate:    `{"Version":"1","Statement":[{"Effect":"Allow","Action":["oss:List*"],"Resource":["*"]}]}`,
+		DefaultTTLSeconds: 300,
+		MaxTTLSeconds:     600,
+	})
+	requireStatus(t, createRec, http.StatusCreated)
+	custom := decodeEnvelope[model.Capability](t, createRec)
+
+	// Grant the read capability to hermes (guest). Raising it to write would
+	// leave that grant outside the guest role.
+	hermesID := env.agentIDs["hermes-researcher"]
+	hermes, err := env.srv.db.GetAgent(ctx, hermesID)
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	grants := append(append([]string{}, hermes.Grants...), custom.ID)
+	grantRec := env.admin(http.MethodPatch, "/api/v1/admin/agents/"+hermesID, model.UpdateAgentInput{Grants: &grants})
+	requireStatus(t, grantRec, http.StatusOK)
+
+	raiseRec := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+custom.ID, map[string]any{
+		"access": model.AccessWrite,
+	})
+	requireErrorCode(t, raiseRec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
+	msg := decodeError(t, raiseRec).Error.Message
+	if !strings.Contains(msg, "hermes-researcher") {
+		t.Fatalf("error message = %q, want it to name hermes-researcher", msg)
+	}
+	if !strings.Contains(msg, string(model.RoleGuest)) {
+		t.Fatalf("error message = %q, want it to name the guest role", msg)
+	}
+	stored, err := env.srv.db.GetCapability(ctx, custom.ID)
+	if err != nil {
+		t.Fatalf("GetCapability: %v", err)
+	}
+	if stored.Access != model.AccessRead {
+		t.Fatalf("refused raise persisted access = %q, want read", stored.Access)
+	}
+
+	// After removing the guest grant, the same raise succeeds.
+	without := hermes.Grants
+	ungrantRec := env.admin(http.MethodPatch, "/api/v1/admin/agents/"+hermesID, model.UpdateAgentInput{Grants: &without})
+	requireStatus(t, ungrantRec, http.StatusOK)
+	okRaise := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+custom.ID, map[string]any{
+		"access": model.AccessWrite,
+	})
+	requireStatus(t, okRaise, http.StatusOK)
+	if got := decodeEnvelope[model.Capability](t, okRaise).Access; got != model.AccessWrite {
+		t.Fatalf("access after raise = %q, want write", got)
+	}
+
+	// Lowering access is always allowed (it cannot leave grants outside a role).
+	lowerRec := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+custom.ID, map[string]any{
+		"access": model.AccessRead,
+	})
+	requireStatus(t, lowerRec, http.StatusOK)
+	if got := decodeEnvelope[model.Capability](t, lowerRec).Access; got != model.AccessRead {
+		t.Fatalf("access after lower = %q, want read", got)
+	}
+	env.verifyAudit()
 }
 
 func TestAgentAdminCRUD(t *testing.T) {
@@ -368,10 +579,12 @@ func TestAgentAdminCRUD(t *testing.T) {
 	})
 	requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
 
-	// Create.
+	// Create. The role bounds the grants, so ci-bot needs member to hold the
+	// write capability it is granted below (CONTRACT §16.1).
 	createRec := env.admin(http.MethodPost, "/api/v1/admin/agents", model.CreateAgentInput{
 		Name:                "ci-bot",
 		Description:         "CI helper",
+		Role:                model.RoleMember,
 		Grants:              []string{"aliyun.cloud.read"},
 		MaxTTLSeconds:       600,
 		MaxConcurrentLeases: 2,
@@ -380,6 +593,9 @@ func TestAgentAdminCRUD(t *testing.T) {
 	created := decodeEnvelope[model.AgentWithToken](t, createRec)
 	if created.Agent.Name != "ci-bot" || created.Token == "" {
 		t.Fatalf("created agent = %+v", created.Agent)
+	}
+	if created.Agent.Role != model.RoleMember {
+		t.Fatalf("created agent role = %q, want member", created.Agent.Role)
 	}
 	if !strings.HasPrefix(created.Token, "csg_agt_") || created.Agent.TokenPrefix == "" {
 		t.Fatalf("agent token/prefix = %q / %q", created.Token, created.Agent.TokenPrefix)

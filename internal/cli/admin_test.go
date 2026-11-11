@@ -16,12 +16,12 @@ func TestCapsListAndShow(t *testing.T) {
 	caps := []model.Capability{
 		{
 			ID: "aliyun.cloud.read", Name: "Cloud read-only inventory", ProviderType: model.ProviderAliyun,
-			Risk: model.RiskLow, PolicyTemplate: `{"Version":"1","Statement":[]}`,
+			Risk: model.RiskLow, Access: model.AccessRead, PolicyTemplate: `{"Version":"1","Statement":[]}`,
 			DefaultTTLSeconds: 900, MaxTTLSeconds: 1800, Enabled: true, Builtin: true,
 		},
 		{
 			ID: "aliyun.dns.manage", Name: "Manage DNS records", ProviderType: model.ProviderAliyun,
-			Risk: model.RiskMedium, PolicyTemplate: `{"Version":"1","Statement":[]}`,
+			Risk: model.RiskMedium, Access: model.AccessWrite, PolicyTemplate: `{"Version":"1","Statement":[]}`,
 			DefaultTTLSeconds: 900, MaxTTLSeconds: 1800, Enabled: true, Builtin: true,
 			Params: []model.CapabilityParam{{Name: "domain", Required: true, Pattern: `^[a-z]+$`, Description: "domain"}},
 		},
@@ -46,6 +46,10 @@ func TestCapsListAndShow(t *testing.T) {
 	if !strings.Contains(ta.out(), "aliyun.cloud.read") || !strings.Contains(ta.out(), "aliyun.dns.manage") {
 		t.Fatalf("caps list output = %q", ta.out())
 	}
+	// The access level is part of the table (CONTRACT §16.7).
+	if !strings.Contains(ta.out(), "ACCESS") || !strings.Contains(ta.out(), "write") {
+		t.Fatalf("caps list output has no access column: %q", ta.out())
+	}
 
 	ta.stdout.Reset()
 	if code := ta.run("caps", "list", "--json"); code != ExitOK {
@@ -65,6 +69,9 @@ func TestCapsListAndShow(t *testing.T) {
 	}
 	if !strings.Contains(ta.out(), "aliyun.dns.manage") || !strings.Contains(ta.out(), "domain") {
 		t.Fatalf("caps show output = %q", ta.out())
+	}
+	if !strings.Contains(ta.out(), "access:       write") {
+		t.Fatalf("caps show output has no access line: %q", ta.out())
 	}
 
 	ta.stdout.Reset()
@@ -183,6 +190,115 @@ func TestAgentsCreateValidation(t *testing.T) {
 	}
 	if code := ta.run("agents", "create", "--name", "x", "--max-ttl", "bogus"); code != ExitUsage {
 		t.Fatalf("create bad ttl exit = %d, want %d", code, ExitUsage)
+	}
+	if code := ta.run("agents", "create", "--name", "x", "--role", "superuser"); code != ExitUsage {
+		t.Fatalf("create bad role exit = %d, want %d", code, ExitUsage)
+	}
+}
+
+// TestAgentsRoleCommands covers the CONTRACT §16.7 CLI surface: --role on
+// create (default guest), `agents set-role`, and role in list/get.
+func TestAgentsRoleCommands(t *testing.T) {
+	agent := model.Agent{
+		ID: "agt_demo1", Name: "claude-code", Status: model.AgentActive, Role: model.RoleAdministrator,
+		Grants: []string{"aliyun.cloud.read", "aliyun.account.admin"}, MaxTTLSeconds: 3600, MaxConcurrentLeases: 3,
+	}
+	var createdInput model.CreateAgentInput
+	var patchedInput model.UpdateAgentInput
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireAuth(t, r, adminTokenA)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/admin/agents":
+			writeEnvelope(w, http.StatusOK, model.ListResponse[model.Agent]{Items: []model.Agent{agent}, Total: 1})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/admin/agents/agt_demo1":
+			writeEnvelope(w, http.StatusOK, agent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/agents":
+			decodeBody(t, r, &createdInput)
+			created := agent
+			created.ID = "agt_new"
+			created.Role = createdInput.Role
+			writeEnvelope(w, http.StatusCreated, model.AgentWithToken{Agent: created, Token: "csg_agt_NEWTOKEN"})
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/admin/agents/agt_demo1":
+			decodeBody(t, r, &patchedInput)
+			patched := agent
+			if patchedInput.Role != nil {
+				patched.Role = *patchedInput.Role
+				patched.Grants = []string{"aliyun.cloud.read"}
+			}
+			writeEnvelope(w, http.StatusOK, patched)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			writeErrorEnvelope(w, http.StatusNotFound, "not_found", "unexpected")
+		}
+	}))
+	defer srv.Close()
+
+	ta := newTestApp(t)
+	ta.useServer(srv.URL, adminTokenA)
+
+	// The role is shown in list and get.
+	if code := ta.run("agents", "list"); code != ExitOK {
+		t.Fatalf("agents list exit = %d, stderr = %s", code, ta.errOut())
+	}
+	if !strings.Contains(ta.out(), "ROLE") || !strings.Contains(ta.out(), "administrator") {
+		t.Fatalf("agents list output has no role column: %q", ta.out())
+	}
+	ta.stdout.Reset()
+	if code := ta.run("agents", "get", "agt_demo1"); code != ExitOK {
+		t.Fatalf("agents get exit = %d, stderr = %s", code, ta.errOut())
+	}
+	if !strings.Contains(ta.out(), "role:") || !strings.Contains(ta.out(), "administrator") {
+		t.Fatalf("agents get output has no role: %q", ta.out())
+	}
+
+	// --role is passed through; it defaults to guest.
+	ta.stdout.Reset()
+	if code := ta.run("agents", "create", "--name", "member-bot", "--role", "member"); code != ExitOK {
+		t.Fatalf("agents create --role exit = %d, stderr = %s", code, ta.errOut())
+	}
+	if createdInput.Role != model.RoleMember {
+		t.Fatalf("create input role = %q, want member", createdInput.Role)
+	}
+	if !strings.Contains(ta.out(), "role=member") {
+		t.Fatalf("create output does not report the role: %q", ta.out())
+	}
+	ta.stdout.Reset()
+	if code := ta.run("agents", "create", "--name", "default-bot"); code != ExitOK {
+		t.Fatalf("agents create exit = %d, stderr = %s", code, ta.errOut())
+	}
+	if createdInput.Role != model.RoleGuest {
+		t.Fatalf("create input role without --role = %q, want guest", createdInput.Role)
+	}
+	// Mixed case is accepted and normalized.
+	ta.stdout.Reset()
+	if code := ta.run("agents", "create", "--name", "upper-bot", "--role", "Administrator"); code != ExitOK {
+		t.Fatalf("agents create --role Administrator exit = %d, stderr = %s", code, ta.errOut())
+	}
+	if createdInput.Role != model.RoleAdministrator {
+		t.Fatalf("create input role = %q, want administrator", createdInput.Role)
+	}
+
+	// set-role PATCHes the role and reports the reset grants.
+	ta.stdout.Reset()
+	if code := ta.run("agents", "set-role", "agt_demo1", "guest"); code != ExitOK {
+		t.Fatalf("agents set-role exit = %d, stderr = %s", code, ta.errOut())
+	}
+	if patchedInput.Role == nil || *patchedInput.Role != model.RoleGuest {
+		t.Fatalf("set-role patch body = %+v, want role guest", patchedInput)
+	}
+	if patchedInput.Grants != nil {
+		t.Fatalf("set-role sent grants (%v); the server must reset them", *patchedInput.Grants)
+	}
+	if !strings.Contains(ta.out(), "guest") || !strings.Contains(ta.out(), "aliyun.cloud.read") {
+		t.Fatalf("set-role output = %q", ta.out())
+	}
+
+	// Usage errors.
+	if code := ta.run("agents", "set-role", "agt_demo1"); code != ExitUsage {
+		t.Fatalf("set-role without a role exit = %d, want %d", code, ExitUsage)
+	}
+	if code := ta.run("agents", "set-role", "agt_demo1", "superuser"); code != ExitUsage {
+		t.Fatalf("set-role with an unknown role exit = %d, want %d", code, ExitUsage)
 	}
 }
 

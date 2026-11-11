@@ -8,6 +8,7 @@ import { cx, formatDateTime, formatTTL, parseDurationInput, tryParseJson } from 
 import { Modal } from '../components/overlays'
 import { ConfirmDialog } from '../components/ConfirmDialog'
 import {
+  AccessBadge,
   Button,
   EmptyState,
   ErrorBanner,
@@ -264,6 +265,7 @@ export function CapabilitiesPage({ refreshKey }: CapabilitiesPageProps) {
                               <div className="cap-card__title">
                                 {capability.name}
                                 <RiskBadge risk={capability.risk} />
+                                <AccessBadge access={capability.access} />
                                 {capability.builtin && (
                                   <span className="badge badge--outline">built-in</span>
                                 )}
@@ -276,6 +278,12 @@ export function CapabilitiesPage({ refreshKey }: CapabilitiesPageProps) {
                           </div>
                           <div className="cap-card__desc">{capability.description}</div>
                           <div className="cap-card__ttls">
+                            <div className="cap-ttl">
+                              <span className="cap-ttl__label">Access</span>
+                              <span className="cap-ttl__value">
+                                <AccessBadge access={capability.access} />
+                              </span>
+                            </div>
                             <div className="cap-ttl">
                               <span className="cap-ttl__label">Default TTL</span>
                               <span className="cap-ttl__value">
