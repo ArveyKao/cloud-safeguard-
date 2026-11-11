@@ -57,7 +57,7 @@ reference: `docs/API.md` (v0.1) plus CONTRACT §16 and §17.8 for what changed s
 ### B. People, supervisors and sign-in (CONTRACT §17.1–§17.3, API only)
 
 There is no console screen for this yet; test with `curl` against the endpoints listed in
-CONTRACT §17.8.
+CONTRACT §17.8. Setup and login need the header `Content-Type: application/json`.
 
 - Setup with the code from `csg init`: weak passwords are refused; a correct authenticator
   code activates the account; the setup code cannot be used twice or after 72 hours.

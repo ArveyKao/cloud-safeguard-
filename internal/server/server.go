@@ -66,10 +66,13 @@ type Config struct {
 	Now func() time.Time
 	// PasswordParams optionally overrides the Argon2id cost (tests lower it).
 	PasswordParams *authn.Params
-	// SecureCookies marks the session cookie Secure even when the server
-	// itself speaks plain HTTP (set it behind a TLS-terminating proxy).
-	// Cookies are always Secure on TLS connections.
-	SecureCookies bool
+	// PublicOrigin is the origin people open the console at, e.g.
+	// "https://csg.example.com". Set it when a proxy terminates TLS in front
+	// of the server: browser requests must then come from exactly this
+	// origin, and the session cookie is marked Secure when it is https.
+	// When empty, the origin is derived from each request (its Host header
+	// and whether the connection itself is TLS).
+	PublicOrigin string
 }
 
 // Server is a running control-plane instance.
@@ -90,6 +93,8 @@ type Server struct {
 	pwParams  authn.Params
 	dummyHash string
 	hashSlots chan struct{}
+	// publicOrigin is the normalized Config.PublicOrigin, or "".
+	publicOrigin string
 
 	handler   http.Handler
 	mockCloud http.Handler
@@ -113,6 +118,13 @@ type Server struct {
 	// reading the capability until its lease sweeps finish.
 	capLocksMu sync.Mutex
 	capLocks   map[string]*capLock
+
+	// personLocks serialize sign-in and authority changes per person, so the
+	// lockout count is exact under parallel logins and a login can never
+	// finish around a concurrent suspend or reset. Single process per data
+	// dir (ADR-002).
+	personLocksMu sync.Mutex
+	personLocks   map[string]chan struct{}
 
 	// Test-only hooks that pause the lease pipeline at exact points, so
 	// tests can reproduce races deterministically. Always nil in production.
@@ -228,6 +240,16 @@ func New(cfg Config) (*Server, error) {
 	if s.dummyHash, err = authn.HashPassword("timing-equalizer-not-a-password", s.pwParams); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("server: prepare password hashing: %w", err)
+	}
+	if s.publicOrigin, err = parsePublicOrigin(cfg.PublicOrigin); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Refuse to run with a master key other than the one this data
+	// directory was encrypted with.
+	if err := ensureVaultKeyCheck(context.Background(), db, v); err != nil {
+		db.Close()
+		return nil, err
 	}
 	s.mockCloud = mockcloud.NewHandler(mockcloud.Deps{Store: db, SigningKey: s.signingKey})
 	s.handler = s.buildHandler()

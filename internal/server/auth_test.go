@@ -3,7 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	cryptotls "crypto/tls"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -283,6 +286,11 @@ func TestLoginLockout(t *testing.T) {
 	requireStatus(t, env.login("admin", testPassword, env.totp(sup.secret, 0)), http.StatusUnauthorized)
 	env.clock.Advance(loginLockDuration - time.Minute)
 	requireStatus(t, env.login("admin", testPassword, env.totp(sup.secret, 0)), http.StatusUnauthorized)
+	// Attempts made while locked are ignored: they neither extend the lock
+	// nor count towards the next one.
+	for i := 0; i < loginFailureThreshold+1; i++ {
+		requireStatus(t, env.login("admin", "wrong wrong wrong", "000000"), http.StatusUnauthorized)
+	}
 	env.clock.Advance(2 * time.Minute)
 	requireStatus(t, env.login("admin", testPassword, env.totp(sup.secret, 0)), http.StatusOK)
 
@@ -552,4 +560,269 @@ func TestInitForceKeepsExistingSupervisor(t *testing.T) {
 	if res.Supervisor != nil {
 		t.Fatal("init --force issued a second supervisor")
 	}
+}
+
+// ---- regression tests for the independent review of commit 42be770 ----
+
+// loginReasons counts auth.login_failed audit events by reason.
+func (e *testEnv) loginReasons() map[string]int {
+	e.t.Helper()
+	out := map[string]int{}
+	for _, ev := range e.listAudit("auth.login_failed") {
+		out[ev.Metadata["reason"].(string)]++
+	}
+	return out
+}
+
+// A burst of parallel logins gets exactly the failure budget, not "the
+// budget plus everything already in flight".
+func TestLockoutIsExactUnderParallelLogins(t *testing.T) {
+	for _, wrong := range []string{"code", "password"} {
+		t.Run("wrong "+wrong, func(t *testing.T) {
+			env := newTestEnv(t, false)
+			sup := env.supervisorClient()
+			env.nextStep()
+			valid := map[string]bool{}
+			for d := int64(-1); d <= 1; d++ {
+				valid[env.totp(sup.secret, d)] = true
+			}
+			const n = 20
+			var wg sync.WaitGroup
+			for i := 0; i < n; i++ {
+				password, code := testPassword, fmt.Sprintf("%06d", 100000+i)
+				if valid[code] {
+					code = "999999"
+				}
+				if wrong == "password" {
+					password, code = fmt.Sprintf("a wrong passphrase %d", i), env.totp(sup.secret, 0)
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if rec := env.login("admin", password, code); rec.Code != http.StatusUnauthorized {
+						t.Errorf("status %d", rec.Code)
+					}
+				}()
+			}
+			wg.Wait()
+			reasons := env.loginReasons()
+			if got := reasons["wrong "+wrong]; got != loginFailureThreshold {
+				t.Fatalf("%d attempts were verified, want exactly %d (%v)", got, loginFailureThreshold, reasons)
+			}
+			if got := reasons["account temporarily locked"]; got != n-loginFailureThreshold {
+				t.Fatalf("%d attempts hit the lock, want %d (%v)", got, n-loginFailureThreshold, reasons)
+			}
+			// The correct credentials are refused until the lock ends.
+			requireStatus(t, env.login("admin", testPassword, env.totp(sup.secret, 0)), http.StatusUnauthorized)
+		})
+	}
+}
+
+// Sending one valid code several times at once (a double click) signs in
+// once and never locks the account.
+func TestSameCodeBurstDoesNotLock(t *testing.T) {
+	env := newTestEnv(t, false)
+	sup := env.supervisorClient()
+	env.nextStep()
+	code := env.totp(sup.secret, 0)
+	const n = 8
+	var wg sync.WaitGroup
+	results := make([]int, n)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = env.login("admin", testPassword, code).Code
+		}()
+	}
+	wg.Wait()
+	ok := 0
+	for _, status := range results {
+		if status == http.StatusOK {
+			ok++
+		}
+	}
+	auth, err := env.srv.db.GetPersonAuth(context.Background(), sup.person.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok != 1 || auth.LockedUntil != nil || auth.FailedLogins != 0 {
+		t.Fatalf("successes=%d locked=%v failed=%d (%v)", ok, auth.LockedUntil, auth.FailedLogins, results)
+	}
+	env.nextStep()
+	requireStatus(t, env.login("admin", testPassword, env.totp(sup.secret, 0)), http.StatusOK)
+}
+
+// Recovery and serve refuse a wrong master key even when the data directory
+// holds no provider credential.
+func TestWrongMasterKeyIsRefusedWithoutProviders(t *testing.T) {
+	ctx := context.Background()
+	wrongKey := bytes.Repeat([]byte{9}, 32)
+	deleteKeyCheck := func(env *testEnv) {
+		t.Helper()
+		if _, err := env.srv.db.SQL().Exec(`DELETE FROM meta WHERE key = ?`, store.MetaVaultKeyCheck); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	env := newTestEnv(t, false) // no providers, nobody set up yet
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: env.dir, Username: "admin", MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("fresh data dir, wrong key: %v", err)
+	}
+	if _, err := New(Config{DataDir: env.dir, MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("serve with a wrong key: %v", err)
+	}
+	sup := env.supervisorClient()
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: env.dir, Username: "admin", MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("after setup, wrong key: %v", err)
+	}
+	requireStatus(t, sup.do(http.MethodGet, "/api/v1/auth/me", nil), http.StatusOK)
+
+	// A data directory from before the key check: a stored TOTP secret is
+	// used instead, and with nothing encrypted at all recovery fails closed.
+	deleteKeyCheck(env)
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: env.dir, Username: "admin", MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("no key check, TOTP secret present, wrong key: %v", err)
+	}
+	empty := newTestEnv(t, false)
+	deleteKeyCheck(empty)
+	for name, key := range map[string][]byte{"wrong": wrongKey, "right": nil} {
+		if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin", MasterKey: key}); !errors.Is(err, errVaultKeyUnverifiable) {
+			t.Fatalf("nothing to verify against, %s key: %v", name, err)
+		}
+	}
+
+	// The right key still works.
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: env.dir, Username: "admin"}); err != nil {
+		t.Fatalf("right key: %v", err)
+	}
+}
+
+func TestSameOriginRules(t *testing.T) {
+	env := newTestEnv(t, false)
+	check := func(host string, tls bool, headers map[string]string) bool {
+		req := httptest.NewRequest(http.MethodPost, "http://"+host+"/api/v1/auth/login", nil)
+		req.Host = host
+		if tls {
+			req.TLS = &cryptotls.ConnectionState{}
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		return env.srv.sameOrigin(req)
+	}
+	origin := func(o string) map[string]string { return map[string]string{"Origin": o} }
+	cases := []struct {
+		name string
+		host string
+		tls  bool
+		h    map[string]string
+		want bool
+	}{
+		{"no origin (non-browser client)", "console.example.com", false, nil, true},
+		{"same origin http", "console.example.com", false, origin("http://console.example.com"), true},
+		{"same origin, case differs", "Console.Example.com", false, origin("http://console.example.COM"), true},
+		{"same origin https", "console.example.com", true, origin("https://console.example.com"), true},
+		{"http origin for an https server", "console.example.com", true, origin("http://console.example.com"), false},
+		{"https origin for an http server", "console.example.com", false, origin("https://console.example.com"), false},
+		{"other host", "console.example.com", false, origin("http://evil.example"), false},
+		{"other port", "console.example.com:8787", false, origin("http://console.example.com:9999"), false},
+		{"port missing", "console.example.com:8787", false, origin("http://console.example.com"), false},
+		{"null origin", "console.example.com", false, origin("null"), false},
+		{"userinfo", "console.example.com", false, origin("http://x@console.example.com"), false},
+		{"path", "console.example.com", false, origin("http://console.example.com/evil"), false},
+		{"query", "console.example.com", false, origin("http://console.example.com?x=1"), false},
+		{"fragment", "console.example.com", false, origin("http://console.example.com#x"), false},
+		{"scheme-relative", "console.example.com", false, origin("//console.example.com"), false},
+		{"other scheme", "console.example.com", false, origin("ftp://console.example.com"), false},
+		{"cross-site fetch metadata", "console.example.com", false, map[string]string{"Sec-Fetch-Site": "cross-site"}, false},
+		{"same-site fetch metadata", "console.example.com", false, map[string]string{"Sec-Fetch-Site": "same-site"}, false},
+	}
+	for _, c := range cases {
+		if got := check(c.host, c.tls, c.h); got != c.want {
+			t.Errorf("%s: sameOrigin = %v, want %v", c.name, got, c.want)
+		}
+	}
+
+	// Behind a TLS proxy the configured public origin is the only one
+	// accepted, whatever Host header the proxy forwards.
+	var err error
+	if env.srv.publicOrigin, err = parsePublicOrigin("https://CSG.example.com/"); err != nil {
+		t.Fatal(err)
+	}
+	if !check("10.0.0.5:8787", false, origin("https://csg.example.com")) {
+		t.Error("public origin refused")
+	}
+	if check("evil.example", false, origin("http://evil.example")) {
+		t.Error("forwarded attacker Host accepted despite a public origin")
+	}
+	for _, bad := range []string{"csg.example.com", "ftp://csg.example.com", "https://csg.example.com/path", "https://u@csg.example.com"} {
+		if _, err := parsePublicOrigin(bad); err == nil {
+			t.Errorf("public origin %q accepted", bad)
+		}
+	}
+}
+
+func TestSecureCookieBehindTLSProxy(t *testing.T) {
+	env := newTestEnv(t, false)
+	sup := env.supervisorClient()
+	if sup.cookie.Secure {
+		t.Fatal("cookie marked Secure on plain HTTP without a public origin")
+	}
+	env.srv.publicOrigin = "https://csg.example.com"
+	env.nextStep()
+	rec := env.login("admin", testPassword, env.totp(sup.secret, 0))
+	requireStatus(t, rec, http.StatusOK)
+	if c := sessionCookie(rec); c == nil || !c.Secure {
+		t.Fatalf("cookie not Secure behind an https public origin: %+v", c)
+	}
+}
+
+func TestLoginNeedsJSONContentType(t *testing.T) {
+	env := newTestEnv(t, false)
+	sup := env.supervisorClient()
+	env.nextStep()
+	body, _ := json.Marshal(model.PersonLoginInput{Username: "admin", Password: testPassword, TOTPCode: env.totp(sup.secret, 0)})
+	for _, contentType := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		rec := httptest.NewRecorder()
+		env.srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnsupportedMediaType || sessionCookie(rec) != nil {
+			t.Errorf("Content-Type %q: status %d", contentType, rec.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	rec := httptest.NewRecorder()
+	env.srv.Handler().ServeHTTP(rec, req)
+	requireStatus(t, rec, http.StatusOK)
+}
+
+func TestLogoutNeedsCSRFToken(t *testing.T) {
+	env := newTestEnv(t, false)
+	sup := env.supervisorClient()
+	requireStatus(t, env.request(http.MethodPost, "/api/v1/auth/logout", sup.cookie, nil, nil), http.StatusForbidden)
+	requireStatus(t, sup.do(http.MethodGet, "/api/v1/auth/me", nil), http.StatusOK)
+}
+
+// A person suspended before finishing setup is brought back with a reset.
+func TestResetRecoversSuspendedInvitation(t *testing.T) {
+	env := newTestEnv(t, false)
+	sup := env.supervisorClient()
+	rec := sup.do(http.MethodPost, "/api/v1/supervisor/people", model.CreatePersonInput{Username: "jun"})
+	jun := decodeEnvelope[model.PersonWithSetupCode](t, rec)
+	path := "/api/v1/supervisor/people/" + jun.Person.ID
+	suspended := model.PersonSuspended
+	requireStatus(t, sup.do(http.MethodPatch, path, model.UpdatePersonInput{Status: &suspended}), http.StatusOK)
+	rec = sup.do(http.MethodPost, path+"/reset", nil)
+	requireStatus(t, rec, http.StatusOK)
+	reset := decodeEnvelope[model.PersonWithSetupCode](t, rec)
+	if reset.Person.Status != model.PersonPending {
+		t.Fatalf("status after reset = %s", reset.Person.Status)
+	}
+	client := env.completeSetup(reset.SetupCode)
+	requireStatus(t, client.do(http.MethodGet, "/api/v1/auth/me", nil), http.StatusOK)
 }

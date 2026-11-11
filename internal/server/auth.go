@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -95,33 +97,106 @@ func (s *Server) acquireHashSlot(ctx context.Context) error {
 
 func (s *Server) releaseHashSlot() { <-s.hashSlots }
 
-// sameOrigin rejects cross-site browser requests. Browsers send Origin on
-// every cross-origin and every state-changing request; a request without it
-// comes from a non-browser client, which cannot carry a victim's cookie.
-func sameOrigin(r *http.Request) bool {
+// parsePublicOrigin validates Config.PublicOrigin and returns it normalized
+// ("scheme://host[:port]", lowercase), or "" when unset.
+func parsePublicOrigin(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	origin, ok := normalizeOrigin(strings.TrimSuffix(raw, "/"))
+	if !ok {
+		return "", fmt.Errorf("server: public origin %q must look like https://host[:port]", raw)
+	}
+	return origin, nil
+}
+
+// normalizeOrigin accepts exactly "http(s)://host[:port]" and returns it
+// lowercased. Anything else a URL parser would tolerate (userinfo, a path,
+// a query, a fragment, another scheme, "null") is refused.
+func normalizeOrigin(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" ||
+		strings.ContainsAny(raw, "?#") {
+		return "", false
+	}
+	return u.Scheme + "://" + strings.ToLower(u.Host), true
+}
+
+// expectedOrigin is the origin a same-origin browser request must carry.
+func (s *Server) expectedOrigin(r *http.Request) string {
+	if s.publicOrigin != "" {
+		return s.publicOrigin
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + strings.ToLower(r.Host)
+}
+
+// sameOrigin rejects cross-site browser requests: an Origin header must be
+// exactly the server's own origin (scheme, host and port), and
+// Sec-Fetch-Site must not say cross-site. Browsers send Origin on every
+// cross-origin and every state-changing request; a request without it comes
+// from a non-browser client, which holds no victim's cookie. The callers add
+// a second, independent barrier (JSON content type or the CSRF token).
+func (s *Server) sameOrigin(r *http.Request) bool {
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		return false
 	}
-	origin := r.Header.Get("Origin")
-	if origin == "" {
+	raw := r.Header.Get("Origin")
+	if raw == "" {
 		return true
 	}
-	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
-		return false
+	origin, ok := normalizeOrigin(raw)
+	return ok && origin == s.expectedOrigin(r)
+}
+
+// isJSONRequest reports whether the request declares a JSON body. A
+// cross-site HTML form cannot send this content type without a CORS
+// preflight, which this server never grants.
+func isJSONRequest(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mediaType == "application/json"
+}
+
+// lockPerson serializes sign-in and authority changes for one person. The
+// returned function releases the lock.
+func (s *Server) lockPerson(ctx context.Context, personID string) (func(), error) {
+	s.personLocksMu.Lock()
+	if s.personLocks == nil {
+		s.personLocks = map[string]chan struct{}{}
 	}
-	return strings.EqualFold(u.Host, r.Host)
+	lock, ok := s.personLocks[personID]
+	if !ok {
+		lock = make(chan struct{}, 1)
+		s.personLocks[personID] = lock
+	}
+	s.personLocksMu.Unlock()
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func isSafeMethod(method string) bool {
 	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
 }
 
-// requireSameOrigin guards the unauthenticated auth endpoints (login CSRF).
+// requireSameOrigin guards the unauthenticated auth endpoints against login
+// CSRF: the request must be same-origin and declare a JSON body.
 func (s *Server) requireSameOrigin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !sameOrigin(r) {
+		if !s.sameOrigin(r) {
 			s.writeError(w, http.StatusForbidden, model.ErrCodeForbidden, "cross-site request refused")
+			return
+		}
+		if !isJSONRequest(r) {
+			s.writeError(w, http.StatusUnsupportedMediaType, model.ErrCodeInvalidRequest, "Content-Type must be application/json")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -139,7 +214,7 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 			return
 		}
 		if !isSafeMethod(r.Method) {
-			if !sameOrigin(r) || !authn.Equal(r.Header.Get(csrfHeader), sc.session.CSRFToken) {
+			if !s.sameOrigin(r) || !authn.Equal(r.Header.Get(csrfHeader), sc.session.CSRFToken) {
 				s.personAudit(r.Context(), sc.person, "auth.csrf_rejected", "denied", "warning", "person", sc.person.ID,
 					map[string]any{"remote_addr": remoteHost(r)})
 				s.writeError(w, http.StatusForbidden, model.ErrCodeForbidden, "missing or invalid CSRF token")
@@ -193,7 +268,9 @@ func (s *Server) loadSession(r *http.Request) (sessionContext, bool) {
 	return sessionContext{person: person, session: sess}, true
 }
 
-func (s *Server) secureCookie(r *http.Request) bool { return s.cfg.SecureCookies || r.TLS != nil }
+func (s *Server) secureCookie(r *http.Request) bool {
+	return r.TLS != nil || strings.HasPrefix(s.publicOrigin, "https://")
+}
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, value string, expires time.Time) {
 	http.SetCookie(w, &http.Cookie{
@@ -318,6 +395,12 @@ func (s *Server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, setupFailedMessage)
 		return
 	}
+	unlock, err := s.lockPerson(ctx, person.ID)
+	if err != nil {
+		s.internalError(w, "lock person", err)
+		return
+	}
+	defer unlock()
 	auth, err := s.db.GetPersonAuth(ctx, person.ID)
 	if err != nil || auth.PasswordHash == "" || auth.TOTPSecretEnc == "" {
 		s.badRequest(w, "choose a password first")
@@ -355,6 +438,10 @@ func (s *Server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 		map[string]any{"remote_addr": remoteHost(r)})
 	info, err := s.startSession(w, r, person)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) { // suspended or reset since activation
+			s.badRequest(w, setupFailedMessage)
+			return
+		}
 		s.internalError(w, "start session", err)
 		return
 	}
@@ -389,6 +476,11 @@ func (s *Server) pendingPersonForSetupCode(ctx context.Context, r *http.Request,
 
 // handleLogin signs a person in with username, password and TOTP code. Every
 // failure returns the same response, whatever the cause.
+//
+// Attempts for one person run one at a time (lockPerson) and the lock state
+// is read inside that lock, so the failure limit is exact: a burst of
+// parallel requests cannot all pass the lock check before the first failure
+// is recorded.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var in model.PersonLoginInput
 	if err := s.decodeJSON(w, r, &in); err != nil {
@@ -396,8 +488,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	fail := func(personID, reason string) {
-		if personID != "" {
+	// fail answers with the uniform 401. count=true records a failed attempt
+	// towards the lockout.
+	fail := func(personID, reason string, count bool) {
+		if count && personID != "" {
 			if err := s.db.RecordLoginFailure(ctx, personID, s.nowUTC(), loginFailureThreshold, loginLockDuration); err != nil {
 				s.logf("record login failure: %v", err)
 			}
@@ -409,41 +503,48 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	username, valid := normalizeUsername(in.Username)
-	var (
-		person model.Person
-		auth   store.PersonAuth
-		found  bool
-	)
+	personID := ""
 	if valid {
 		if p, err := s.db.GetPersonByUsername(ctx, username); err == nil {
-			if a, err := s.db.GetPersonAuth(ctx, p.ID); err == nil {
-				person, auth, found = p, a, true
-			}
+			personID = p.ID
 		}
 	}
-	if !found {
+	if personID == "" {
 		s.verifyPassword(ctx, "", in.Password) // equalize timing
-		fail("", "unknown username")
+		fail("", "unknown username", false)
+		return
+	}
+	unlock, err := s.lockPerson(ctx, personID)
+	if err != nil {
+		s.internalError(w, "lock person", err)
+		return
+	}
+	defer unlock()
+	// Read the state only now, inside the lock.
+	person, err := s.db.GetPerson(ctx, personID)
+	if err != nil {
+		s.internalError(w, "read person", err)
+		return
+	}
+	auth, err := s.db.GetPersonAuth(ctx, personID)
+	if err != nil {
+		s.internalError(w, "read person auth", err)
 		return
 	}
 	now := s.nowUTC()
-	locked := auth.LockedUntil != nil && now.Before(*auth.LockedUntil)
-	usable := person.Status == model.PersonActive && auth.PasswordHash != "" && auth.TOTPSecretEnc != ""
-	if locked || !usable {
+	if auth.LockedUntil != nil && now.Before(*auth.LockedUntil) {
+		// A locked account ignores attempts and does not extend the lock.
 		s.verifyPassword(ctx, "", in.Password) // equalize timing; never matches
-		if locked {
-			// Do not extend the lock: a locked account ignores attempts.
-			s.systemAudit(ctx, "auth.login_failed", "denied", "warning", "person", person.ID, map[string]any{
-				"remote_addr": remoteHost(r), "reason": "account temporarily locked",
-			})
-			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, loginFailedMessage)
-			return
-		}
-		fail(person.ID, "person is "+string(person.Status))
+		fail(person.ID, "account temporarily locked", false)
+		return
+	}
+	if person.Status != model.PersonActive || auth.PasswordHash == "" || auth.TOTPSecretEnc == "" {
+		s.verifyPassword(ctx, "", in.Password)
+		fail(person.ID, "person is "+string(person.Status), false)
 		return
 	}
 	if !s.verifyPassword(ctx, auth.PasswordHash, in.Password) {
-		fail(person.ID, "wrong password")
+		fail(person.ID, "wrong password", true)
 		return
 	}
 	secret, err := s.vault.Decrypt(auth.TOTPSecretEnc, totpAAD(person.ID))
@@ -451,20 +552,26 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, "decrypt TOTP secret", err)
 		return
 	}
-	step, ok, err := authn.VerifyTOTP(string(secret), in.TOTPCode, now, auth.TOTPLastStep)
+	step, result, err := authn.CheckTOTP(string(secret), in.TOTPCode, now, auth.TOTPLastStep)
 	if err != nil {
 		s.internalError(w, "verify TOTP", err)
 		return
 	}
-	if !ok {
-		fail(person.ID, "wrong or reused code")
+	switch result {
+	case authn.TOTPWrong:
+		fail(person.ID, "wrong code", true)
+		return
+	case authn.TOTPReused:
+		// A genuine code used twice (double click, retry) is refused but is
+		// not a guess, so it does not count towards the lockout.
+		fail(person.ID, "code already used", false)
 		return
 	}
-	// Consume the TOTP step atomically: of two logins with the same code,
-	// only one succeeds.
+	// Consume the TOTP step atomically; the store also re-checks that the
+	// person is still active.
 	if err := s.db.AcceptLogin(ctx, person.ID, step, now); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			fail(person.ID, "wrong or reused code")
+			fail(person.ID, "code already used or person no longer active", false)
 			return
 		}
 		s.internalError(w, "accept login", err)
@@ -477,6 +584,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := s.startSession(w, r, person)
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) { // suspended or reset just now
+			fail(person.ID, "person no longer active", false)
+			return
+		}
 		s.internalError(w, "start session", err)
 		return
 	}

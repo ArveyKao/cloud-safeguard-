@@ -23,6 +23,9 @@ const (
 	MetaBootstrapTime    = "bootstrap_time"
 	MetaDemoMode         = "demo_mode"
 	MetaPolicySettings   = "policy_settings"
+	// MetaVaultKeyCheck holds a known plaintext encrypted with the master
+	// key, so a wrong key is detected even when nothing else is encrypted.
+	MetaVaultKeyCheck = "vault_key_check"
 )
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.

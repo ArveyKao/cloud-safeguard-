@@ -223,8 +223,22 @@ func (db *DB) ResetPersonSetup(ctx context.Context, id, setupCodeHash string, se
 	})
 }
 
+// SetPendingSupervisorFlag sets the supervisor flag of a person who is still
+// pending. It returns ErrConflict when the person is no longer pending (they
+// finished setup in the meantime); the caller then goes through
+// SetPersonAuthority, which carries the last-supervisor guard.
+func (db *DB) SetPendingSupervisorFlag(ctx context.Context, id string, supervisor bool, now time.Time) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE persons SET supervisor = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
+		boolInt(supervisor), toMillis(now), id)
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrConflict(res)
+}
+
 // SetSupervisorFlag sets the supervisor flag without the last-supervisor
-// guard. It is for bootstrap and local recovery only.
+// guard. It is for local recovery only; the API must never call it.
 func (db *DB) SetSupervisorFlag(ctx context.Context, id string, supervisor bool, now time.Time) error {
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE persons SET supervisor = ?, updated_at = ? WHERE id = ?`, boolInt(supervisor), toMillis(now), id)
@@ -303,12 +317,28 @@ func affectedOrConflict(res sql.Result) error {
 
 // ---- sessions ----
 
-// CreateSession stores a new session.
+// CreateSession stores a new session, but only while the person is active.
+// The check is part of the INSERT, so a session can never be created after a
+// suspend or reset has committed. It returns ErrConflict otherwise.
 func (db *DB) CreateSession(ctx context.Context, s Session) error {
-	_, err := db.sql.ExecContext(ctx,
-		`INSERT INTO sessions(token_hash, person_id, csrf_token, created_at, last_seen_at, expires_at) VALUES(?, ?, ?, ?, ?, ?)`,
-		s.TokenHash, s.PersonID, s.CSRFToken, toMillis(s.CreatedAt), toMillis(s.LastSeenAt), toMillis(s.ExpiresAt))
-	return mapErr(err)
+	res, err := db.sql.ExecContext(ctx,
+		`INSERT INTO sessions(token_hash, person_id, csrf_token, created_at, last_seen_at, expires_at)
+		 SELECT ?, ?, ?, ?, ?, ?
+		 WHERE EXISTS (SELECT 1 FROM persons WHERE id = ? AND status = 'active')`,
+		s.TokenHash, s.PersonID, s.CSRFToken, toMillis(s.CreatedAt), toMillis(s.LastSeenAt), toMillis(s.ExpiresAt),
+		s.PersonID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrConflict(res)
+}
+
+// AnyTOTPSecret returns one stored encrypted TOTP secret with its person ID,
+// or ErrNotFound. It is used to prove the vault key.
+func (db *DB) AnyTOTPSecret(ctx context.Context) (personID, encrypted string, err error) {
+	err = db.sql.QueryRowContext(ctx,
+		`SELECT id, totp_secret_enc FROM persons WHERE totp_secret_enc <> '' ORDER BY id LIMIT 1`).Scan(&personID, &encrypted)
+	return personID, encrypted, mapErr(err)
 }
 
 // GetSession returns a session by cookie hash.

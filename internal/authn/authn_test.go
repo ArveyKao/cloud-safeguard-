@@ -134,3 +134,47 @@ func TestSecrets(t *testing.T) {
 		t.Fatal("Equal broken")
 	}
 }
+
+func TestCheckTOTPTellsReuseFromGuess(t *testing.T) {
+	secret, _ := NewTOTPSecret()
+	now := time.Unix(1_800_000_000, 0)
+	step := TOTPStep(now)
+	code, _ := TOTPCode(secret, step)
+	if _, r, _ := CheckTOTP(secret, code, now, -1); r != TOTPAccepted {
+		t.Fatalf("fresh code = %v", r)
+	}
+	if _, r, _ := CheckTOTP(secret, code, now, step); r != TOTPReused {
+		t.Fatalf("used code = %v, want reused", r)
+	}
+	older, _ := TOTPCode(secret, step-1)
+	if _, r, _ := CheckTOTP(secret, older, now, step); r != TOTPReused {
+		t.Fatalf("older code = %v, want reused", r)
+	}
+	wrong := "000000"
+	for _, s := range []int64{step - 1, step, step + 1} {
+		if c, _ := TOTPCode(secret, s); c == wrong {
+			wrong = "999999"
+		}
+	}
+	if _, r, _ := CheckTOTP(secret, wrong, now, step); r != TOTPWrong {
+		t.Fatalf("wrong code = %v", r)
+	}
+}
+
+func TestVerifyRejectsHostileHashParameters(t *testing.T) {
+	good, _ := HashPassword("correct horse battery", fastParams)
+	for name, h := range map[string]string{
+		"1 GiB":       strings.Replace(good, "m=64", "m=1048576", 1),
+		"257 MiB":     strings.Replace(good, "m=64", "m=263168", 1),
+		"many passes": strings.Replace(good, "t=1", "t=11", 1),
+		"many lanes":  strings.Replace(good, "p=1", "p=9", 1),
+		"over-long":   good + strings.Repeat("A", 600),
+	} {
+		if ok, err := VerifyPassword(h, "correct horse battery"); ok || err == nil {
+			t.Errorf("%s: ok=%v err=%v", name, ok, err)
+		}
+	}
+	if err := DefaultParams.check(); err != nil {
+		t.Fatalf("default parameters rejected: %v", err)
+	}
+}

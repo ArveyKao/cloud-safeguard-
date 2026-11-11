@@ -99,13 +99,14 @@ agents and prints their one-time tokens.
 
 // runServe implements `csg serve`.
 func (a *App) runServe(args []string) error {
-	fs := a.newFlagSet("serve", `Usage: csg serve [--data-dir DIR] [--addr 127.0.0.1:8787]
+	fs := a.newFlagSet("serve", `Usage: csg serve [--data-dir DIR] [--addr 127.0.0.1:8787] [--public-url URL]
 
 Runs the control plane (HTTP API, embedded console, mock cloud) until SIGINT or
 SIGTERM, then shuts down gracefully.
 `)
 	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address (loopback only by default)")
+	publicURL := fs.String("public-url", "", "origin people open the console at, e.g. https://csg.example.com (set it behind a TLS proxy)")
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -117,7 +118,7 @@ SIGTERM, then shuts down gracefully.
 		return usagef("--data-dir must not be empty")
 	}
 
-	srv, err := server.New(server.Config{Addr: *addr, DataDir: *dataDir})
+	srv, err := server.New(server.Config{Addr: *addr, DataDir: *dataDir, PublicOrigin: *publicURL})
 	if err != nil {
 		return fmt.Errorf("cannot start control plane: %v", err)
 	}

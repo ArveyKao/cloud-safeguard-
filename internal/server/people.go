@@ -107,6 +107,13 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
 	id := r.PathValue("id")
+	// Authority changes and sign-in for one person never interleave.
+	unlock, err := s.lockPerson(ctx, id)
+	if err != nil {
+		s.internalError(w, "lock person", err)
+		return
+	}
+	defer unlock()
 	person, err := s.db.GetPerson(ctx, id)
 	if err != nil {
 		s.storeErrorResponse(w, err, "person not found")
@@ -137,8 +144,14 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 			supervisor = *in.Supervisor
 		}
 		if status == model.PersonPending {
-			// Only the flag of a pending person can change here.
-			if err := s.db.SetSupervisorFlag(ctx, id, supervisor, now); err != nil {
+			// Only the flag of a pending person can change here. The write
+			// itself requires the person to still be pending, so it can
+			// never demote someone who finished setup in the meantime.
+			if err := s.db.SetPendingSupervisorFlag(ctx, id, supervisor, now); err != nil {
+				if errors.Is(err, store.ErrConflict) {
+					s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "this person just finished setup; try again")
+					return
+				}
 				s.storeErrorResponse(w, err, "person not found")
 				return
 			}
@@ -174,18 +187,22 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleResetPerson issues a new setup code, erasing the person's password,
-// TOTP secret and sessions.
+// TOTP secret and sessions. The person becomes pending, whatever their status
+// was; this is also how a suspended person who never finished setup is
+// brought back.
 func (s *Server) handleResetPerson(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
 	id := r.PathValue("id")
+	unlock, err := s.lockPerson(ctx, id)
+	if err != nil {
+		s.internalError(w, "lock person", err)
+		return
+	}
+	defer unlock()
 	person, err := s.db.GetPerson(ctx, id)
 	if err != nil {
 		s.storeErrorResponse(w, err, "person not found")
-		return
-	}
-	if person.Status == model.PersonSuspended {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "person is suspended; activate them before a reset")
 		return
 	}
 	code, hash, err := authn.NewSecret(24)

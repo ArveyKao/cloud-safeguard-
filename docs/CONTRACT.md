@@ -727,7 +727,8 @@ merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR
   role binding like anyone else, and binding oneself is audited at warning level.
 - The last active supervisor cannot be suspended or lose the flag. A supervisor locked out of
   the console is restored with a local `csg` command on the server host, which needs the vault
-  master key and is audited at critical.
+  master key and is audited at critical. The data directory stores a key check, so recovery
+  and `csg serve` refuse a master key other than the one the directory was created with.
 - **Agent**: a non-human identity owned by exactly one person (`Agent.owner_id`, required,
   immutable). Its token is valid only while the agent and its owner are both active. An agent
   has no role of its own.
@@ -762,10 +763,17 @@ merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR
      the setup code and signs them in. Supervisors never see or set passwords.
    - **Login.** Every failure returns the same 401, whatever the cause. A TOTP code works
      once: the accepted time step is consumed atomically. Five consecutive failures lock the
-     account for 15 minutes.
+     account for 15 minutes. The limit is exact under parallel requests: attempts for one
+     person are checked one at a time. Attempts made while locked are ignored, and a genuine
+     code sent twice is refused without counting as a failure.
    - **Session.** 30 minutes idle, 12 hours at most. State-changing requests need the
      session's token in `X-CSRF-Token` and must be same-origin. Suspending or resetting a
-     person ends their sessions at once.
+     person ends their sessions at once, and no session can be created for a person who is
+     not active.
+   - **Same origin.** An `Origin` header must equal the server's own origin exactly (scheme,
+     host and port). Behind a TLS-terminating proxy, start the server with
+     `csg serve --public-url https://host`: only that origin is accepted and the session
+     cookie is marked `Secure`. Setup and login also require `Content-Type: application/json`.
    - **Storage.** Passwords are Argon2id hashes; TOTP secrets are encrypted in the vault.
 2. **Agent-first sign-in**: the agent (CLI or MCP) starts a sign-in and receives a short user
    code and a link. The person logs in, checks that the code and agent name match, and approves;

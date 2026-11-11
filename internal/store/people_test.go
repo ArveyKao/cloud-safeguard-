@@ -218,6 +218,8 @@ func TestStaleSessionsAreDeleted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	newPerson(t, db, "p", false)
+	activate(t, db, "p")
 	mk("fresh", peopleNow, peopleNow.Add(time.Hour))
 	mk("idle", peopleNow.Add(-31*time.Minute), peopleNow.Add(time.Hour))
 	mk("expired", peopleNow, peopleNow)
@@ -264,5 +266,62 @@ func TestBindings(t *testing.T) {
 	}
 	if err := db.DeleteBinding(ctx, "mei", "prod"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete: %v", err)
+	}
+}
+
+func TestSessionNeedsAnActivePerson(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	newPerson(t, db, "root", true)
+	activate(t, db, "root")
+	newPerson(t, db, "pending", false)
+	newPerson(t, db, "mei", false)
+	activate(t, db, "mei")
+	create := func(person string) error {
+		return db.CreateSession(ctx, Session{TokenHash: "h-" + person, PersonID: person, CSRFToken: "c",
+			CreatedAt: peopleNow, LastSeenAt: peopleNow, ExpiresAt: peopleNow.Add(time.Hour)})
+	}
+	if err := create("mei"); err != nil {
+		t.Fatal(err)
+	}
+	for _, person := range []string{"pending", "nobody"} {
+		if err := create(person); !errors.Is(err, ErrConflict) {
+			t.Errorf("session for %s: %v", person, err)
+		}
+	}
+	// After a suspend or reset has committed, no session can be created:
+	// a login that verified just before cannot finish around it.
+	if err := db.SetPersonAuthority(ctx, "mei", model.PersonSuspended, false, peopleNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSession(ctx, Session{TokenHash: "late", PersonID: "mei", CSRFToken: "c",
+		CreatedAt: peopleNow, LastSeenAt: peopleNow, ExpiresAt: peopleNow.Add(time.Hour)}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("session after suspend: %v", err)
+	}
+	if err := db.ResetPersonSetup(ctx, "root", "again", peopleNow.Add(time.Hour), peopleNow, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := create("root"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("session after reset: %v", err)
+	}
+}
+
+func TestPendingSupervisorFlagOnlyWhilePending(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	newPerson(t, db, "mei", true)
+	if err := db.SetPendingSupervisorFlag(ctx, "mei", false, peopleNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPendingSupervisorFlag(ctx, "mei", true, peopleNow); err != nil {
+		t.Fatal(err)
+	}
+	activate(t, db, "mei") // now the only active supervisor
+	// A stale "still pending" decision must not demote an active supervisor.
+	if err := db.SetPendingSupervisorFlag(ctx, "mei", false, peopleNow); !errors.Is(err, ErrConflict) {
+		t.Fatalf("flag changed on an active person: %v", err)
+	}
+	if n, _ := db.CountActiveSupervisors(ctx); n != 1 {
+		t.Fatalf("active supervisors = %d", n)
 	}
 }

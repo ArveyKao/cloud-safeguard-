@@ -116,6 +116,9 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		return InitResult{}, err
 	}
 	defer db.Close()
+	if err := ensureVaultKeyCheck(ctx, db, v); err != nil {
+		return InitResult{}, err
+	}
 	// `csg init --force` on an older data dir performs the schema upgrade, so it
 	// must record it too; a later `csg serve` would see no migration to report.
 	if err := auditMigrationReport(ctx, db); err != nil {
@@ -561,10 +564,52 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 	return out, nil
 }
 
-// verifyVaultKey proves the supplied master key is the one this data
-// directory was encrypted with, by decrypting a stored provider credential.
-// With nothing encrypted yet there is nothing to protect and it passes.
+// Vault key check: a known plaintext encrypted with the master key and kept
+// in the meta table, so a wrong key is detected even when no provider
+// credential or TOTP secret exists yet.
+const (
+	vaultKeyCheckPlaintext = "csg-vault-key-check-v1"
+	vaultKeyCheckAAD       = "meta/vault-key-check"
+)
+
+var errWrongMasterKey = errors.New("server: the master key does not match this data directory")
+
+// ensureVaultKeyCheck verifies the stored key check, or writes it when the
+// data directory has none yet. Init and serve call it; both hold the key the
+// directory was created with (or fail here).
+func ensureVaultKeyCheck(ctx context.Context, db *store.DB, v *vault.Vault) error {
+	err := verifyVaultKey(ctx, db, v)
+	if err == nil || !errors.Is(err, errVaultKeyUnverifiable) {
+		return err
+	}
+	blob, err := v.Encrypt([]byte(vaultKeyCheckPlaintext), vaultKeyCheckAAD)
+	if err != nil {
+		return err
+	}
+	return db.SetMeta(ctx, store.MetaVaultKeyCheck, blob)
+}
+
+// errVaultKeyUnverifiable means the data directory holds nothing encrypted
+// to test a key against.
+var errVaultKeyUnverifiable = errors.New("server: cannot verify the master key: this data directory has no key check yet; start `csg serve` once with the right key")
+
+// verifyVaultKey proves that v holds the master key this data directory was
+// encrypted with. It fails closed: errWrongMasterKey when a stored secret
+// does not decrypt, errVaultKeyUnverifiable when there is nothing to test.
+// A data directory from before the key check falls back to a stored provider
+// credential or TOTP secret.
 func verifyVaultKey(ctx context.Context, db *store.DB, v *vault.Vault) error {
+	blob, err := db.GetMeta(ctx, store.MetaVaultKeyCheck)
+	switch {
+	case err == nil:
+		plain, err := v.Decrypt(blob, vaultKeyCheckAAD)
+		if err != nil || string(plain) != vaultKeyCheckPlaintext {
+			return errWrongMasterKey
+		}
+		return nil
+	case !errors.Is(err, store.ErrNotFound):
+		return err
+	}
 	providers, err := db.ListProviders(ctx)
 	if err != nil {
 		return err
@@ -578,9 +623,19 @@ func verifyVaultKey(ctx context.Context, db *store.DB, v *vault.Vault) error {
 			return err
 		}
 		if _, err := v.Decrypt(blob, providerAAD(p.ID)); err != nil {
-			return errors.New("server: the master key does not match this data directory")
+			return errWrongMasterKey
 		}
 		return nil
 	}
-	return nil
+	personID, enc, err := db.AnyTOTPSecret(ctx)
+	switch {
+	case err == nil:
+		if _, err := v.Decrypt(enc, totpAAD(personID)); err != nil {
+			return errWrongMasterKey
+		}
+		return nil
+	case !errors.Is(err, store.ErrNotFound):
+		return err
+	}
+	return errVaultKeyUnverifiable
 }

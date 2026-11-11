@@ -60,23 +60,43 @@ func TOTPCode(secret string, step int64) (string, error) {
 	return fmt.Sprintf("%0*d", TOTPDigits, value%1_000_000), nil
 }
 
-// VerifyTOTP checks code against the steps around now. It returns the matched
+// TOTPResult is the outcome of checking a TOTP code.
+type TOTPResult int
+
+const (
+	// TOTPWrong: the code matches no step in the window.
+	TOTPWrong TOTPResult = iota
+	// TOTPAccepted: the code matches a step newer than the last accepted one.
+	TOTPAccepted
+	// TOTPReused: the code is genuine but its step was already used (or is
+	// older than a used one). It must be refused, but it is not a guess.
+	TOTPReused
+)
+
+// VerifyTOTP reports whether code is acceptable; see CheckTOTP.
+func VerifyTOTP(secret, code string, now time.Time, lastStep int64) (step int64, ok bool, err error) {
+	step, result, err := CheckTOTP(secret, code, now, lastStep)
+	return step, result == TOTPAccepted, err
+}
+
+// CheckTOTP checks code against the steps around now. It returns the matched
 // step so the caller can refuse to accept the same or an older step again
 // (replay protection): pass the last accepted step as lastStep, or -1 for
 // none. Every candidate step is evaluated so timing does not reveal which one
 // matched.
-func VerifyTOTP(secret, code string, now time.Time, lastStep int64) (step int64, ok bool, err error) {
+func CheckTOTP(secret, code string, now time.Time, lastStep int64) (step int64, result TOTPResult, err error) {
 	code = strings.TrimSpace(code)
 	if len(code) != TOTPDigits {
-		return 0, false, nil
+		return 0, TOTPWrong, nil
 	}
 	for _, c := range code {
 		if c < '0' || c > '9' {
-			return 0, false, nil
+			return 0, TOTPWrong, nil
 		}
 	}
 	current := TOTPStep(now)
 	matched := int64(-1)
+	reused := false
 	for delta := int64(-TOTPSkew); delta <= TOTPSkew; delta++ {
 		candidate := current + delta
 		if candidate < 0 {
@@ -84,16 +104,23 @@ func VerifyTOTP(secret, code string, now time.Time, lastStep int64) (step int64,
 		}
 		want, err := TOTPCode(secret, candidate)
 		if err != nil {
-			return 0, false, err
+			return 0, TOTPWrong, err
 		}
-		if subtle.ConstantTimeCompare([]byte(want), []byte(code)) == 1 && candidate > lastStep && matched < 0 {
-			matched = candidate
+		if subtle.ConstantTimeCompare([]byte(want), []byte(code)) == 1 {
+			if candidate > lastStep && matched < 0 {
+				matched = candidate
+			} else if candidate <= lastStep {
+				reused = true
+			}
 		}
 	}
-	if matched < 0 {
-		return 0, false, nil
+	switch {
+	case matched >= 0:
+		return matched, TOTPAccepted, nil
+	case reused:
+		return 0, TOTPReused, nil
 	}
-	return matched, true, nil
+	return 0, TOTPWrong, nil
 }
 
 // OTPAuthURL builds the otpauth:// URI an authenticator app scans.

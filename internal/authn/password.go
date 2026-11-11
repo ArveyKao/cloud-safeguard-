@@ -39,11 +39,12 @@ var DefaultParams = Params{MemoryKiB: 64 * 1024, Time: 3, Threads: 2, SaltLen: 1
 // Upper bounds accepted when verifying a stored hash, so a corrupted or
 // hostile row cannot make the server allocate unbounded memory.
 const (
-	maxMemoryKiB = 1024 * 1024
-	maxTime      = 16
-	maxThreads   = 16
-	maxSaltLen   = 64
-	maxKeyLen    = 64
+	maxMemoryKiB  = 256 * 1024
+	maxTime       = 10
+	maxThreads    = 8
+	maxSaltLen    = 64
+	maxKeyLen     = 64
+	maxEncodedLen = 512
 )
 
 // Errors returned by the password functions.
@@ -121,6 +122,9 @@ func (p Params) check() error {
 }
 
 func parseHash(encoded string) (Params, []byte, []byte, error) {
+	if len(encoded) > maxEncodedLen {
+		return Params{}, nil, nil, ErrHashFormat
+	}
 	parts := strings.Split(encoded, "$")
 	// "", "argon2id", "v=19", "m=..,t=..,p=..", salt, hash
 	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
