@@ -23,6 +23,8 @@ func downgradeToV1(t *testing.T, dir string) {
 	for _, stmt := range []string{
 		`ALTER TABLE agents DROP COLUMN role`,
 		`ALTER TABLE capabilities DROP COLUMN access`,
+		`DROP INDEX IF EXISTS idx_agents_owner`,
+		`ALTER TABLE agents DROP COLUMN owner_id`,
 		`UPDATE meta SET value = '1' WHERE key = 'schema_version'`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {

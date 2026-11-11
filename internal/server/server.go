@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -73,6 +74,12 @@ type Config struct {
 	// When empty, the origin is derived from each request (its Host header
 	// and whether the connection itself is TLS).
 	PublicOrigin string
+	// TrustedProxies lists the addresses or CIDR ranges of reverse proxies
+	// in front of the server. Only when the direct peer is one of them is
+	// X-Forwarded-For used to find the client address (for rate limits, the
+	// sign-in approval screen and the audit log). Empty: the direct peer is
+	// always the client.
+	TrustedProxies []string
 }
 
 // Server is a running control-plane instance.
@@ -95,6 +102,8 @@ type Server struct {
 	hashSlots chan struct{}
 	// publicOrigin is the normalized Config.PublicOrigin, or "".
 	publicOrigin string
+	// trustedProxies is the parsed Config.TrustedProxies.
+	trustedProxies []netip.Prefix
 
 	handler   http.Handler
 	mockCloud http.Handler
@@ -245,6 +254,10 @@ func New(cfg Config) (*Server, error) {
 		db.Close()
 		return nil, err
 	}
+	if s.trustedProxies, err = parseTrustedProxies(cfg.TrustedProxies); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// Refuse to run with a master key other than the one this data
 	// directory was encrypted with.
 	if err := ensureVaultKeyCheck(context.Background(), db, v); err != nil {
@@ -263,6 +276,15 @@ func New(cfg Config) (*Server, error) {
 	if err := s.retireCapabilityLeases(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("server: revoke leases that violate the IAM prohibition: %w", err)
+	}
+	// Re-check every pending and active lease once at startup. Authority can
+	// change while the server is down or in a crash between a status change
+	// and its sweep: local recovery resets a person, an operator edits the
+	// database. Whatever is no longer authorized is revoked before serving.
+	if _, err := s.revalidateLeasesAs(context.Background(), store.LeaseFilter{},
+		"no longer authorized (startup check)", map[string]any{"caused_by": "startup check"}); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: re-check leases at startup: %w", err)
 	}
 	s.startSweeper()
 	return s, nil

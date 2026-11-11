@@ -243,7 +243,7 @@ func (db *DB) UpdateCapability(ctx context.Context, c model.Capability) error {
 // ================= Agents =================
 
 const agentColumns = `id, name, description, status, role, grants_json, max_ttl_seconds,
-	max_concurrent_leases, token_prefix, last_seen_at, created_at, updated_at`
+	max_concurrent_leases, token_prefix, last_seen_at, created_at, updated_at, owner_id`
 
 // scanAgent scans one agent row (token hash excluded).
 func scanAgent(row rowScanner) (model.Agent, error) {
@@ -256,7 +256,7 @@ func scanAgent(row rowScanner) (model.Agent, error) {
 	)
 	err := row.Scan(
 		&a.ID, &a.Name, &a.Description, &a.Status, &a.Role, &grantsJSON, &a.MaxTTLSeconds,
-		&a.MaxConcurrentLeases, &a.TokenPrefix, &lastSeenAt, &createdAt, &updatedAt,
+		&a.MaxConcurrentLeases, &a.TokenPrefix, &lastSeenAt, &createdAt, &updatedAt, &a.OwnerID,
 	)
 	if err != nil {
 		return model.Agent{}, mapErr(err)
@@ -275,21 +275,52 @@ func scanAgent(row rowScanner) (model.Agent, error) {
 	return a, nil
 }
 
+// execer is satisfied by *sql.DB and *sql.Tx.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // CreateAgent persists an agent together with its bearer token hash.
 func (db *DB) CreateAgent(ctx context.Context, a model.Agent, tokenHash string) error {
+	return insertAgent(ctx, db.sql, a, tokenHash)
+}
+
+func insertAgent(ctx context.Context, x execer, a model.Agent, tokenHash string) error {
 	grantsJSON, err := marshalJSON(a.Grants, "[]")
 	if err != nil {
 		return err
 	}
-	_, err = db.sql.ExecContext(ctx,
+	_, err = x.ExecContext(ctx,
 		`INSERT INTO agents(id, name, description, status, role, grants_json, max_ttl_seconds,
-			max_concurrent_leases, token_hash, token_prefix, last_seen_at, created_at, updated_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			max_concurrent_leases, token_hash, token_prefix, last_seen_at, created_at, updated_at, owner_id)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.Description, string(a.Status), string(a.Role), grantsJSON, a.MaxTTLSeconds,
 		a.MaxConcurrentLeases, tokenHash, a.TokenPrefix, millisPtr(a.LastSeenAt),
-		toMillis(a.CreatedAt), toMillis(a.UpdatedAt),
+		toMillis(a.CreatedAt), toMillis(a.UpdatedAt), a.OwnerID,
 	)
 	return mapErr(err)
+}
+
+// ListAgentsByOwner returns the agents owned by a person, oldest first.
+func (db *DB) ListAgentsByOwner(ctx context.Context, ownerID string) ([]model.Agent, error) {
+	if ownerID == "" {
+		return []model.Agent{}, nil
+	}
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+agentColumns+` FROM agents WHERE owner_id = ? ORDER BY created_at ASC, id ASC`, ownerID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := []model.Agent{}
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, mapErr(rows.Err())
 }
 
 // GetAgent returns an agent by ID.

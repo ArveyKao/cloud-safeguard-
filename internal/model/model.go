@@ -340,6 +340,11 @@ type Agent struct {
 	MaxTTLSeconds int `json:"max_ttl_seconds"`
 	// MaxConcurrentLeases caps simultaneously active leases.
 	MaxConcurrentLeases int `json:"max_concurrent_leases"`
+	// OwnerID is the person this agent belongs to (CONTRACT §17.1). It is set
+	// when the agent signs in and never changes. It is empty for agents
+	// created through the legacy admin API (§16), which stays available
+	// until §17 replaces it; those agents are not tied to any person.
+	OwnerID string `json:"owner_id,omitempty"`
 	// TokenPrefix is a display-only hint (e.g. "csg_agt_7f3a").
 	TokenPrefix string     `json:"token_prefix"`
 	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`

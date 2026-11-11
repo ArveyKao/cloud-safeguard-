@@ -442,3 +442,17 @@ func TestRenderPolicyNoParamsForStaticTemplate(t *testing.T) {
 		t.Fatalf("RenderPolicy() = %s, want %s", out, want)
 	}
 }
+
+// A template without statements is rejected even though the appended deny
+// statement would make the final document non-empty (QA finding).
+func TestRenderPolicyRejectsEmptyStatementList(t *testing.T) {
+	for _, tmpl := range []string{
+		`{"Version":"1","Statement":[]}`,
+		`{"Version":"1","Statement":null}`,
+	} {
+		c := model.Capability{ID: "cap_empty", Access: model.AccessRead, PolicyTemplate: tmpl}
+		if out, err := RenderPolicy(c, nil); err == nil {
+			t.Errorf("%s rendered to %s", tmpl, out)
+		}
+	}
+}

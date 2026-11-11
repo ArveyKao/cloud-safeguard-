@@ -243,6 +243,12 @@ func RenderPolicy(cap model.Capability, params map[string]string) ([]byte, error
 	if err := RejectDuplicateKeys(rendered); err != nil {
 		return nil, fmt.Errorf("policy template of capability %s: %v", cap.ID, err)
 	}
+	// The template itself must be a valid policy with at least one
+	// statement: once the deny statement is appended, an empty or null
+	// Statement would no longer look empty (CONTRACT §16.3 rule 0).
+	if err := CheckPolicy(cap.Access, rendered); err != nil {
+		return nil, err
+	}
 	withDeny, err := appendDenyStatement(rendered)
 	if err != nil {
 		return nil, fmt.Errorf("policy template of capability %s cannot carry the mandatory deny statement: %v", cap.ID, err)

@@ -30,7 +30,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 3
+const CurrentSchemaVersion = 4
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -199,6 +199,27 @@ var migrations = []migration{
 				expires_at   INTEGER NOT NULL
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_sessions_person ON sessions(person_id)`,
+		},
+	},
+	{ // version 3 -> 4: agent ownership and agent-first sign-in (CONTRACT §17.3)
+		statements: []string{
+			`ALTER TABLE agents ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_id)`,
+			`CREATE TABLE IF NOT EXISTS agent_signins (
+				id               TEXT PRIMARY KEY,
+				device_code_hash TEXT NOT NULL UNIQUE,
+				user_code        TEXT NOT NULL UNIQUE,
+				agent_name       TEXT NOT NULL,
+				description      TEXT NOT NULL DEFAULT '',
+				status           TEXT NOT NULL,
+				person_id        TEXT NOT NULL DEFAULT '',
+				agent_id         TEXT NOT NULL DEFAULT '',
+				remote_addr      TEXT NOT NULL DEFAULT '',
+				created_at       INTEGER NOT NULL,
+				expires_at       INTEGER NOT NULL,
+				decided_at       INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_signins_status ON agent_signins(status, expires_at)`,
 		},
 	},
 }

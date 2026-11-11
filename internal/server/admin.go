@@ -25,7 +25,7 @@ import (
 // handleAdminLogin implements POST /api/v1/admin/login.
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	s.adminAudit(r.Context(), "auth.admin_login", "ok", "info", "admin", "admin", map[string]any{
-		"remote_addr": remoteHost(r),
+		"remote_addr": s.clientAddr(r),
 	})
 	s.writeData(w, http.StatusOK, model.LoginResult{
 		OK:      true,

@@ -454,9 +454,21 @@ func (s *Server) handleAgentFetchCredential(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Check again now that the credential is in hand. A revoke writes the
+	// terminal status before it erases the credential, so if the lease still
+	// reads active here, no revocation had happened when the credential was
+	// read. The same goes for the agent and its owner.
+	if problem, err := s.credentialReleaseProblem(r.Context(), ag.ID, lease.ID); err != nil {
+		s.writeHandlerError(w, err)
+		return
+	} else if problem != "" {
+		s.writeError(w, http.StatusConflict, model.ErrCodeLeaseNotActive, problem)
+		return
+	}
+
 	envelope := s.credentialEnvelope(credential, lease, r)
 	s.agentAudit(r.Context(), ag, "lease.credential_fetched", "ok", "info", "lease", lease.ID, map[string]any{
-		"remote_addr": remoteHost(r),
+		"remote_addr": s.clientAddr(r),
 	})
 	s.writeData(w, http.StatusOK, envelope)
 }
@@ -651,9 +663,20 @@ func (s *Server) handleAdminApproveLease(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, problem)
 		return
 	}
+	if problem, err := s.agentOwnerProblem(r.Context(), ag); err != nil {
+		s.writeHandlerError(w, err)
+		return
+	} else if problem != "" {
+		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, problem)
+		return
+	}
 
+	if in.TTLSeconds < 0 {
+		s.badRequest(w, "ttl_seconds must be positive")
+		return
+	}
 	ttl := in.TTLSeconds
-	if ttl <= 0 {
+	if ttl == 0 { // omitted: keep the requested validity period
 		ttl = lease.RequestedTTLSeconds
 	}
 	if ttl <= 0 {
@@ -1009,6 +1032,9 @@ func (s *Server) recheckLeaseAuthorization(ctx context.Context, lease model.Leas
 	if lease.EffectiveTTLSeconds > maxTTL {
 		return fmt.Sprintf("ttl %ds now exceeds the allowed maximum %ds", lease.EffectiveTTLSeconds, maxTTL), nil
 	}
+	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil || problem != "" {
+		return problem, err
+	}
 	return leaseAuthorizationProblem(ag, capability, lease), nil
 }
 
@@ -1041,6 +1067,35 @@ func isRetiredCapability(id string) bool {
 	return false
 }
 
+// credentialReleaseProblem re-reads the lease, the agent and the agent's
+// owner and reports why a credential must not be handed out, or "".
+func (s *Server) credentialReleaseProblem(ctx context.Context, agentID, leaseID string) (string, error) {
+	lease, err := s.db.GetLease(ctx, leaseID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "lease no longer exists", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if lease.Status != model.LeaseActive {
+		return "lease is " + string(lease.Status) + "; credentials are only available for active leases", nil
+	}
+	if lease.ExpiresAt == nil || !lease.ExpiresAt.After(s.nowUTC()) {
+		return "lease credential has expired", nil
+	}
+	ag, err := s.db.GetAgent(ctx, agentID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "agent no longer exists", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if ag.Status != model.AgentActive {
+		return "agent is " + string(ag.Status), nil
+	}
+	return s.agentOwnerProblem(ctx, ag)
+}
+
 // revalidateLeases re-runs the full activation check (recheckLeaseAuthorization)
 // against every pending and active lease matching filter, and revokes each one
 // that no longer passes. Every authority-reducing change calls it after its own
@@ -1049,6 +1104,15 @@ func isRetiredCapability(id string) bool {
 // as active and revoked; one still pending is revoked and its activation then
 // fails; one whose recheck runs after the change's commit fails the recheck.
 func (s *Server) revalidateLeases(ctx context.Context, filter store.LeaseFilter, reason string) ([]string, error) {
+	return s.revalidateLeasesAs(ctx, filter, reason, nil)
+}
+
+// revalidateLeasesAs is revalidateLeases with audit attribution. With a nil
+// cause the revocations are recorded as the operator's (the legacy admin
+// API). Otherwise they are recorded as the control plane's, and cause (for
+// example caused_by, owner_id) is added to each event, so the audit log
+// names who triggered the revocation (§17.6).
+func (s *Server) revalidateLeasesAs(ctx context.Context, filter store.LeaseFilter, reason string, cause map[string]any) ([]string, error) {
 	// One consistent snapshot: paging over a set that shrinks as leases
 	// expire or are revoked would skip rows.
 	filter.Statuses = []model.LeaseStatus{model.LeasePending, model.LeaseActive}
@@ -1068,7 +1132,12 @@ func (s *Server) revalidateLeases(ctx context.Context, filter store.LeaseFilter,
 		// The caller's reason is recorded exactly (the contract fixes some, e.g.
 		// "role changed to guest"); the specific failed check is logged.
 		s.logf("lease %s revoked on revalidation: %s", lease.ID, problem)
-		if _, err := s.revokeLease(ctx, lease, reason, nil); err != nil {
+		if cause == nil {
+			_, err = s.revokeLease(ctx, lease, reason, nil)
+		} else {
+			_, err = s.revokeLeaseWithCause(ctx, lease, reason, cause)
+		}
+		if err != nil {
 			var he *httpError
 			if errors.As(err, &he) && he.status == http.StatusConflict {
 				continue
@@ -1078,6 +1147,27 @@ func (s *Server) revalidateLeases(ctx context.Context, filter store.LeaseFilter,
 		revoked = append(revoked, lease.ID)
 	}
 	return revoked, nil
+}
+
+// revokeLeaseWithCause revokes a lease on behalf of the control plane and
+// records what triggered it.
+func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, reason string, cause map[string]any) (model.Lease, error) {
+	updated, previousStatus, err := s.markLeaseRevoked(ctx, lease, reason)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	metadata := map[string]any{
+		"actor":           "system",
+		"reason":          reason,
+		"previous_status": string(previousStatus),
+		"agent_id":        lease.AgentID,
+		"agent_name":      lease.AgentName,
+	}
+	for k, v := range cause {
+		metadata[k] = v
+	}
+	s.systemAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
+	return updated, nil
 }
 
 // revokePendingLeasesForCapability revokes every pending lease of a capability
@@ -1239,6 +1329,9 @@ func (s *Server) sweepOnce(ctx context.Context) {
 	now := s.nowUTC()
 	if err := s.db.DeleteStaleSessions(ctx, now, sessionIdleTimeout); err != nil {
 		s.logf("sweeper: delete stale sessions: %v", err)
+	}
+	if err := s.db.DeleteOldSignIns(ctx, now.Add(-signInRetention)); err != nil {
+		s.logf("sweeper: delete old sign-ins: %v", err)
 	}
 	settings, err := s.db.GetPolicySettings(ctx)
 	if err != nil {

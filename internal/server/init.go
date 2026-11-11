@@ -527,7 +527,12 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 
 	now := time.Now().UTC()
 	var out model.PersonWithSetupCode
+	revokedLeases := []string{}
+	previousStatus := "(new)"
 	person, err := db.GetPersonByUsername(ctx, username)
+	if err == nil {
+		previousStatus = string(person.Status)
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		if out, err = newPersonWithSetupCode(ctx, db, username, "", true, now); err != nil {
@@ -547,6 +552,11 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 		if err := db.ResetPersonSetup(ctx, person.ID, hash, expires, now, false); err != nil {
 			return zero, err
 		}
+		// The person is pending now: their agents' leases end with that
+		// (§17.6). Recovery runs outside the server, so revoke in the store.
+		if revokedLeases, err = db.RevokeOwnerLeases(ctx, person.ID, "agent's owner was reset by local recovery", now); err != nil {
+			return zero, err
+		}
 		if person, err = db.GetPerson(ctx, person.ID); err != nil {
 			return zero, err
 		}
@@ -556,7 +566,8 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 		ActorType: "system", ActorID: "system", ActorName: model.ProductName,
 		Action: "person.supervisor_recovered", Status: "ok", Severity: "critical",
 		TargetType: "person", TargetID: out.Person.ID,
-		Metadata: map[string]any{"username": username},
+		// A suspended person is reactivated by recovery; record what they were.
+		Metadata: map[string]any{"username": username, "previous_status": previousStatus, "revoked_lease_ids": revokedLeases},
 	}
 	if err := db.AppendAudit(ctx, &ev); err != nil {
 		return zero, err

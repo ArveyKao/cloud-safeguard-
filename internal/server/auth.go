@@ -216,7 +216,7 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		if !isSafeMethod(r.Method) {
 			if !s.sameOrigin(r) || !authn.Equal(r.Header.Get(csrfHeader), sc.session.CSRFToken) {
 				s.personAudit(r.Context(), sc.person, "auth.csrf_rejected", "denied", "warning", "person", sc.person.ID,
-					map[string]any{"remote_addr": remoteHost(r)})
+					map[string]any{"remote_addr": s.clientAddr(r)})
 				s.writeError(w, http.StatusForbidden, model.ErrCodeForbidden, "missing or invalid CSRF token")
 				return
 			}
@@ -373,7 +373,7 @@ func (s *Server) handleSetupBegin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.personAudit(ctx, person, "person.setup_started", "ok", "info", "person", person.ID,
-		map[string]any{"remote_addr": remoteHost(r)})
+		map[string]any{"remote_addr": s.clientAddr(r)})
 	s.writeData(w, http.StatusOK, model.SetupBeginResult{
 		Username:   person.Username,
 		TOTPSecret: secret,
@@ -435,7 +435,7 @@ func (s *Server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.personAudit(ctx, person, "person.setup_completed", "ok", "info", "person", person.ID,
-		map[string]any{"remote_addr": remoteHost(r)})
+		map[string]any{"remote_addr": s.clientAddr(r)})
 	info, err := s.startSession(w, r, person)
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) { // suspended or reset since activation
@@ -459,7 +459,7 @@ func (s *Server) pendingPersonForSetupCode(ctx context.Context, r *http.Request,
 	person, err := s.db.GetPersonBySetupCodeHash(ctx, hash)
 	if err != nil {
 		s.systemAudit(ctx, "auth.setup_failed", "denied", "warning", "person", "", map[string]any{
-			"remote_addr": remoteHost(r), "reason": "unknown setup code",
+			"remote_addr": s.clientAddr(r), "reason": "unknown setup code",
 		})
 		return model.Person{}, "", false
 	}
@@ -467,7 +467,7 @@ func (s *Server) pendingPersonForSetupCode(ctx context.Context, r *http.Request,
 	if err != nil || person.Status != model.PersonPending ||
 		auth.SetupExpiresAt == nil || !s.nowUTC().Before(*auth.SetupExpiresAt) {
 		s.systemAudit(ctx, "auth.setup_failed", "denied", "warning", "person", person.ID, map[string]any{
-			"remote_addr": remoteHost(r), "reason": "setup code expired or person not pending",
+			"remote_addr": s.clientAddr(r), "reason": "setup code expired or person not pending",
 		})
 		return model.Person{}, "", false
 	}
@@ -497,7 +497,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.systemAudit(ctx, "auth.login_failed", "denied", "warning", "person", personID, map[string]any{
-			"remote_addr": remoteHost(r), "reason": reason,
+			"remote_addr": s.clientAddr(r), "reason": reason,
 		})
 		s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, loginFailedMessage)
 	}
@@ -592,7 +592,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.personAudit(ctx, person, "auth.login", "ok", "info", "person", person.ID,
-		map[string]any{"remote_addr": remoteHost(r)})
+		map[string]any{"remote_addr": s.clientAddr(r)})
 	s.writeData(w, http.StatusOK, info)
 }
 

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -83,6 +84,21 @@ func (s *Server) buildHandler() http.Handler {
 	authMux.Handle("GET /api/v1/auth/me", s.requireSession(http.HandlerFunc(s.handleAuthMe)))
 	authMux.HandleFunc("/", s.handleUnknownAPI)
 
+	// Agent-first sign-in: the agent's two calls need no authentication; the
+	// person's side runs in their console session.
+	signInMux := http.NewServeMux()
+	signInMux.Handle("POST /api/v1/agent-signin/start", s.requireSameOrigin(http.HandlerFunc(s.handleAgentSignInStart)))
+	signInMux.Handle("POST /api/v1/agent-signin/token", s.requireSameOrigin(http.HandlerFunc(s.handleAgentSignInToken)))
+	signInMux.HandleFunc("/", s.handleUnknownAPI)
+
+	meMux := http.NewServeMux()
+	meMux.HandleFunc("GET /api/v1/me/signins/{code}", s.handleGetSignIn)
+	meMux.HandleFunc("POST /api/v1/me/signins/{code}/approve", s.handleApproveSignIn)
+	meMux.HandleFunc("POST /api/v1/me/signins/{code}/deny", s.handleDenySignIn)
+	meMux.HandleFunc("GET /api/v1/me/agents", s.handleListMyAgents)
+	meMux.HandleFunc("POST /api/v1/me/agents/{id}/revoke", s.handleRevokeMyAgent)
+	meMux.HandleFunc("/", s.handleUnknownAPI)
+
 	supervisorMux := http.NewServeMux()
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/people", s.handleListPeople)
 	supervisorMux.HandleFunc("POST /api/v1/supervisor/people", s.handleCreatePerson)
@@ -96,6 +112,8 @@ func (s *Server) buildHandler() http.Handler {
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", s.handleHealth)
 	root.Handle("/api/v1/auth/", authMux)
+	root.Handle("/api/v1/agent-signin/", signInMux)
+	root.Handle("/api/v1/me/", s.requireSession(meMux))
 	root.Handle("/api/v1/supervisor/", s.requireSession(s.requireSupervisor(supervisorMux)))
 	root.Handle("/api/v1/agent/", s.requireAgent(agentMux))
 	root.Handle("/api/v1/admin/", s.requireAdmin(adminMux))
@@ -124,7 +142,7 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 		ag, err := s.db.GetAgentByTokenHash(r.Context(), token.Hash(plain))
 		if err != nil {
 			s.systemAudit(r.Context(), "auth.agent_auth_failed", "denied", "warning", "agent", "", map[string]any{
-				"remote_addr":  remoteHost(r),
+				"remote_addr":  s.clientAddr(r),
 				"token_prefix": token.DisplayPrefix(plain),
 				"reason":       "unknown token",
 			})
@@ -133,11 +151,24 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 		}
 		if ag.Status != model.AgentActive {
 			s.systemAudit(r.Context(), "auth.agent_auth_failed", "denied", "warning", "agent", ag.ID, map[string]any{
-				"remote_addr":  remoteHost(r),
+				"remote_addr":  s.clientAddr(r),
 				"token_prefix": token.DisplayPrefix(plain),
 				"reason":       "agent is " + string(ag.Status),
 			})
 			s.writeError(w, http.StatusForbidden, model.ErrCodeForbidden, "agent is "+string(ag.Status))
+			return
+		}
+		// An owned agent acts only while its owner is active (§17.1).
+		if problem, err := s.agentOwnerProblem(r.Context(), ag); err != nil {
+			s.internalError(w, "check agent owner", err)
+			return
+		} else if problem != "" {
+			s.systemAudit(r.Context(), "auth.agent_auth_failed", "denied", "warning", "agent", ag.ID, map[string]any{
+				"remote_addr":  s.clientAddr(r),
+				"token_prefix": token.DisplayPrefix(plain),
+				"reason":       problem,
+			})
+			s.writeError(w, http.StatusForbidden, model.ErrCodeForbidden, problem)
 			return
 		}
 		// Refresh last_seen_at at most once per 60 s.
@@ -173,7 +204,7 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 		}
 		if !token.HashEqual(token.Hash(plain), stored) {
 			s.systemAudit(r.Context(), "auth.admin_auth_failed", "denied", "warning", "admin", "admin", map[string]any{
-				"remote_addr": remoteHost(r),
+				"remote_addr": s.clientAddr(r),
 			})
 			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "invalid admin token")
 			return
@@ -222,8 +253,21 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		s.logf("%s %s %d %dms", r.Method, r.URL.Path, status, time.Since(start).Milliseconds())
+		s.logf("%s %s %d %dms", r.Method, logPath(r.URL.Path), status, time.Since(start).Milliseconds())
 	})
+}
+
+// logPath is the request path as written to the access log. A sign-in user
+// code is an approval secret while the sign-in is pending, so it is masked.
+func logPath(path string) string {
+	const prefix = "/api/v1/me/signins/"
+	if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
+		if _, tail, found := strings.Cut(rest, "/"); found {
+			return prefix + "***/" + tail
+		}
+		return prefix + "***"
+	}
+	return path
 }
 
 // recoverPanics turns a handler panic into a JSON 500 without leaking details.
@@ -255,6 +299,8 @@ type listData[T any] struct {
 // writeData writes a success envelope.
 func (s *Server) writeData(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// API responses are per-identity and may carry one-time secrets.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(dataEnvelope{Data: payload}); err != nil {
 		s.logf("write response: %v", err)
@@ -277,6 +323,7 @@ func (s *Server) writeError(w http.ResponseWriter, status int, code, message str
 // writeErrorDetails writes the standard error envelope with details.
 func (s *Server) writeErrorDetails(w http.ResponseWriter, status int, code, message string, details map[string]any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	body := model.ErrorBody{Error: model.ErrorDetail{Code: code, Message: message, Details: details}}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
@@ -353,7 +400,66 @@ func bearerToken(r *http.Request) (string, bool) {
 	return value, true
 }
 
-// remoteHost returns the client IP (without port) for audit metadata.
+// parseTrustedProxies parses Config.TrustedProxies (addresses or CIDRs).
+func parseTrustedProxies(raw []string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(raw))
+	for _, item := range raw {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(item); err == nil {
+			out = append(out, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(item)
+		if err != nil {
+			return nil, fmt.Errorf("server: trusted proxy %q is not an IP address or CIDR range", item)
+		}
+		addr = addr.Unmap()
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return out, nil
+}
+
+func (s *Server) isTrustedProxy(host string) bool {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range s.trustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientAddr returns the client's IP address for rate limits, the sign-in
+// approval screen and audit metadata. It is the direct peer, unless that
+// peer is a configured trusted proxy: then it is the right-most
+// X-Forwarded-For entry that is not itself a trusted proxy. A forwarded
+// header from any other peer is ignored, so a client cannot spoof it.
+func (s *Server) clientAddr(r *http.Request) string {
+	peer := remoteHost(r)
+	if len(s.trustedProxies) == 0 || !s.isTrustedProxy(peer) {
+		return peer
+	}
+	entries := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(entries) - 1; i >= 0; i-- {
+		addr, err := netip.ParseAddr(strings.TrimSpace(entries[i]))
+		if err != nil {
+			break // malformed: trust nothing further left
+		}
+		if !s.isTrustedProxy(addr.String()) {
+			return addr.Unmap().String()
+		}
+	}
+	return peer
+}
+
+// remoteHost returns the direct peer's IP (without port).
 func remoteHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

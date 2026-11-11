@@ -53,6 +53,13 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   login with CSRF, supervisor API for people and bindings, first supervisor in `csg init`,
   `csg supervisor recover`. Adds `golang.org/x/crypto`. Not yet cross-family reviewed, and
   bindings are not yet enforced on agent requests. Status table: CONTRACT §17.8.
+- **§17 progress (2026-11-11):** review of the identity foundation done (dsh; 1 high, 1 medium,
+  6 low, all fixed in 372d21f). Qoder QA run on 372d21f (sections A and B of
+  `docs/QA_BRIEF.md`): 2 real bugs fixed (empty `Statement` accepted at capability create;
+  negative approve TTL accepted), 4 points clarified in CONTRACT. Agent ownership and
+  agent-first sign-in built by Lead (schema v4, `internal/server/agentsignin.go`), verified
+  locally, not yet reviewed. GitHub issues cannot be filed or read from this machine (no `gh`,
+  connector failing), so QA findings arrive in task reports.
 - **Blocked:** none. Future work (not v0.1): credential-free proxy mode, per-parameter
   grant constraints, chat approvals, multi-cloud, SSO/multi-tenant (see README roadmap).
 

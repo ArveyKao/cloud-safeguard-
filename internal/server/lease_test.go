@@ -608,6 +608,10 @@ func TestApproveValidation(t *testing.T) {
 	rec := env.admin(http.MethodPost, "/api/v1/admin/leases/"+dnsLease.ID+"/approve", model.ApproveLeaseInput{TTLSeconds: 1801})
 	requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
 
+	// A negative TTL is rejected, not silently replaced (QA finding).
+	rec = env.admin(http.MethodPost, "/api/v1/admin/leases/"+dnsLease.ID+"/approve", model.ApproveLeaseInput{TTLSeconds: -5})
+	requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
+
 	// Approval succeeds with the default TTL.
 	rec = env.admin(http.MethodPost, "/api/v1/admin/leases/"+dnsLease.ID+"/approve", model.ApproveLeaseInput{})
 	requireStatus(t, rec, http.StatusOK)

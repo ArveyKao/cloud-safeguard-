@@ -175,7 +175,7 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		if status != person.Status {
 			s.personAudit(ctx, actor.person, "person.status_changed", "ok", "warning", "person", id,
 				map[string]any{"username": person.Username, "from": string(person.Status), "to": string(status)})
-			s.afterPersonAuthorityChange(ctx, id)
+			s.afterPersonAuthorityChange(ctx, actor.person, id)
 		}
 	}
 	updated, err := s.db.GetPerson(ctx, id)
@@ -223,7 +223,7 @@ func (s *Server) handleResetPerson(w http.ResponseWriter, r *http.Request) {
 	}
 	s.personAudit(ctx, actor.person, "person.setup_reset", "ok", "warning", "person", id,
 		map[string]any{"username": person.Username})
-	s.afterPersonAuthorityChange(ctx, id)
+	s.afterPersonAuthorityChange(ctx, actor.person, id)
 	person, err = s.db.GetPerson(ctx, id)
 	if err != nil {
 		s.storeErrorResponse(w, err, "person not found")
@@ -326,12 +326,24 @@ func (s *Server) bindingTargets(w http.ResponseWriter, r *http.Request) (model.P
 	return provider, person, true
 }
 
-// afterPersonAuthorityChange runs after a person was suspended or reset.
-// Sessions are already gone (store). Agent ownership arrives with the agent
-// sign-in work; from then on this also revokes the person's agents' leases.
-func (s *Server) afterPersonAuthorityChange(ctx context.Context, personID string) {
+// afterPersonAuthorityChange runs after a person was suspended, reactivated
+// or reset. Sessions are already gone (store). While the person is not
+// active their agents cannot authenticate, and this revokes those agents'
+// pending and active leases at once (§17.6). After a reactivation the
+// re-check finds nothing to revoke.
+func (s *Server) afterPersonAuthorityChange(ctx context.Context, actor model.Person, personID string) {
 	if s.hookAfterAuthorityWrite != nil {
 		s.hookAfterAuthorityWrite("person")
+	}
+	revoked, err := s.revokeOwnedAgentLeases(ctx, personID, "agent's owner is no longer active", map[string]any{
+		"caused_by": "person:" + actor.ID, "caused_by_username": actor.Username, "owner_id": personID,
+	})
+	if err != nil {
+		s.logf("revoke leases of agents owned by %s: %v", personID, err)
+	}
+	if len(revoked) > 0 {
+		s.systemAudit(ctx, "person.agent_leases_revoked", "ok", "warning", "person", personID,
+			map[string]any{"revoked_lease_ids": revoked})
 	}
 }
 

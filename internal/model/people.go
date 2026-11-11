@@ -114,3 +114,60 @@ type SessionInfo struct {
 	CSRFToken string        `json:"csrf_token"`
 	ExpiresAt time.Time     `json:"expires_at"`
 }
+
+// ---- agent-first sign-in (CONTRACT §17.3 item 2) ----
+
+// SignInStatus is the state of an agent sign-in.
+type SignInStatus string
+
+const (
+	SignInPending  SignInStatus = "pending"
+	SignInApproved SignInStatus = "approved"
+	SignInDenied   SignInStatus = "denied"
+	// SignInConsumed: the agent collected its token. Stored only; the API
+	// reports it as expired.
+	SignInConsumed SignInStatus = "consumed"
+	// SignInExpired also covers a sign-in whose token was already collected.
+	SignInExpired SignInStatus = "expired"
+)
+
+// AgentSignInStartInput is the agent's request to begin signing in.
+type AgentSignInStartInput struct {
+	AgentName   string `json:"agent_name"`
+	Description string `json:"description,omitempty"`
+}
+
+// AgentSignInStart is returned to the agent. DeviceCode is a secret the
+// agent keeps and polls with; UserCode is what the agent shows its human.
+type AgentSignInStart struct {
+	DeviceCode      string    `json:"device_code"`
+	UserCode        string    `json:"user_code"`
+	VerificationURL string    `json:"verification_url"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	IntervalSeconds int       `json:"interval_seconds"`
+}
+
+// AgentSignIn is what a person sees before approving or denying.
+type AgentSignIn struct {
+	UserCode    string       `json:"user_code"`
+	AgentName   string       `json:"agent_name"`
+	Description string       `json:"description"`
+	Status      SignInStatus `json:"status"`
+	// RemoteAddr is where the sign-in was started from.
+	RemoteAddr string    `json:"remote_addr"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+// AgentSignInTokenInput is the agent's poll for the outcome.
+type AgentSignInTokenInput struct {
+	DeviceCode string `json:"device_code"`
+}
+
+// AgentSignInResult is the poll answer. Agent and Token are set exactly once,
+// when Status is approved; the token is never retrievable again.
+type AgentSignInResult struct {
+	Status SignInStatus `json:"status"`
+	Agent  *Agent       `json:"agent,omitempty"`
+	Token  string       `json:"token,omitempty"`
+}
