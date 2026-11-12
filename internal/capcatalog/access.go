@@ -116,11 +116,15 @@ var resourceSpecs = []resourceSpec{
 		title:       "ECS instances",
 		service:     "ecs",
 		resources:   []string{"acs:ecs:*:*:instance/{{resource_name}}"},
-		namePattern: `^i-[A-Za-z0-9]+$`,
+		namePattern: `^i-[A-Za-z0-9]{1,62}$`,
 		nameHint:    "an ECS instance ID such as i-2ze0demo001",
 		read:        []string{"ecs:Describe*"},
-		write:       []string{"ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance", "ecs:ModifyInstanceAttribute"},
-		full:        []string{"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance"},
+		// ecs:ModifyInstanceAttribute is deliberately absent: it can set the
+		// instance's login password, which with a reboot gives a shell on
+		// the instance and so the credentials of any RAM role attached to
+		// it. That would be a way around the IAM prohibition.
+		write: []string{"ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance"},
+		full:  []string{"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance"},
 	},
 	{
 		provider:    model.ProviderAliyun,

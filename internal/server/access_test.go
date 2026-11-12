@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -503,14 +504,23 @@ func TestCloudAccountIsFixedPerProvider(t *testing.T) {
 	}
 }
 
-// A person approves only access requests. A capability lease of the older
-// kind held by their agent (granted by the operator) stays with the operator.
-func TestOwnerCannotApproveOperatorLeases(t *testing.T) {
+// An agent that belongs to a person has no role or grants of its own and
+// cannot use the older capability request; a person decides access requests
+// only, never the operator's capability leases.
+func TestOwnedAgentsAndOperatorLeasesStayApart(t *testing.T) {
 	a := newAccessEnv(t, model.RoleAdministrator)
 	role, grants := model.RoleMember, []string{capcatalog.IDDNSManage}
-	requireStatus(t, a.admin(http.MethodPatch, "/api/v1/admin/agents/"+a.agent.ID,
-		model.UpdateAgentInput{Role: &role, Grants: &grants}), http.StatusOK)
-	rec := a.do(http.MethodPost, "/api/v1/agent/leases", a.token, model.CreateLeaseInput{
+	requireStatus(t, a.admin(http.MethodPatch, "/api/v1/admin/agents/"+a.agent.ID, model.UpdateAgentInput{Role: &role}), http.StatusConflict)
+	requireStatus(t, a.admin(http.MethodPatch, "/api/v1/admin/agents/"+a.agent.ID, model.UpdateAgentInput{Grants: &grants}), http.StatusConflict)
+	stored, _ := a.srv.db.GetAgent(context.Background(), a.agent.ID)
+	if stored.Role != model.RoleGuest || len(stored.Grants) != 0 {
+		t.Fatalf("owned agent got a role or grants: %+v", stored)
+	}
+	old := model.CreateLeaseInput{CapabilityID: capcatalog.IDCloudRead, Reason: "look"}
+	requireErrorCode(t, a.do(http.MethodPost, "/api/v1/agent/leases", a.token, old), http.StatusForbidden, model.ErrCodeForbidden)
+
+	// A pending capability lease of an agent without an owner.
+	rec := a.do(http.MethodPost, "/api/v1/agent/leases", a.agentTokens[demoAgentClaudeCode], model.CreateLeaseInput{
 		CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "example.com"}, Reason: "dns change",
 	})
 	requireStatus(t, rec, http.StatusCreated)
@@ -520,12 +530,193 @@ func TestOwnerCannotApproveOperatorLeases(t *testing.T) {
 	}
 	for _, action := range []string{"approve", "deny", "revoke"} {
 		requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/requests/"+lease.ID+"/"+action, nil), http.StatusNotFound)
+		requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/me/requests/"+lease.ID+"/"+action, nil), http.StatusNotFound)
 	}
 	if a.status(lease.ID) != model.LeasePending || a.minter.requestCount() != 0 {
-		t.Fatal("the owner decided an operator lease")
-	}
-	if rec := a.mei.do(http.MethodGet, "/api/v1/me/requests", nil); decodeEnvelope[listData[model.AccessRequest]](t, rec).Total != 0 {
-		t.Fatal("an operator lease is listed as an access request")
+		t.Fatal("a person decided an operator lease")
 	}
 	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", nil), http.StatusOK)
+}
+
+// A capability lease held by an owned agent (made before the rule, or put
+// there behind the API) does not follow the owner's role, so it ends at the
+// next re-check and its credential is not handed out.
+func TestLegacyLeaseOfOwnedAgentEnds(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	ctx := context.Background()
+	if _, err := a.srv.db.SQL().Exec(`UPDATE agents SET role = 'member', grants_json = '["aliyun.cloud.read"]' WHERE id = ?`, a.agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := a.clock.Now()
+	expires := now.Add(10 * time.Minute)
+	lease := model.Lease{ID: "lea_legacy", AgentID: a.agent.ID, AgentName: a.agent.Name, CapabilityID: capcatalog.IDCloudRead,
+		ProviderID: a.providerID, Status: model.LeaseActive, RequestedTTLSeconds: 600, EffectiveTTLSeconds: 600,
+		CreatedAt: now, IssuedAt: &now, ExpiresAt: &expires, CredentialAvailable: true}
+	if err := a.srv.db.CreateLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	if rec := a.credential(lease.ID); rec.Code == http.StatusOK {
+		t.Fatal("credential of a capability lease handed to an owned agent")
+	}
+	// Any role change of the owner sweeps it away.
+	a.bind(a.mei, model.RoleGuest)
+	if got := a.status(lease.ID); got != model.LeaseRevoked {
+		t.Fatalf("legacy lease after a role change = %s", got)
+	}
+}
+
+// ---- regression tests for the independent review of commit a4b5ad5 ----
+
+// A burst of parallel requests gets exactly the agent's limits.
+func TestRequestLimitsAreExactUnderBursts(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.requestRaw(a.token, accessInput("ecs", "read"))
+		}()
+	}
+	wg.Wait()
+	ctx := context.Background()
+	active, err := a.srv.db.CountActiveLeases(ctx, a.agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != a.agent.MaxConcurrentLeases || a.minter.requestCount() != a.agent.MaxConcurrentLeases {
+		t.Fatalf("%d active credentials and %d mints from one burst; the limit is %d", active, a.minter.requestCount(), a.agent.MaxConcurrentLeases)
+	}
+}
+
+// Waiting requests count towards the limit, so an agent cannot fill its
+// owner's inbox, and approval never exceeds the limit either.
+func TestPendingRequestsAreBounded(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	var ids []string
+	for i := 0; i < a.agent.MaxConcurrentLeases; i++ {
+		req := a.request(accessInput("ecs", "write"))
+		if req.Status != model.LeasePending {
+			t.Fatalf("request %d = %s", i, req.Status)
+		}
+		ids = append(ids, req.ID)
+	}
+	if over := a.request(accessInput("ecs", "write")); over.Status != model.LeaseDenied {
+		t.Fatalf("request beyond the limit = %s", over.Status)
+	}
+	rec := a.mei.do(http.MethodGet, "/api/v1/me/requests?status=pending", nil)
+	if got := decodeEnvelope[listData[model.AccessRequest]](t, rec).Total; got != a.agent.MaxConcurrentLeases {
+		t.Fatalf("%d requests waiting", got)
+	}
+	// With the limit lowered behind the API, approval re-checks it.
+	if _, err := a.srv.db.SQL().Exec(`UPDATE agents SET max_concurrent_leases = 1 WHERE id = ?`, a.agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	requireStatus(t, a.approve(a.mei, ids[0]), http.StatusOK)
+	requireStatus(t, a.approve(a.mei, ids[1]), http.StatusConflict)
+	if a.minter.requestCount() != 1 {
+		t.Fatalf("minted %d times past the limit", a.minter.requestCount())
+	}
+}
+
+func TestInputSizesAreBounded(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	before := a.leaseCount()
+	for name, value := range map[string]string{
+		"long instance id": "i-" + strings.Repeat("a", 63),
+		"huge instance id": "i-" + strings.Repeat("a", 200000),
+	} {
+		in := accessInput("ecs", "read")
+		in.ResourceName = value
+		if rec := a.requestRaw(a.token, in); rec.Code != http.StatusBadRequest || rec.Body.Len() > 1000 {
+			t.Errorf("%s: status %d, %d bytes", name, rec.Code, rec.Body.Len())
+		}
+	}
+	in := accessInput("dns", "read")
+	in.ResourceName = strings.Repeat("a.", 127) + "com" // 257 characters of valid labels
+	requireStatus(t, a.requestRaw(a.token, in), http.StatusBadRequest)
+	if a.leaseCount() != before {
+		t.Fatal("an oversized request was stored")
+	}
+
+	req := a.request(accessInput("ecs", "read"))
+	long := model.RevokeLeaseInput{Reason: strings.Repeat("x", 501)}
+	requireStatus(t, a.do(http.MethodPost, "/api/v1/agent/leases/"+req.ID+"/revoke", a.token, long), http.StatusBadRequest)
+	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+req.ID+"/revoke", long), http.StatusBadRequest)
+	if a.status(req.ID) != model.LeaseActive {
+		t.Fatal("a refused revoke changed the lease")
+	}
+	requireStatus(t, a.do(http.MethodPost, "/api/v1/agent/leases/"+req.ID+"/revoke", a.token, model.RevokeLeaseInput{Reason: "done"}), http.StatusOK)
+}
+
+// The note a person writes when approving is not shown to the agent.
+func TestApprovalNoteIsNotShownToTheAgent(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	req := a.request(accessInput("ecs", "write"))
+	rec := a.mei.do(http.MethodPost, "/api/v1/me/requests/"+req.ID+"/approve", map[string]string{"note": "internal: watch this agent"})
+	requireStatus(t, rec, http.StatusOK)
+	for _, path := range []string{"/api/v1/agent/leases/" + req.ID, "/api/v1/agent/leases", "/api/v1/agent/access-requests/" + req.ID} {
+		rec := a.do(http.MethodGet, path, a.token, nil)
+		requireStatus(t, rec, http.StatusOK)
+		if strings.Contains(rec.Body.String(), "watch this agent") {
+			t.Errorf("%s shows the approval note to the agent", path)
+		}
+	}
+	if stored, _ := a.srv.db.GetLease(context.Background(), req.ID); stored.ApprovalNote != "internal: watch this agent" {
+		t.Fatal("the note was not kept for people")
+	}
+}
+
+// A role on one cloud account gives nothing on another.
+func TestRoleOnOneAccountDoesNotReachAnother(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	rec := a.admin(http.MethodPost, "/api/v1/admin/providers", model.CreateProviderInput{
+		Name: "second", Type: model.ProviderAliyun, Mode: model.ModeMock, Region: "cn-hangzhou",
+		RoleARN: "acs:ram::6543210987654321:role/csg", AccessKeyID: "LTAI5tSecondAccount", AccessKeySecret: "placeholder-secret-value"})
+	requireStatus(t, rec, http.StatusCreated)
+	second := decodeEnvelope[model.Provider](t, rec)
+	in := accessInput("ecs", "read")
+	in.CloudAccountID = second.CloudAccountID
+	requireStatus(t, a.requestRaw(a.token, in), http.StatusForbidden)
+
+	// Bound as guest there: read works, write is denied, though the owner
+	// is an administrator of the first account.
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/accounts/"+second.ID+"/people/"+a.mei.person.ID,
+		model.PutBindingInput{Role: model.RoleGuest}), http.StatusOK)
+	if req := a.request(in); req.Status != model.LeaseActive || req.CloudAccountID != second.CloudAccountID {
+		t.Fatalf("read on the second account = %+v", req)
+	}
+	in.Permission, in.Reason = "write", "change"
+	if req := a.request(in); req.Status != model.LeaseDenied {
+		t.Fatalf("write on the second account = %s", req.Status)
+	}
+}
+
+// Revocations caused by a role change name the supervisor who made it. The
+// operator can stop an access request but never grant one.
+func TestRevocationAttributionAndOperatorLimits(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	write := a.request(accessInput("ecs", "write"))
+	requireStatus(t, a.approve(a.mei, write.ID), http.StatusOK)
+	a.bind(a.mei, model.RoleGuest)
+	found := false
+	for _, ev := range a.listAudit("lease.revoked") {
+		if ev.TargetID == write.ID {
+			found = ev.Metadata["caused_by"] == "person:"+a.sup.person.ID && ev.Metadata["cause"] == "binding_reduced"
+		}
+	}
+	if !found {
+		t.Fatalf("revocation does not name the supervisor: %+v", a.listAudit("lease.revoked"))
+	}
+
+	a.bind(a.mei, model.RoleMember)
+	pending := a.request(accessInput("ecs", "write"))
+	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/approve", nil), http.StatusConflict)
+	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/deny", model.DenyLeaseInput{Reason: "stop"}), http.StatusOK)
+	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/deny", model.DenyLeaseInput{Reason: "again"}), http.StatusConflict)
+	requireStatus(t, a.approve(a.mei, pending.ID), http.StatusConflict)
+	if a.status(pending.ID) != model.LeaseDenied || a.minter.requestCount() != 1 {
+		t.Fatal("a request the operator stopped was issued")
+	}
 }

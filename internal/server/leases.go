@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
@@ -93,6 +95,20 @@ func (s *Server) handleAgentCreateLease(w http.ResponseWriter, r *http.Request) 
 // createLease runs the policy engine and persists the lease (in every
 // outcome), minting credentials when auto-approved.
 func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.CreateLeaseInput) (model.Lease, error) {
+	// An agent that belongs to a person has no role or grants of its own
+	// (CONTRACT §17.2): everything it may do comes from its owner's role on a
+	// cloud account, through access requests. Letting it also use capability
+	// leases would leave credentials that ignore that role.
+	if ag.OwnerID != "" {
+		return model.Lease{}, &httpError{status: http.StatusForbidden, code: model.ErrCodeForbidden,
+			message: "this agent belongs to a person; request access with POST /api/v1/agent/access-requests"}
+	}
+	// IDs reserved for access templates are never served from the database.
+	if capcatalog.IsAccessTemplateID(in.CapabilityID) {
+		return model.Lease{}, errNotFoundAPI("capability not found")
+	}
+	unlockAgent := s.lockAgentRequests(ag.ID)
+	defer unlockAgent()
 	now := s.nowUTC()
 
 	capability, err := s.db.GetCapability(ctx, in.CapabilityID)
@@ -382,6 +398,9 @@ func (s *Server) handleAgentListLeases(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
+	for i := range items {
+		items[i] = agentLeaseView(items[i])
+	}
 	writeList(s, w, http.StatusOK, items, total)
 }
 
@@ -406,7 +425,28 @@ func (s *Server) handleAgentGetLease(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
 		return
 	}
-	s.writeData(w, http.StatusOK, lease)
+	s.writeData(w, http.StatusOK, agentLeaseView(lease))
+}
+
+// agentLeaseView removes what the agent must not read from a lease: the
+// note a person wrote when approving an access request is for people.
+func agentLeaseView(lease model.Lease) model.Lease {
+	if capcatalog.IsAccessTemplateID(lease.CapabilityID) {
+		lease.ApprovalNote = ""
+	}
+	return lease
+}
+
+// revokeReason validates an optional revoke reason.
+func revokeReason(raw, fallback string) (string, error) {
+	reason := strings.TrimSpace(raw)
+	if !utf8.ValidString(reason) || utf8.RuneCountInString(reason) > maxReasonLength {
+		return "", errBadRequestAPI(fmt.Sprintf("reason must be at most %d characters", maxReasonLength))
+	}
+	if reason == "" {
+		return fallback, nil
+	}
+	return sanitizeMessage(reason), nil
 }
 
 // handleAgentFetchCredential implements POST /api/v1/agent/leases/{id}/credential.
@@ -526,9 +566,10 @@ func (s *Server) handleAgentRevokeLease(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
 		return
 	}
-	reason := in.Reason
-	if reason == "" {
-		reason = "revoked by agent"
+	reason, err := revokeReason(in.Reason, "revoked by agent")
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
 	}
 	updated, err := s.revokeLease(r.Context(), lease, reason, &ag)
 	if err != nil {
@@ -695,6 +736,19 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 		return model.Lease{}, errConflictAPI(problem)
 	}
 
+	// The limit on simultaneously active credentials holds at approval too
+	// (requests are counted when they are made, but several can be pending).
+	if accessRequest {
+		active, err := s.db.CountActiveLeases(ctx, ag.ID)
+		if err != nil {
+			return model.Lease{}, err
+		}
+		if active >= ag.MaxConcurrentLeases {
+			return model.Lease{}, errConflictAPI(fmt.Sprintf(
+				"%d credentials of this agent are active; the limit is %d. Revoke one or wait for it to expire.", active, ag.MaxConcurrentLeases))
+		}
+	}
+
 	if in.TTLSeconds < 0 {
 		return model.Lease{}, errBadRequestAPI("ttl_seconds must be positive")
 	}
@@ -797,7 +851,13 @@ func (s *Server) handleAdminDenyLease(w http.ResponseWriter, r *http.Request) {
 	lease.DeniedReason = reason
 	lease.CredentialAvailable = false
 	lease.CredentialFingerprint = ""
-	if err := s.db.UpdateLease(r.Context(), lease); err != nil {
+	// Compare-and-set: a lease that was approved, revoked or expired since
+	// the read above is not overwritten.
+	if err := s.db.UpdateLeaseIfStatus(r.Context(), lease, model.LeasePending); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease is no longer pending")
+			return
+		}
 		s.writeHandlerError(w, err)
 		return
 	}
@@ -827,9 +887,10 @@ func (s *Server) handleAdminRevokeLease(w http.ResponseWriter, r *http.Request) 
 		s.writeHandlerError(w, err)
 		return
 	}
-	reason := in.Reason
-	if reason == "" {
-		reason = "revoked by operator"
+	reason, err := revokeReason(in.Reason, "revoked by operator")
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
 	}
 	updated, err := s.revokeLease(r.Context(), lease, reason, nil)
 	if err != nil {
@@ -1096,6 +1157,11 @@ func (s *Server) capabilityByID(ctx context.Context, id string) (model.Capabilit
 //     agent or the lease.
 func (s *Server) leaseAuthorityProblem(ctx context.Context, ag model.Agent, capability model.Capability, lease model.Lease) (string, error) {
 	if !capcatalog.IsAccessTemplateID(capability.ID) {
+		if ag.OwnerID != "" {
+			// Only possible for a lease made before this rule, or by an
+			// operator edit: it does not follow the owner's role, so it ends.
+			return "an agent that belongs to a person may hold access requests only", nil
+		}
 		return leaseAuthorizationProblem(ag, capability, lease), nil
 	}
 	if ag.Status != model.AgentActive {
@@ -1182,9 +1248,9 @@ func (s *Server) credentialReleaseProblem(ctx context.Context, agentID, leaseID 
 	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil || problem != "" {
 		return problem, err
 	}
-	// An access request depends on the owner's role, which can change at
-	// any time: read it again now (CONTRACT §17.2).
-	if capcatalog.IsAccessTemplateID(lease.CapabilityID) {
+	// What an owned agent may hold depends on its owner's role, which can
+	// change at any time: read it again now (CONTRACT §17.2).
+	if ag.OwnerID != "" || capcatalog.IsAccessTemplateID(lease.CapabilityID) {
 		return s.recheckLeaseAuthorization(ctx, lease)
 	}
 	return "", nil
@@ -1478,4 +1544,22 @@ func (s *Server) expireLease(ctx context.Context, lease model.Lease, reason stri
 		"previous_status": string(lease.Status),
 		"reason":          reason,
 	})
+}
+
+// lockAgentRequests serializes the requests of one agent, so the rate and
+// concurrency limits are checked against a count that cannot change before
+// the request is stored. Single process per data dir (ADR-002).
+func (s *Server) lockAgentRequests(agentID string) func() {
+	s.agentLocksMu.Lock()
+	if s.agentLocks == nil {
+		s.agentLocks = map[string]*sync.Mutex{}
+	}
+	lock, ok := s.agentLocks[agentID]
+	if !ok {
+		lock = &sync.Mutex{}
+		s.agentLocks[agentID] = lock
+	}
+	s.agentLocksMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
 }

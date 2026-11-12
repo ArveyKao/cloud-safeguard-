@@ -283,7 +283,7 @@ func (s *Server) handlePutBinding(w http.ResponseWriter, r *http.Request) {
 		"self": person.ID == actor.person.ID,
 	})
 	if previous != "" && model.Role(previous).Rank() > in.Role.Rank() {
-		s.afterBindingReduced(ctx, person.ID, provider.ID)
+		s.afterBindingReduced(ctx, actor.person, person.ID, provider.ID)
 	}
 	stored, err := s.db.GetBinding(ctx, person.ID, provider.ID)
 	if err != nil {
@@ -307,7 +307,7 @@ func (s *Server) handleDeleteBinding(w http.ResponseWriter, r *http.Request) {
 	s.personAudit(ctx, actor.person, "binding.removed", "ok", "warning", "provider", provider.ID, map[string]any{
 		"person_id": person.ID, "username": person.Username,
 	})
-	s.afterBindingReduced(ctx, person.ID, provider.ID)
+	s.afterBindingReduced(ctx, actor.person, person.ID, provider.ID)
 	s.writeData(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -351,18 +351,20 @@ func (s *Server) afterPersonAuthorityChange(ctx context.Context, actor model.Per
 // re-checks every pending and active lease of the person's agents and
 // revokes those the new role no longer permits (§17.6). Leases on other
 // cloud accounts pass the re-check and are left alone.
-func (s *Server) afterBindingReduced(ctx context.Context, personID, providerID string) {
+func (s *Server) afterBindingReduced(ctx context.Context, actor model.Person, personID, providerID string) {
 	if s.hookAfterAuthorityWrite != nil {
 		s.hookAfterAuthorityWrite("binding")
 	}
 	revoked, err := s.revokeOwnedAgentLeases(ctx, personID, "owner's role on the cloud account was lowered or removed", map[string]any{
 		"cause": "binding_reduced", "owner_id": personID, "provider_id": providerID,
+		"caused_by": "person:" + actor.ID, "caused_by_username": actor.Username,
 	})
 	if err != nil {
 		s.logf("revoke leases after binding change for %s on %s: %v", personID, providerID, err)
 	}
 	if len(revoked) > 0 {
 		s.systemAudit(ctx, "binding.agent_leases_revoked", "ok", "warning", "provider", providerID,
-			map[string]any{"person_id": personID, "revoked_lease_ids": revoked})
+			map[string]any{"person_id": personID, "revoked_lease_ids": revoked,
+				"caused_by": "person:" + actor.ID, "caused_by_username": actor.Username})
 	}
 }

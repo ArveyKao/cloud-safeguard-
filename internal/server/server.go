@@ -135,6 +135,10 @@ type Server struct {
 	personLocksMu sync.Mutex
 	personLocks   map[string]chan struct{}
 
+	// agentLocks serialize the requests of one agent (lockAgentRequests).
+	agentLocksMu sync.Mutex
+	agentLocks   map[string]*sync.Mutex
+
 	// Test-only hooks that pause the lease pipeline at exact points, so
 	// tests can reproduce races deterministically. Always nil in production.
 	hookBeforeAutoLock    func(leaseID string)

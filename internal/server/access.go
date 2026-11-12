@@ -34,6 +34,10 @@ const (
 
 const maxReasonLength = 500
 
+// maxResourceNameLength bounds resource_name before pattern validation (253
+// is the longest DNS name).
+const maxResourceNameLength = 253
+
 // minProviderTTL is the shortest credential a provider mode can mint.
 func minProviderTTL(mode model.ProviderMode) int {
 	if mode == model.ModeSTS {
@@ -135,6 +139,9 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	} else if name == capcatalog.AllResources {
 		return model.Lease{}, errBadRequestAPI("leave resource_name out to ask for all resources")
 	}
+	if len(name) > maxResourceNameLength {
+		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("resource_name must be at most %d characters", maxResourceNameLength))
+	}
 	params := map[string]string{capcatalog.ResourceNameParam: name}
 	if err := capcatalog.ValidateParams(capability, params); err != nil {
 		return model.Lease{}, errBadRequestAPI("resource_name must be " + capcatalog.ResourceNameHint(prov.Type, resource))
@@ -159,11 +166,19 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("ttl_seconds %d exceeds the allowed maximum %d", in.TTLSeconds, maxTTL))
 	}
 
+	// From the counts below until the request is stored, no other request of
+	// this agent may run: otherwise a burst would pass the limits together.
+	unlockAgent := s.lockAgentRequests(ag.ID)
+	defer unlockAgent()
 	now := s.nowUTC()
-	activeCount, err := s.db.CountActiveLeases(ctx, ag.ID)
+	// Waiting requests count too: an agent cannot queue an unbounded number
+	// of approvals for its owner.
+	open, err := s.db.ListAllLeases(ctx, store.LeaseFilter{AgentID: ag.ID,
+		Statuses: []model.LeaseStatus{model.LeasePending, model.LeaseActive}})
 	if err != nil {
 		return model.Lease{}, err
 	}
+	activeCount := len(open)
 	lastMinute, err := s.db.CountLeasesSince(ctx, ag.ID, now.Add(-time.Minute))
 	if err != nil {
 		return model.Lease{}, err
@@ -192,7 +207,7 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	}
 	if activeCount >= ag.MaxConcurrentLeases {
 		add(policy.RuleConcurrency, policy.OutcomeDeny,
-			fmt.Sprintf("%d credentials are active; the limit is %d", activeCount, ag.MaxConcurrentLeases))
+			fmt.Sprintf("%d credentials or requests of this agent are active or waiting; the limit is %d", activeCount, ag.MaxConcurrentLeases))
 	}
 	if lastMinute >= settings.LeasesPerMinutePerAgent {
 		add(policy.RuleRateLimit, policy.OutcomeDeny,
@@ -319,7 +334,9 @@ func (s *Server) ownedAccessLeases(ctx context.Context, personID string, statuse
 	}
 	var out []model.Lease
 	for _, ag := range agents {
-		leases, err := s.db.ListAllLeases(ctx, store.LeaseFilter{AgentID: ag.ID, Statuses: statuses})
+		// Newest 200 per agent: the history of an agent can be long, the
+		// inbox must stay cheap.
+		leases, _, err := s.db.ListLeases(ctx, store.LeaseFilter{AgentID: ag.ID, Statuses: statuses, Limit: 200})
 		if err != nil {
 			return nil, err
 		}

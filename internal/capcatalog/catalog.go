@@ -260,7 +260,7 @@ func RenderPolicy(cap model.Capability, params map[string]string) ([]byte, error
 	// code, and only while it stays within its permission level (§17.4).
 	if IsAccessTemplateID(cap.ID) {
 		template, ok := AccessTemplateByID(cap.ID)
-		if !ok || template.Capability.PolicyTemplate != cap.PolicyTemplate || template.Capability.Access != cap.Access {
+		if !ok || !sameAccessTemplate(template.Capability, cap) {
 			return nil, fmt.Errorf("capability %s uses an ID reserved for access templates", cap.ID)
 		}
 		if err := CheckAccessTemplateLevel(template, withDeny); err != nil {
@@ -376,4 +376,21 @@ func jsonEscape(s string) string {
 		b = b[1 : len(b)-1]
 	}
 	return string(b)
+}
+
+// sameAccessTemplate reports whether cap is exactly the code-defined access
+// template: the same policy, level, provider type and parameter rules. A
+// stored row that borrows the ID with a looser parameter pattern is refused.
+func sameAccessTemplate(want, cap model.Capability) bool {
+	if want.PolicyTemplate != cap.PolicyTemplate || want.Access != cap.Access ||
+		want.ProviderType != cap.ProviderType || len(want.Params) != len(cap.Params) {
+		return false
+	}
+	for i := range want.Params {
+		if want.Params[i].Name != cap.Params[i].Name || want.Params[i].Pattern != cap.Params[i].Pattern ||
+			want.Params[i].Required != cap.Params[i].Required {
+			return false
+		}
+	}
+	return true
 }

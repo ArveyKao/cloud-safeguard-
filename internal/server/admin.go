@@ -996,6 +996,11 @@ func (s *Server) handleAdminUpdateAgent(w http.ResponseWriter, r *http.Request) 
 		s.writeHandlerError(w, err)
 		return
 	}
+	if ag.OwnerID != "" && (in.Role != nil || in.Grants != nil) {
+		s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
+			"this agent belongs to a person: it has no role or grants of its own and inherits its owner's role on each cloud account")
+		return
+	}
 	changed := make([]string, 0, 6)
 	if in.Name != nil {
 		name := strings.TrimSpace(*in.Name)

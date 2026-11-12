@@ -179,3 +179,70 @@ func TestAccessTemplateIDsAreReserved(t *testing.T) {
 		}
 	}
 }
+
+// The exact actions of every template, written out independently of the
+// classification code. Changing a template means changing this list, which
+// is the point: a reviewer sees the action that was added.
+func TestAccessTemplateActionsAreExactlyAsReviewed(t *testing.T) {
+	want := map[string][]string{
+		"aliyun.access.ecs.read":  {"ecs:Describe*"},
+		"aliyun.access.ecs.write": {"ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance"},
+		"aliyun.access.ecs.full": {"ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance",
+			"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance"},
+		"aliyun.access.dns.read": {"alidns:Describe*"},
+		"aliyun.access.dns.write": {"alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
+			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus"},
+		"aliyun.access.dns.full": {"alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
+			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus", "alidns:AddDomain", "alidns:DeleteDomain"},
+		"aliyun.access.oss.read":  {"oss:Get*", "oss:List*"},
+		"aliyun.access.oss.write": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
+		"aliyun.access.oss.full": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload",
+			"oss:PutBucket", "oss:DeleteBucket"},
+	}
+	if len(want) != len(accessTemplates) {
+		t.Fatalf("%d templates reviewed, %d defined", len(want), len(accessTemplates))
+	}
+	for id, actions := range want {
+		tpl, ok := AccessTemplateByID(id)
+		if !ok {
+			t.Errorf("no template %s", id)
+			continue
+		}
+		raw, err := RenderPolicy(tpl.Capability, map[string]string{ResourceNameParam: AllResources})
+		if err != nil {
+			t.Errorf("%s: %v", id, err)
+			continue
+		}
+		if got := strings.Join(templateActions(t, raw), " "); got != strings.Join(actions, " ") {
+			t.Errorf("%s allows\n  %s\nreviewed\n  %s", id, got, strings.Join(actions, " "))
+		}
+	}
+	// Never in any template: it can set an instance's login password.
+	for id, tpl := range accessTemplates {
+		if strings.Contains(tpl.Capability.PolicyTemplate, "ModifyInstanceAttribute") {
+			t.Errorf("%s allows ecs:ModifyInstanceAttribute", id)
+		}
+	}
+}
+
+// A stored row that borrows a reserved ID and the exact template text, but
+// loosens the parameter rule, does not render.
+func TestReservedIDWithLooserParamsIsRefused(t *testing.T) {
+	tpl, _ := LookupAccessTemplate(model.ProviderAliyun, "ecs", PermissionRead)
+	loose := tpl.Capability
+	loose.Params = []model.CapabilityParam{{Name: ResourceNameParam, Required: true, Pattern: ".*"}}
+	if _, err := RenderPolicy(loose, map[string]string{ResourceNameParam: "*/*"}); err == nil {
+		t.Error("a reserved ID with a looser parameter pattern rendered")
+	}
+	noParams := tpl.Capability
+	noParams.Params = nil
+	if _, err := RenderPolicy(noParams, nil); err == nil {
+		t.Error("a reserved ID without parameters rendered")
+	}
+	for name, ok := range map[string]bool{"i-" + strings.Repeat("a", 62): true, "i-" + strings.Repeat("a", 63): false} {
+		err := ValidateParams(tpl.Capability, map[string]string{ResourceNameParam: name})
+		if (err == nil) != ok {
+			t.Errorf("instance id of %d characters: %v", len(name), err)
+		}
+	}
+}

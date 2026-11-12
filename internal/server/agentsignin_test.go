@@ -89,11 +89,9 @@ func TestAgentSignInFlow(t *testing.T) {
 	}
 
 	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", res.Token, nil), http.StatusOK)
-	// An owned agent has no grants: the §16 request path gives it nothing.
+	// An owned agent cannot use the older capability request at all.
 	recLease := env.do(http.MethodPost, "/api/v1/agent/leases", res.Token, model.CreateLeaseInput{CapabilityID: "aliyun.cloud.read", Reason: "look"})
-	if lease := decodeEnvelope[model.Lease](t, recLease); lease.Status != model.LeaseDenied {
-		t.Fatalf("owned agent got a lease through the old path: %+v", lease)
-	}
+	requireErrorCode(t, recLease, http.StatusForbidden, model.ErrCodeForbidden)
 
 	// Neither secret reached the audit log or the server log.
 	events, _, err := env.srv.db.ListAudit(context.Background(), auditAll())
@@ -203,13 +201,10 @@ func TestAgentActsOnlyWhileOwnerIsActive(t *testing.T) {
 	personPath := "/api/v1/supervisor/people/" + mei.person.ID
 	suspended, active := model.PersonSuspended, model.PersonActive
 
-	// Give the agent a lease through the legacy admin path, so there is
-	// something to revoke.
-	role := model.RoleGuest
-	grants := []string{"aliyun.cloud.read"}
-	requireStatus(t, env.admin(http.MethodPatch, "/api/v1/admin/agents/"+ag.ID, model.UpdateAgentInput{Role: &role, Grants: &grants}), http.StatusOK)
-	rec := env.do(http.MethodPost, "/api/v1/agent/leases", tok, model.CreateLeaseInput{CapabilityID: "aliyun.cloud.read", Reason: "look"})
-	lease := decodeEnvelope[model.Lease](t, rec)
+	// Give the agent a credential, so there is something to revoke.
+	_ = ag
+	env.bindDirect(mei.person.ID, model.RoleMember)
+	lease := env.accessLease(tok, "ecs", "read")
 	if lease.Status != model.LeaseActive {
 		t.Fatalf("setup lease not active: %+v", lease)
 	}
@@ -236,25 +231,18 @@ func TestAgentActsOnlyWhileOwnerIsActive(t *testing.T) {
 		t.Fatalf("token issued for a suspended owner: %+v", got.Status)
 	}
 
-	// A pending lease of an owned agent cannot be approved while the owner
-	// is suspended.
+	// A request waiting for the owner ends when the owner is suspended.
 	requireStatus(t, sup.do(http.MethodPatch, personPath, model.UpdatePersonInput{Status: &active}), http.StatusOK)
-	member := model.RoleMember
-	writeGrants := []string{"aliyun.dns.manage"}
-	requireStatus(t, env.admin(http.MethodPatch, "/api/v1/admin/agents/"+ag.ID, model.UpdateAgentInput{Role: &member, Grants: &writeGrants}), http.StatusOK)
-	rec = env.do(http.MethodPost, "/api/v1/agent/leases", tok, model.CreateLeaseInput{
-		CapabilityID: "aliyun.dns.manage", Params: map[string]string{"domain": "arveykao.com"}, Reason: "dns change"})
-	pending := decodeEnvelope[model.Lease](t, rec)
+	pending := env.accessLease(tok, "dns", "write")
 	if pending.Status != model.LeasePending {
-		t.Fatalf("write lease not pending: %+v", pending)
+		t.Fatalf("write request not pending: %+v", pending)
 	}
-	if _, err := env.srv.db.SQL().Exec(`UPDATE persons SET status = 'suspended' WHERE id = ?`, mei.person.ID); err != nil {
-		t.Fatal(err) // bypass the sweep to test the approval-time check alone
+	requireStatus(t, sup.do(http.MethodPatch, personPath, model.UpdatePersonInput{Status: &suspended}), http.StatusOK)
+	if got := env.getLease(pending.ID); got.Status != model.LeaseRevoked {
+		t.Fatalf("pending request after the owner was suspended: %s", got.Status)
 	}
-	requireErrorCode(t, env.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/approve", model.ApproveLeaseInput{}),
-		http.StatusConflict, model.ErrCodeConflict)
 	if env.minter.requestCount() != 1 {
-		t.Fatalf("minted %d times, want 1 (the first read lease only)", env.minter.requestCount())
+		t.Fatalf("minted %d times, want 1 (the first read credential only)", env.minter.requestCount())
 	}
 }
 
@@ -297,11 +285,8 @@ func TestSignInAgainReplacesTheAgent(t *testing.T) {
 	old, oldToken := env.signInAgent(mei, "laptop")
 	other, otherToken := env.signInAgent(sup, "laptop")
 
-	role := model.RoleGuest
-	grants := []string{"aliyun.cloud.read"}
-	requireStatus(t, env.admin(http.MethodPatch, "/api/v1/admin/agents/"+old.ID, model.UpdateAgentInput{Role: &role, Grants: &grants}), http.StatusOK)
-	lease := decodeEnvelope[model.Lease](t, env.do(http.MethodPost, "/api/v1/agent/leases", oldToken,
-		model.CreateLeaseInput{CapabilityID: "aliyun.cloud.read", Reason: "look"}))
+	env.bindDirect(mei.person.ID, model.RoleGuest)
+	lease := env.accessLease(oldToken, "ecs", "read")
 	if lease.Status != model.LeaseActive {
 		t.Fatalf("setup lease: %+v", lease)
 	}

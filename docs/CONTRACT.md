@@ -753,8 +753,11 @@ merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR
 | `administrator` | `full` | Also create new resources and delete existing ones. |
 
 - An agent **inherits** its owner's role on each account. The role is read from the binding at
-  every request, approval and credential fetch; it is never copied onto the agent. The agent
-  role and per-agent grants of §16 are removed.
+  every request, approval and credential fetch; it is never copied onto the agent. An agent
+  that belongs to a person has no role or grants of its own: the operator cannot set them, the
+  §16 capability request (`POST /agent/leases`) refuses it with 403, and a §16 lease found on
+  such an agent is revoked at the next re-check. Agents without an owner keep the §16 model
+  until it is removed.
 - The IAM prohibition (§16.3) applies at every role and to supervisors.
 
 ### 17.3 Authentication
@@ -834,9 +837,15 @@ merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR
   created or edited through any API. Their IDs have the reserved form
   `<cloud>.access.<resource>.<permission>` (for example `aliyun.access.ecs.write`); a stored
   capability may not use such an ID. Resource types today: `ecs`, `dns`, `oss`.
-- `resource_name` names one resource (an instance ID, a domain, a bucket) and is validated
-  against the resource type's pattern. Left out, the request covers all resources of that type
-  in the account. Wildcards inside a name are refused.
+- `resource_name` names one resource (an instance ID, a domain, a bucket), is at most 253
+  characters and is validated against the resource type's pattern. Left out, the request
+  covers all resources of that type in the account. Wildcards inside a name are refused.
+- ECS `write` is start, stop and reboot. `ecs:ModifyInstanceAttribute` is in no template: it
+  can set an instance's login password, which gives a shell on the instance and with it the
+  credentials of any RAM role attached to that instance, a way around the IAM prohibition.
+- Limits are exact under parallel requests: an agent's requests are checked one at a time.
+  Requests waiting for approval count towards the agent's limit on active credentials, and
+  the limit is checked again at approval.
 - `cloud_account_id` is taken from the provider's role ARN when the provider is created, is
   unique, and never changes: a provider's role ARN may only be replaced by one in the same
   cloud account, so role bindings can never move to another account.
@@ -875,6 +884,9 @@ agent or the request.
   token; to anyone else the request does not exist (404). The owner cannot change the
   validity period at approval.
 - The owner can also deny a pending request and revoke an issued one early.
+- The operator token (until it is removed) can see, deny and revoke access requests as a
+  safety control, with every such action audited. It can never approve one. The note an
+  owner writes at approval is not shown to the agent.
 - The approval shows the agent, cloud account, resource type, resource name, permission, validity
   period and reason exactly as they will be issued.
 - Approval rechecks everything in §17.4 and §16.5 at decision time. A pending request expires
@@ -885,7 +897,8 @@ agent or the request.
 - **Expiry timer.** Every issued credential has a deadline = issue time + `ttl_seconds`. The
   clock starts when the credential is issued (for `write` and `full`, at approval), not when
   the request is made. The cloud token is minted with exactly that lifetime, so the cloud
-  rejects it after the deadline even if Cloud Safeguard is down. At the deadline the server
+  rejects it after the deadline even if Cloud Safeguard is down (the cloud's own deadline is
+  later than the server's by the time minting took, normally under a second). At the deadline the server
   marks the lease `expired`, erases its stored credential and writes an audit event (§10
   sweep). A credential cannot be extended; the agent sends a new request.
 - Suspending a person suspends their agents and revokes their pending and active leases.

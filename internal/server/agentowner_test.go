@@ -16,16 +16,42 @@ import (
 
 // Regression tests for the independent review of agent ownership and sign-in.
 
-// ownedAgentWithLease signs an agent in for owner and gives it an active
-// read lease through the legacy admin path.
+// bindDirect gives a person a role on the demo cloud account, writing the
+// binding straight to the store.
+func (e *testEnv) bindDirect(personID string, role model.Role) {
+	e.t.Helper()
+	now := e.clock.Now()
+	err := e.srv.db.PutBinding(context.Background(), model.RoleBinding{
+		PersonID: personID, ProviderID: e.providerID, Role: role, CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// accessLease posts an access request for the agent and returns the stored
+// lease behind it.
+func (e *testEnv) accessLease(tok, resource, permission string) model.Lease {
+	e.t.Helper()
+	in := model.AccessRequestInput{CloudAccountID: "1234567890123456", Resource: resource, Permission: permission, TTLSeconds: 600}
+	if permission != "read" {
+		in.Reason = "change for a test"
+	}
+	rec := e.do(http.MethodPost, "/api/v1/agent/access-requests", tok, in)
+	requireStatus(e.t, rec, http.StatusCreated)
+	lease, err := e.srv.db.GetLease(context.Background(), decodeEnvelope[model.AccessRequest](e.t, rec).ID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return lease
+}
+
+// ownedAgentWithLease signs an agent in for owner, makes the owner a member
+// of the demo cloud account and gives the agent an active read credential.
 func (e *testEnv) ownedAgentWithLease(owner *personClient, name string) (model.Agent, string, model.Lease) {
 	e.t.Helper()
 	ag, tok := e.signInAgent(owner, name)
-	role := model.RoleMember
-	grants := []string{"aliyun.cloud.read", "aliyun.dns.manage"}
-	requireStatus(e.t, e.admin(http.MethodPatch, "/api/v1/admin/agents/"+ag.ID, model.UpdateAgentInput{Role: &role, Grants: &grants}), http.StatusOK)
-	lease := decodeEnvelope[model.Lease](e.t, e.do(http.MethodPost, "/api/v1/agent/leases", tok,
-		model.CreateLeaseInput{CapabilityID: "aliyun.cloud.read", Reason: "look"}))
+	e.bindDirect(owner.person.ID, model.RoleMember)
+	lease := e.accessLease(tok, "ecs", "read")
 	if lease.Status != model.LeaseActive {
 		e.t.Fatalf("setup lease not active: %+v", lease)
 	}
@@ -116,8 +142,7 @@ func TestOwnerSuspensionRevokesAndIsAttributed(t *testing.T) {
 	sup := env.supervisorClient()
 	mei := env.addPerson(sup, "mei", false)
 	ag, tok, active := env.ownedAgentWithLease(mei, "mei-agent")
-	pending := decodeEnvelope[model.Lease](t, env.do(http.MethodPost, "/api/v1/agent/leases", tok, model.CreateLeaseInput{
-		CapabilityID: "aliyun.dns.manage", Params: map[string]string{"domain": "arveykao.com"}, Reason: "dns change"}))
+	pending := env.accessLease(tok, "dns", "write")
 	if pending.Status != model.LeasePending {
 		t.Fatalf("write lease not pending: %+v", pending)
 	}
@@ -164,8 +189,10 @@ func TestOwnerSuspendedDuringActivation(t *testing.T) {
 		sup := env.supervisorClient()
 		mei := env.addPerson(sup, "mei", false)
 		_, tok, _ := env.ownedAgentWithLease(mei, "mei-agent")
-		pending := decodeEnvelope[model.Lease](t, env.do(http.MethodPost, "/api/v1/agent/leases", tok, model.CreateLeaseInput{
-			CapabilityID: "aliyun.dns.manage", Params: map[string]string{"domain": "arveykao.com"}, Reason: "dns change"}))
+		pending := env.accessLease(tok, "dns", "write")
+		if pending.Status != model.LeasePending {
+			t.Fatalf("write request not pending: %+v", pending)
+		}
 		return env, sup, mei, pending
 	}
 
@@ -178,7 +205,7 @@ func TestOwnerSuspendedDuringActivation(t *testing.T) {
 			}
 		}
 		env.minter.mu.Unlock()
-		rec := env.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/approve", model.ApproveLeaseInput{})
+		rec := mei.do(http.MethodPost, "/api/v1/me/requests/"+pending.ID+"/approve", nil)
 		requireStatus(t, rec, http.StatusConflict)
 		if got := env.getLease(pending.ID); got.Status == model.LeaseActive || got.CredentialAvailable {
 			t.Fatalf("lease activated for a suspended owner: %+v", got)
@@ -201,7 +228,7 @@ func TestOwnerSuspendedDuringActivation(t *testing.T) {
 		}
 		approveDone := make(chan int, 1)
 		go func() {
-			approveDone <- env.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/approve", model.ApproveLeaseInput{}).Code
+			approveDone <- mei.do(http.MethodPost, "/api/v1/me/requests/"+pending.ID+"/approve", nil).Code
 		}()
 		<-rechecked
 		suspendDone := make(chan int, 1)
