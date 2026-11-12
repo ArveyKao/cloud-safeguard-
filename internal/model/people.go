@@ -302,3 +302,15 @@ type SetApprovalModeInput struct {
 type SetAutoLevelInput struct {
 	MaxAutoLevel ApprovalMode `json:"max_auto_level"`
 }
+
+// AsOf returns p as it applies at time now: an expired or unknown mode is
+// shown as read, without its stale expiry. Every API response uses it, so
+// what people see is what decides their agents' requests.
+func (p Person) AsOf(now time.Time) Person {
+	effective := p.EffectiveApprovalMode(now)
+	if effective != p.ApprovalMode {
+		p.ApprovalMode = effective
+		p.ApprovalModeExpiresAt = nil
+	}
+	return p
+}

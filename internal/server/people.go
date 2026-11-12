@@ -43,7 +43,7 @@ func newPersonWithSetupCode(ctx context.Context, db *store.DB, username, display
 	}
 	person := model.Person{
 		ID: id, Username: username, DisplayName: displayName, Status: model.PersonPending,
-		Supervisor: supervisor, CreatedAt: now, UpdatedAt: now,
+		Supervisor: supervisor, ApprovalMode: model.ModeRead, CreatedAt: now, UpdatedAt: now,
 	}
 	expires := now.Add(setupCodeTTL)
 	if err := db.CreatePerson(ctx, person, hash, expires); err != nil {
@@ -57,6 +57,10 @@ func (s *Server) handleListPeople(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.internalError(w, "list people", err)
 		return
+	}
+	now := s.nowUTC()
+	for i := range people {
+		people[i] = people[i].AsOf(now)
 	}
 	writeList(s, w, http.StatusOK, people, len(people))
 }
@@ -183,7 +187,7 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		s.storeErrorResponse(w, err, "person not found")
 		return
 	}
-	s.writeData(w, http.StatusOK, updated)
+	s.writeData(w, http.StatusOK, updated.AsOf(now))
 }
 
 // handleResetPerson issues a new setup code, erasing the person's password,
@@ -221,8 +225,10 @@ func (s *Server) handleResetPerson(w http.ResponseWriter, r *http.Request) {
 		s.storeErrorResponse(w, err, "person not found")
 		return
 	}
-	s.personAudit(ctx, actor.person, "person.setup_reset", "ok", "warning", "person", id,
-		map[string]any{"username": person.Username})
+	s.personAudit(ctx, actor.person, "person.setup_reset", "ok", "warning", "person", id, map[string]any{
+		"username":      person.Username,
+		"previous_mode": string(person.EffectiveApprovalMode(now)), "mode": string(model.ModeRead),
+	})
 	s.afterPersonAuthorityChange(ctx, actor.person, id)
 	person, err = s.db.GetPerson(ctx, id)
 	if err != nil {

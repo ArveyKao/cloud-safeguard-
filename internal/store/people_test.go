@@ -392,10 +392,86 @@ func TestNewProviderStartsAtReadLevel(t *testing.T) {
 	if err != nil || got.MaxAutoLevel != model.ModeRead {
 		t.Fatalf("level = %q, %v", got.MaxAutoLevel, err)
 	}
+	// Whatever the caller passes, a new account starts at read.
+	p.ID, p.MaxAutoLevel = "p2", model.ModeFull
+	if err := db.CreateProvider(ctx, p, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := db.GetProvider(ctx, "p2"); got.MaxAutoLevel != model.ModeRead {
+		t.Fatalf("created at level %q", got.MaxAutoLevel)
+	}
 	if err := db.SetProviderMaxAutoLevel(ctx, "p1", "everything", peopleNow); err == nil {
 		t.Fatal("an unknown level was stored")
 	}
 	if err := db.SetProviderMaxAutoLevel(ctx, "missing", model.ModeFull, peopleNow); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown provider: %v", err)
+	}
+}
+
+func TestSetApprovalModeGuards(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	newPerson(t, db, "root", true)
+	activate(t, db, "root")
+	newPerson(t, db, "mei", false)
+	if err := db.SetApprovalMode(ctx, "mei", model.ModeFull, nil, peopleNow); !errors.Is(err, ErrConflict) {
+		t.Fatalf("pending person: %v", err)
+	}
+	activate(t, db, "mei")
+	if err := db.SetApprovalMode(ctx, "mei", "everything", nil, peopleNow); err == nil {
+		t.Fatal("unknown mode stored")
+	}
+	until := peopleNow.Add(time.Hour)
+	if err := db.SetApprovalMode(ctx, "mei", model.ModeFull, &until, peopleNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPersonAuthority(ctx, "mei", model.PersonSuspended, false, peopleNow); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetApprovalMode(ctx, "mei", model.ModeWrite, nil, peopleNow); !errors.Is(err, ErrConflict) {
+		t.Fatalf("suspended person: %v", err)
+	}
+	if err := db.ResetPersonSetup(ctx, "mei", "again", peopleNow.Add(time.Hour), peopleNow, false); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := db.GetPerson(ctx, "mei"); p.ApprovalMode != model.ModeRead || p.ApprovalModeExpiresAt != nil {
+		t.Fatalf("after reset: %s, %v", p.ApprovalMode, p.ApprovalModeExpiresAt)
+	}
+}
+
+// The schema-6 migration gives every existing person and account read.
+func TestApprovalModeMigrationDefaults(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE persons DROP COLUMN approval_mode`,
+		`ALTER TABLE persons DROP COLUMN approval_mode_expires_at`,
+		`ALTER TABLE providers DROP COLUMN max_auto_level`,
+		`INSERT INTO persons(id, username, status, created_at, updated_at) VALUES ('mei', 'mei', 'active', 1, 1)`,
+		`INSERT INTO providers(id, name, type, mode, region, role_arn, status, created_at, updated_at, cloud_account_id)
+			VALUES ('p1', 'x', 'aliyun', 'mock', 'r', '', 'active', 1, 1, '')`,
+		`UPDATE meta SET value = '5' WHERE key = 'schema_version'`,
+	} {
+		if _, err := db.SQL().Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	db.Close()
+	db, err = Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	p, err := db.GetPerson(ctx, "mei")
+	if err != nil || p.ApprovalMode != model.ModeRead || p.ApprovalModeExpiresAt != nil {
+		t.Fatalf("person after migration = %+v, %v", p, err)
+	}
+	prov, err := db.GetProvider(ctx, "p1")
+	if err != nil || prov.MaxAutoLevel != model.ModeRead {
+		t.Fatalf("provider after migration = %q, %v", prov.MaxAutoLevel, err)
 	}
 }

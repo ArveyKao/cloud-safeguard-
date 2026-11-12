@@ -895,8 +895,19 @@ agent or the request.
   - What is automatic for a request = the lower of the person's mode and the account's
     highest automatic level. The role check comes first and is unaffected: a mode never
     lets an agent get more than its owner's role allows.
-  - The mode is read when the request is made. Changing it later does not approve requests
-    already waiting and does not revoke credentials already issued.
+  - The mode is one per person and applies to **every** agent that person owns; a temporary
+    raise is visible to all of them at once.
+  - Mode and level are read once, when the request is made: the decision is a snapshot.
+    Raising either later does not approve requests already waiting; lowering either does not
+    revoke credentials already issued or stop one being issued at that moment. Lowering a mode
+    or level is therefore **not an emergency stop**: use revoke, suspension or removing the
+    role binding for that.
+  - Agents are told how far they are issued automatically (`automatic_up_to` in
+    `GET /agent/accounts`, already capped by the role) but never the owner's mode or the
+    account's level themselves. API responses show a person's mode as it applies now: an
+    expired mode is shown as `read`.
+  - A new cloud account always starts at level `read`. Resetting a person or recovering a
+    supervisor puts their mode back to `read`, and the audit event records the previous mode.
   - Changes of a mode or of an account's level are audited; an automatic issue records the
     mode and level that allowed it.
 - A request that waits is approved by the **agent's owner**, signed in to the console. Nobody

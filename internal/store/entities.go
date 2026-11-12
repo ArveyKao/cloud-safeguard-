@@ -46,12 +46,10 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 
 // CreateProvider persists a provider and its encrypted broker credential.
 func (db *DB) CreateProvider(ctx context.Context, p model.Provider, encryptedCredential string) error {
-	// A new cloud account starts at the safest level; only a supervisor
-	// raises it (CONTRACT §17.5).
+	// A new cloud account always starts at the safest level, whatever the
+	// caller passes; only a supervisor raises it, through the audited
+	// SetProviderMaxAutoLevel (CONTRACT §17.5).
 	level := model.ModeRead
-	if p.MaxAutoLevel.Valid() {
-		level = p.MaxAutoLevel
-	}
 	_, err := db.sql.ExecContext(ctx,
 		`INSERT INTO providers(`+providerColumns+`, encrypted_credential)
 		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

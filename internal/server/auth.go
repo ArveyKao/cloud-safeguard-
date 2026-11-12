@@ -325,7 +325,7 @@ func (s *Server) sessionInfo(ctx context.Context, person model.Person, sess stor
 	if err != nil {
 		return model.SessionInfo{}, err
 	}
-	return model.SessionInfo{Person: person, Bindings: bindings, CSRFToken: sess.CSRFToken, ExpiresAt: sess.ExpiresAt}, nil
+	return model.SessionInfo{Person: person.AsOf(s.nowUTC()), Bindings: bindings, CSRFToken: sess.CSRFToken, ExpiresAt: sess.ExpiresAt}, nil
 }
 
 // ================= handlers =================

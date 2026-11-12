@@ -225,14 +225,12 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 		mode, level, automatic := automaticLevel(owner, prov, now)
 		auditExtra = map[string]any{"approval_mode": string(mode), "max_auto_level": string(level)}
 		if permission.Rank() <= automatic.Rank() {
-			add(ruleAutomatic, policy.OutcomeAllow, fmt.Sprintf(
-				"%s access is issued without approval (owner's mode %s, account's highest automatic level %s)",
-				permission, mode, level))
+			// The detail is shown to the agent, so it names neither the owner's
+			// mode nor the account's level; both are in the audit event.
+			add(ruleAutomatic, policy.OutcomeAllow, fmt.Sprintf("%s access is issued without approval", permission))
 		} else {
 			decision.Outcome = model.OutcomeRequireApproval
-			add(ruleOwnerApproval, policy.OutcomeRequireApproval, fmt.Sprintf(
-				"%s access waits for the owner's approval (owner's mode %s, account's highest automatic level %s)",
-				permission, mode, level))
+			add(ruleOwnerApproval, policy.OutcomeRequireApproval, fmt.Sprintf("%s access waits for the owner's approval", permission))
 		}
 	}
 
@@ -578,7 +576,7 @@ func (s *Server) handleSetMyApprovalMode(w http.ResponseWriter, r *http.Request)
 		s.writeHandlerError(w, err)
 		return
 	}
-	s.writeData(w, http.StatusOK, updated)
+	s.writeData(w, http.StatusOK, updated.AsOf(now))
 }
 
 // handleSetAccountAutoLevel implements

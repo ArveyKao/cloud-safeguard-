@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -284,5 +285,118 @@ func TestUnknownStoredLevelCountsAsRead(t *testing.T) {
 	}
 	if req := a.request(accessInput("ecs", "write")); req.Status != model.LeasePending {
 		t.Fatalf("write under an unknown level = %s", req.Status)
+	}
+}
+
+// ---- regression tests for the independent review of commit f2062a1 ----
+
+// The agent learns how far it is issued automatically, never the owner's
+// mode or the account's level themselves.
+func TestAgentNeverSeesModeOrLevel(t *testing.T) {
+	a := newAccessEnv(t, model.RoleGuest)
+	requireCode(t, a.setLevel(model.ModeFull), http.StatusOK)
+	requireCode(t, a.setMode(a.mei, model.ModeFull, 0), http.StatusOK)
+	rec := a.requestRaw(a.token, accessInput("ecs", "read"))
+	requireStatus(t, rec, http.StatusCreated)
+	id := decodeEnvelope[model.AccessRequest](t, rec).ID
+	bodies := map[string]string{"create": rec.Body.String()}
+	for _, path := range []string{"/api/v1/agent/access-requests/" + id, "/api/v1/agent/leases/" + id, "/api/v1/agent/leases", "/api/v1/agent/accounts"} {
+		r := a.do(http.MethodGet, path, a.token, nil)
+		requireStatus(t, r, http.StatusOK)
+		bodies[path] = r.Body.String()
+	}
+	for where, body := range bodies {
+		for _, leak := range []string{"owner's mode", "automatic level", "approval_mode", "max_auto_level", `"full"`} {
+			if strings.Contains(body, leak) {
+				t.Errorf("%s shows %s to the agent", where, leak)
+			}
+		}
+	}
+	// The values are kept for people, in the audit event.
+	for _, ev := range a.listAudit("lease.requested") {
+		if ev.TargetID == id && (ev.Metadata["approval_mode"] != "full" || ev.Metadata["max_auto_level"] != "full") {
+			t.Fatalf("audit lost the mode and level: %+v", ev.Metadata)
+		}
+	}
+}
+
+// automatic_up_to is capped by the account's level, not only by role or mode.
+func TestAutomaticUpToFollowsTheLevel(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	requireCode(t, a.setMode(a.mei, model.ModeFull, 0), http.StatusOK)
+	requireCode(t, a.setLevel(model.ModeWrite), http.StatusOK)
+	rec := a.do(http.MethodGet, "/api/v1/agent/accounts", a.token, nil)
+	if acct := decodeEnvelope[listData[model.AgentAccount]](t, rec).Items[0]; acct.AutomaticUpTo != "write" || acct.HighestPermission != "full" {
+		t.Fatalf("account view = %+v", acct)
+	}
+}
+
+// Both new routes refuse requests without the CSRF token or from another
+// origin.
+func TestModeAndLevelRoutesNeedCSRFAndSameOrigin(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	for _, c := range []struct {
+		p    *personClient
+		path string
+		body any
+	}{
+		{a.mei, "/api/v1/me/approval-mode", model.SetApprovalModeInput{Mode: model.ModeFull}},
+		{a.sup, "/api/v1/supervisor/accounts/" + a.providerID + "/auto-level", model.SetAutoLevelInput{MaxAutoLevel: model.ModeFull}},
+	} {
+		requireStatus(t, a.testEnv.request(http.MethodPut, c.path, c.p.cookie, nil, c.body), http.StatusForbidden)
+		requireStatus(t, a.testEnv.request(http.MethodPut, c.path, c.p.cookie,
+			map[string]string{csrfHeader: c.p.csrf, "Origin": "https://evil.example"}, c.body), http.StatusForbidden)
+	}
+	p, _ := a.srv.db.GetPerson(context.Background(), a.mei.person.ID)
+	prov, _ := a.srv.db.GetProvider(context.Background(), a.providerID)
+	if p.ApprovalMode != model.ModeRead || prov.MaxAutoLevel != model.ModeRead {
+		t.Fatalf("a refused request changed something: mode %s, level %s", p.ApprovalMode, prov.MaxAutoLevel)
+	}
+}
+
+// What people are shown is the mode that applies now.
+func TestShownModeIsTheModeInEffect(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/people", model.CreatePersonInput{Username: "jun"})
+	requireStatus(t, rec, http.StatusCreated)
+	if created := decodeEnvelope[model.PersonWithSetupCode](t, rec); created.Person.ApprovalMode != model.ModeRead {
+		t.Fatalf("new person's mode = %q", created.Person.ApprovalMode)
+	}
+
+	requireCode(t, a.setMode(a.mei, model.ModeFull, 60), http.StatusOK)
+	a.clock.Advance(61 * time.Second)
+	rec = a.mei.do(http.MethodGet, "/api/v1/auth/me", nil)
+	if p := decodeEnvelope[model.SessionInfo](t, rec).Person; p.ApprovalMode != model.ModeRead || p.ApprovalModeExpiresAt != nil {
+		t.Fatalf("/auth/me after expiry = %s, %v", p.ApprovalMode, p.ApprovalModeExpiresAt)
+	}
+	rec = a.sup.do(http.MethodGet, "/api/v1/supervisor/people", nil)
+	for _, p := range decodeEnvelope[listData[model.Person]](t, rec).Items {
+		if p.ID == a.mei.person.ID && (p.ApprovalMode != model.ModeRead || p.ApprovalModeExpiresAt != nil) {
+			t.Fatalf("people list after expiry = %s, %v", p.ApprovalMode, p.ApprovalModeExpiresAt)
+		}
+	}
+}
+
+// Resetting a person or recovering a supervisor lowers the mode, and the
+// audit event says from what.
+func TestResetAndRecoveryRecordTheModeTheyClear(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	requireCode(t, a.setMode(a.mei, model.ModeFull, 0), http.StatusOK)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/people/"+a.mei.person.ID+"/reset", nil), http.StatusOK)
+	ev := a.listAudit("person.setup_reset")
+	if len(ev) != 1 || ev[0].Metadata["previous_mode"] != "full" || ev[0].Metadata["mode"] != "read" {
+		t.Fatalf("reset audit = %+v", ev)
+	}
+
+	requireCode(t, a.setMode(a.sup, model.ModeWrite, 0), http.StatusOK)
+	if _, err := RecoverSupervisor(context.Background(), RecoverOptions{DataDir: a.dir, Username: a.sup.person.Username}); err != nil {
+		t.Fatal(err)
+	}
+	ev = a.listAudit("person.supervisor_recovered")
+	if len(ev) != 1 || ev[0].Metadata["previous_mode"] != "write" || ev[0].Metadata["mode"] != "read" {
+		t.Fatalf("recovery audit = %+v", ev)
+	}
+	if p, _ := a.srv.db.GetPerson(context.Background(), a.sup.person.ID); p.ApprovalMode != model.ModeRead {
+		t.Fatalf("mode after recovery = %s", p.ApprovalMode)
 	}
 }

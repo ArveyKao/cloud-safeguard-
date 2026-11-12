@@ -530,10 +530,11 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 	now := time.Now().UTC()
 	var out model.PersonWithSetupCode
 	revokedLeases := []string{}
-	previousStatus := "(new)"
+	previousStatus, previousMode := "(new)", model.ModeRead
 	person, err := db.GetPersonByUsername(ctx, username)
 	if err == nil {
 		previousStatus = string(person.Status)
+		previousMode = person.EffectiveApprovalMode(now)
 	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -569,7 +570,8 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 		Action: "person.supervisor_recovered", Status: "ok", Severity: "critical",
 		TargetType: "person", TargetID: out.Person.ID,
 		// A suspended person is reactivated by recovery; record what they were.
-		Metadata: map[string]any{"username": username, "previous_status": previousStatus, "revoked_lease_ids": revokedLeases},
+		Metadata: map[string]any{"username": username, "previous_status": previousStatus, "revoked_lease_ids": revokedLeases,
+			"previous_mode": string(previousMode), "mode": string(model.ModeRead)},
 	}
 	if err := db.AppendAudit(ctx, &ev); err != nil {
 		return zero, err
