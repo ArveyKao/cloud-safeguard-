@@ -28,7 +28,7 @@ func createCanaryProvider(t *testing.T, env *testEnv) model.Provider {
 		Type:            model.ProviderAliyun,
 		Mode:            model.ModeSTS,
 		Region:          "cn-hangzhou",
-		RoleARN:         "acs:ram::1234567890123456:role/canary",
+		RoleARN:         "acs:ram::6543210987654321:role/canary",
 		AccessKeyID:     canaryBrokerAKID,
 		AccessKeySecret: canaryBrokerSecret,
 	})
@@ -54,7 +54,7 @@ func TestProviderSecretsNeverReturnedByAPI(t *testing.T) {
 	responses := map[string]string{
 		"create provider": env.admin(http.MethodPost, "/api/v1/admin/providers", model.CreateProviderInput{
 			Name: "canary-2", Type: model.ProviderAliyun, Mode: model.ModeSTS, Region: "cn-hangzhou",
-			RoleARN: "acs:ram::1234567890123456:role/canary", AccessKeyID: canaryBrokerAKID, AccessKeySecret: canaryBrokerSecret,
+			RoleARN: "acs:ram::7777777777777777:role/canary", AccessKeyID: canaryBrokerAKID, AccessKeySecret: canaryBrokerSecret,
 		}).Body.String(),
 		"list providers": env.admin(http.MethodGet, "/api/v1/admin/providers", nil).Body.String(),
 		"get provider":   env.admin(http.MethodGet, "/api/v1/admin/providers/"+provider.ID, nil).Body.String(),

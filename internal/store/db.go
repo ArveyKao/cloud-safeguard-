@@ -30,7 +30,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 5
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -222,6 +222,51 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_signins_status ON agent_signins(status, expires_at)`,
 		},
 	},
+	{ // version 4 -> 5: cloud account IDs on providers (CONTRACT §17.2)
+		statements: []string{
+			`ALTER TABLE providers ADD COLUMN cloud_account_id TEXT NOT NULL DEFAULT ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_cloud_account
+				ON providers(cloud_account_id) WHERE cloud_account_id <> ''`,
+		},
+		transform: migrateCloudAccountIDs,
+	},
+}
+
+// migrateCloudAccountIDs fills providers.cloud_account_id from each role
+// ARN. When several providers point at the same cloud account, only the
+// oldest gets the ID; the others keep "" and cannot serve access requests
+// until a supervisor removes the duplicate.
+func migrateCloudAccountIDs(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, type, role_arn FROM providers ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return err
+	}
+	type row struct{ id, typ, arn string }
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.typ, &r.arn); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	taken := map[string]bool{}
+	for _, r := range all {
+		account := model.CloudAccountIDFromRoleARN(model.ProviderType(r.typ), r.arn)
+		if account == "" || taken[account] {
+			continue
+		}
+		taken[account] = true
+		if _, err := tx.ExecContext(ctx, `UPDATE providers SET cloud_account_id = ? WHERE id = ?`, account, r.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyMigrations brings the database schema up to CurrentSchemaVersion. It is

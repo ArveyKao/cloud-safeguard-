@@ -67,7 +67,7 @@ func TestProviderAdminCRUD(t *testing.T) {
 		Type:            model.ProviderAliyun,
 		Mode:            model.ModeSTS,
 		Region:          "cn-hangzhou",
-		RoleARN:         "acs:ram::1234567890123456:role/csg",
+		RoleARN:         "acs:ram::6543210987654321:role/csg",
 		AccessKeyID:     "LTAIbrokerAKID0001",
 		AccessKeySecret: "broker-secret-0001",
 	})

@@ -827,9 +827,21 @@ merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR
 | `resource_name` | no | Narrows the policy to one resource (domain, instance ID, bucket). |
 | `reason` | yes for `write` and `full` | Shown to the owner on the approval. |
 
-- Each `(resource, permission)` pair maps to one vetted capability template (§7, §16); agents
-  cannot submit IAM actions. The account-wide `aliyun.account.admin` capability is retired:
-  `full` is always scoped to one resource type.
+- Each `(resource, permission)` pair maps to one vetted template; agents cannot submit IAM
+  actions. `full` is always scoped to one resource type; the account-wide
+  `aliyun.account.admin` capability is not reachable through access requests.
+- Templates are defined in code (`internal/capcatalog/access.go`), not stored, and cannot be
+  created or edited through any API. Their IDs have the reserved form
+  `<cloud>.access.<resource>.<permission>` (for example `aliyun.access.ecs.write`); a stored
+  capability may not use such an ID. Resource types today: `ecs`, `dns`, `oss`.
+- `resource_name` names one resource (an instance ID, a domain, a bucket) and is validated
+  against the resource type's pattern. Left out, the request covers all resources of that type
+  in the account. Wildcards inside a name are refused.
+- `cloud_account_id` is taken from the provider's role ARN when the provider is created, is
+  unique, and never changes: a provider's role ARN may only be replaced by one in the same
+  cloud account, so role bindings can never move to another account.
+- An unknown cloud account and one the owner has no role on get the same 403. Malformed
+  requests are 400 and leave no record.
 - `ttl_seconds` must be within the capability and global maximums and at least the provider
   minimum (real STS 900 s); otherwise 400 naming the limit.
 
@@ -849,13 +861,20 @@ its declared level is rejected at startup and at capability edit.
 Verification order (deny on the first failure, recorded as decision reasons): token valid →
 agent and owner active → owner bound to the cloud account → `permission` within the owner's role
 there → IAM prohibition → existing §6 rules (TTL, concurrency, rate). A request above the
-owner's role is denied at once; it never reaches approval.
+owner's role is recorded as denied at once; it never reaches approval.
+
+The owner's role is read from the binding again at approval, after the credential is minted
+(before the lease becomes active), and at every credential fetch. It is never copied onto the
+agent or the request.
 
 ### 17.5 Approval
 
 - `read` requests that pass verification are approved automatically.
 - `write` and `full` requests always wait for approval. The approver is the **agent's owner**,
-  signed in to the console. Nobody else can approve, including supervisors.
+  signed in to the console. Nobody else can approve, including supervisors and the operator
+  token; to anyone else the request does not exist (404). The owner cannot change the
+  validity period at approval.
+- The owner can also deny a pending request and revoke an issued one early.
 - The approval shows the agent, cloud account, resource type, resource name, permission, validity
   period and reason exactly as they will be issued.
 - Approval rechecks everything in §17.4 and §16.5 at decision time. A pending request expires
@@ -891,8 +910,8 @@ agent API; it holds the agent token and no cloud credentials beyond the lease it
 | Role bindings and the supervisor API (§17.2) | implemented; not yet enforced on requests |
 | `csg init` first supervisor, `csg supervisor recover` | implemented |
 | Agent ownership and agent-first sign-in (§17.3 item 2) | implemented (API), schema version 4; CLI and console not yet |
-| Five-field request, permission levels, owner approval (§17.4, §17.5) | not started |
-| Lifecycle revocation for owned agents (§17.6) | owner suspended or reset: implemented; binding lowered: not started |
+| Five-field request, permission levels, owner approval (§17.4, §17.5) | implemented (API), schema version 5; CLI and console not yet |
+| Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) | not started |
 | Console redesign | not started |
 
@@ -908,3 +927,8 @@ unchanged alongside the new endpoints:
 - `POST /api/v1/agent-signin/start`, `POST /api/v1/agent-signin/token` (agent, no token yet)
 - `GET /api/v1/me/signins/{user_code}`, `POST /api/v1/me/signins/{user_code}/approve|deny`,
   `GET /api/v1/me/agents`, `POST /api/v1/me/agents/{id}/revoke` (person session)
+- `GET /api/v1/agent/accounts`, `POST /api/v1/agent/access-requests`,
+  `GET /api/v1/agent/access-requests/{id}` (agent token). The request ID is also the lease ID
+  for `POST /api/v1/agent/leases/{id}/credential` and `.../revoke`.
+- `GET /api/v1/me/requests[?status=pending]`,
+  `POST /api/v1/me/requests/{id}/approve|deny|revoke` (person session)

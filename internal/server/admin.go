@@ -235,12 +235,18 @@ func (s *Server) handleAdminCreateProvider(w http.ResponseWriter, r *http.Reques
 		Mode:              in.Mode,
 		Region:            in.Region,
 		RoleARN:           in.RoleARN,
+		CloudAccountID:    model.CloudAccountIDFromRoleARN(in.Type, in.RoleARN),
 		AccessKeyIDMasked: maskAccessKeyID(in.AccessKeyID),
 		Status:            model.ProviderActive,
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
 	if err := s.db.CreateProvider(r.Context(), prov, encrypted); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
+				"cloud account "+prov.CloudAccountID+" is already connected")
+			return
+		}
 		s.writeHandlerError(w, err)
 		return
 	}
@@ -307,6 +313,13 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	if in.RoleARN != nil && prov.RoleARN != *in.RoleARN {
+		// People's roles are bound to this provider. Pointing it at a role in
+		// another cloud account would silently move those roles there.
+		if model.CloudAccountIDFromRoleARN(prov.Type, *in.RoleARN) != prov.CloudAccountID {
+			s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
+				"role_arn must stay in the same cloud account; connect the other account as a new provider")
+			return
+		}
 		prov.RoleARN = *in.RoleARN
 		changed = append(changed, "role_arn")
 	}
@@ -492,6 +505,10 @@ func (s *Server) handleAdminCreateCapability(w http.ResponseWriter, r *http.Requ
 	in.Name = strings.TrimSpace(in.Name)
 	if in.Name == "" {
 		s.badRequest(w, "name is required")
+		return
+	}
+	if capcatalog.IsAccessTemplateID(in.ID) {
+		s.badRequest(w, "capability IDs of the form <cloud>.access.<resource>.<permission> are reserved")
 		return
 	}
 	if in.ProviderType == "" {

@@ -256,6 +256,17 @@ func RenderPolicy(cap model.Capability, params map[string]string) ([]byte, error
 	if err := CheckPolicy(cap.Access, withDeny); err != nil {
 		return nil, err
 	}
+	// IDs reserved for access templates render only the template defined in
+	// code, and only while it stays within its permission level (§17.4).
+	if IsAccessTemplateID(cap.ID) {
+		template, ok := AccessTemplateByID(cap.ID)
+		if !ok || template.Capability.PolicyTemplate != cap.PolicyTemplate || template.Capability.Access != cap.Access {
+			return nil, fmt.Errorf("capability %s uses an ID reserved for access templates", cap.ID)
+		}
+		if err := CheckAccessTemplateLevel(template, withDeny); err != nil {
+			return nil, err
+		}
+	}
 	return withDeny, nil
 }
 

@@ -325,3 +325,53 @@ func TestPendingSupervisorFlagOnlyWhilePending(t *testing.T) {
 		t.Fatalf("active supervisors = %d", n)
 	}
 }
+
+// The schema-5 migration gives each cloud account to its oldest provider.
+func TestCloudAccountIDMigration(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX idx_providers_cloud_account`,
+		`ALTER TABLE providers DROP COLUMN cloud_account_id`,
+		`INSERT INTO providers(id, name, type, mode, region, role_arn, status, created_at, updated_at) VALUES
+			('p1', 'first',  'aliyun', 'sts',  'r', 'acs:ram::1111111111111111:role/a', 'active', 1, 1),
+			('p2', 'second', 'aliyun', 'sts',  'r', 'acs:ram::1111111111111111:role/b', 'active', 2, 2),
+			('p3', 'third',  'aliyun', 'sts',  'r', 'acs:ram::2222222222222222:role/c', 'active', 3, 3),
+			('p4', 'no-arn', 'aliyun', 'mock', 'r', '',                                 'active', 4, 4)`,
+		`UPDATE meta SET value = '4' WHERE key = 'schema_version'`,
+	} {
+		if _, err := db.SQL().Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	db.Close()
+
+	db, err = Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	want := map[string]string{"p1": "1111111111111111", "p2": "", "p3": "2222222222222222", "p4": ""}
+	for id, account := range want {
+		p, err := db.GetProvider(ctx, id)
+		if err != nil || p.CloudAccountID != account {
+			t.Errorf("%s: account %q, %v; want %q", id, p.CloudAccountID, err, account)
+		}
+	}
+	if p, err := db.GetProviderByCloudAccountID(ctx, "1111111111111111"); err != nil || p.ID != "p1" {
+		t.Fatalf("lookup = %+v, %v", p, err)
+	}
+	if _, err := db.GetProviderByCloudAccountID(ctx, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("empty account resolved: %v", err)
+	}
+	// The account stays unique afterwards.
+	dup := model.Provider{ID: "p5", Name: "dup", Type: model.ProviderAliyun, Mode: model.ModeSTS, Status: model.ProviderActive,
+		CloudAccountID: "2222222222222222", CreatedAt: peopleNow, UpdatedAt: peopleNow}
+	if err := db.CreateProvider(ctx, dup, ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate cloud account: %v", err)
+	}
+}

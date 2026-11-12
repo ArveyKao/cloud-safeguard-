@@ -18,7 +18,7 @@ type rowScanner interface {
 // ================= Providers =================
 
 const providerColumns = `id, name, type, mode, region, role_arn, access_key_id_masked,
-	status, last_tested_at, last_test_ok, created_at, updated_at`
+	status, last_tested_at, last_test_ok, created_at, updated_at, cloud_account_id`
 
 // scanProvider scans one provider row (credential blob excluded).
 func scanProvider(row rowScanner) (model.Provider, error) {
@@ -32,7 +32,7 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 	err := row.Scan(
 		&p.ID, &p.Name, &p.Type, &p.Mode, &p.Region, &p.RoleARN,
 		&p.AccessKeyIDMasked, &p.Status, &lastTestedAt, &lastTestOK,
-		&createdAt, &updatedAt,
+		&createdAt, &updatedAt, &p.CloudAccountID,
 	)
 	if err != nil {
 		return model.Provider{}, mapErr(err)
@@ -48,14 +48,23 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 func (db *DB) CreateProvider(ctx context.Context, p model.Provider, encryptedCredential string) error {
 	_, err := db.sql.ExecContext(ctx,
 		`INSERT INTO providers(`+providerColumns+`, encrypted_credential)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Name, string(p.Type), string(p.Mode), p.Region, p.RoleARN,
 		p.AccessKeyIDMasked, string(p.Status),
 		millisPtr(p.LastTestedAt), boolPtrInt(p.LastTestOK),
-		toMillis(p.CreatedAt), toMillis(p.UpdatedAt),
+		toMillis(p.CreatedAt), toMillis(p.UpdatedAt), p.CloudAccountID,
 		encryptedCredential,
 	)
 	return mapErr(err)
+}
+
+// GetProviderByCloudAccountID returns the provider for a cloud account ID.
+func (db *DB) GetProviderByCloudAccountID(ctx context.Context, cloudAccountID string) (model.Provider, error) {
+	if cloudAccountID == "" {
+		return model.Provider{}, ErrNotFound
+	}
+	row := db.sql.QueryRowContext(ctx, `SELECT `+providerColumns+` FROM providers WHERE cloud_account_id = ?`, cloudAccountID)
+	return scanProvider(row)
 }
 
 // GetProvider returns a provider by ID without its credential blob.

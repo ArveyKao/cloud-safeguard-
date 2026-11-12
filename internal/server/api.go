@@ -43,6 +43,11 @@ func (s *Server) buildHandler() http.Handler {
 	agentMux.HandleFunc("POST /api/v1/agent/leases/{id}/credential", s.handleAgentFetchCredential)
 	agentMux.HandleFunc("POST /api/v1/agent/leases/{id}/revoke", s.handleAgentRevokeLease)
 	agentMux.HandleFunc("POST /api/v1/agent/heartbeat", s.handleAgentHeartbeat)
+	// Access requests (CONTRACT §17.4). The request ID is also the lease ID
+	// for the credential and revoke endpoints above.
+	agentMux.HandleFunc("GET /api/v1/agent/accounts", s.handleAgentListAccounts)
+	agentMux.HandleFunc("POST /api/v1/agent/access-requests", s.handleAgentCreateAccessRequest)
+	agentMux.HandleFunc("GET /api/v1/agent/access-requests/{id}", s.handleAgentGetAccessRequest)
 	agentMux.HandleFunc("/", s.handleUnknownAPI)
 
 	adminMux := http.NewServeMux()
@@ -97,6 +102,10 @@ func (s *Server) buildHandler() http.Handler {
 	meMux.HandleFunc("POST /api/v1/me/signins/{code}/deny", s.handleDenySignIn)
 	meMux.HandleFunc("GET /api/v1/me/agents", s.handleListMyAgents)
 	meMux.HandleFunc("POST /api/v1/me/agents/{id}/revoke", s.handleRevokeMyAgent)
+	meMux.HandleFunc("GET /api/v1/me/requests", s.handleListMyRequests)
+	meMux.HandleFunc("POST /api/v1/me/requests/{id}/approve", s.handleApproveMyRequest)
+	meMux.HandleFunc("POST /api/v1/me/requests/{id}/deny", s.handleDenyMyRequest)
+	meMux.HandleFunc("POST /api/v1/me/requests/{id}/revoke", s.handleRevokeMyRequest)
 	meMux.HandleFunc("/", s.handleUnknownAPI)
 
 	supervisorMux := http.NewServeMux()
@@ -602,6 +611,15 @@ func (s *Server) appendAudit(ctx context.Context, ev model.AuditEvent) {
 
 // agentAudit appends an audit event attributed to an agent.
 func (s *Server) agentAudit(ctx context.Context, ag model.Agent, action, status, severity, targetType, targetID string, metadata map[string]any) {
+	// Every event of an owned agent also names the person behind it (§17.6).
+	if ag.OwnerID != "" {
+		withOwner := make(map[string]any, len(metadata)+1)
+		for k, v := range metadata {
+			withOwner[k] = v
+		}
+		withOwner["owner_id"] = ag.OwnerID
+		metadata = withOwner
+	}
 	s.appendAudit(ctx, model.AuditEvent{
 		ActorType:  "agent",
 		ActorID:    ag.ID,

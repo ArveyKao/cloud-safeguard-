@@ -25,6 +25,8 @@ func downgradeToV1(t *testing.T, dir string) {
 		`ALTER TABLE capabilities DROP COLUMN access`,
 		`DROP INDEX IF EXISTS idx_agents_owner`,
 		`ALTER TABLE agents DROP COLUMN owner_id`,
+		`DROP INDEX IF EXISTS idx_providers_cloud_account`,
+		`ALTER TABLE providers DROP COLUMN cloud_account_id`,
 		`UPDATE meta SET value = '1' WHERE key = 'schema_version'`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {

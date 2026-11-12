@@ -171,3 +171,69 @@ type AgentSignInResult struct {
 	Agent  *Agent       `json:"agent,omitempty"`
 	Token  string       `json:"token,omitempty"`
 }
+
+// ---- access requests (CONTRACT §17.4, §17.5) ----
+
+// AccessRequestInput is the agent's request for short-lived access. All
+// fields except ResourceName are required; Reason is required for write and
+// full.
+type AccessRequestInput struct {
+	// CloudAccountID is the cloud's own account ID.
+	CloudAccountID string `json:"cloud_account_id"`
+	// Resource is a resource type: ecs, dns, oss.
+	Resource string `json:"resource"`
+	// Permission is read, write or full.
+	Permission string `json:"permission"`
+	// TTLSeconds is the validity period. There is no default.
+	TTLSeconds int `json:"ttl_seconds"`
+	// ResourceName narrows the request to one resource; empty means all
+	// resources of that type in the account.
+	ResourceName string `json:"resource_name,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+}
+
+// AccessRequest is an access request as shown to the agent and to its owner.
+// Its ID is also the lease ID used to fetch or revoke the credential.
+type AccessRequest struct {
+	ID               string `json:"id"`
+	AgentID          string `json:"agent_id"`
+	AgentName        string `json:"agent_name"`
+	OwnerID          string `json:"owner_id"`
+	CloudAccountID   string `json:"cloud_account_id"`
+	CloudAccountName string `json:"cloud_account_name"`
+	Resource         string `json:"resource"`
+	Permission       string `json:"permission"`
+	// ResourceName is empty when the request covers all resources.
+	ResourceName        string         `json:"resource_name,omitempty"`
+	TTLSeconds          int            `json:"ttl_seconds"`
+	Reason              string         `json:"reason"`
+	Status              LeaseStatus    `json:"status"`
+	Decision            PolicyDecision `json:"decision"`
+	DeniedReason        string         `json:"denied_reason,omitempty"`
+	RevokeReason        string         `json:"revoke_reason,omitempty"`
+	FailureReason       string         `json:"failure_reason,omitempty"`
+	ApprovedBy          string         `json:"approved_by,omitempty"`
+	CredentialAvailable bool           `json:"credential_available"`
+	CreatedAt           time.Time      `json:"created_at"`
+	ApprovedAt          *time.Time     `json:"approved_at,omitempty"`
+	IssuedAt            *time.Time     `json:"issued_at,omitempty"`
+	// ExpiresAt is the credential's deadline: issue time + TTLSeconds.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// AgentAccount is one cloud account an agent may ask for, with the role it
+// inherits from its owner there.
+type AgentAccount struct {
+	CloudAccountID string       `json:"cloud_account_id"`
+	Name           string       `json:"name"`
+	ProviderType   ProviderType `json:"provider_type"`
+	Role           Role         `json:"role"`
+	// HighestPermission is the highest permission the role allows.
+	HighestPermission string   `json:"highest_permission"`
+	Resources         []string `json:"resources"`
+}
+
+// DenyRequestInput is the owner's request body for denying a request.
+type DenyRequestInput struct {
+	Reason string `json:"reason,omitempty"`
+}

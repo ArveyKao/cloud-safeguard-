@@ -347,10 +347,22 @@ func (s *Server) afterPersonAuthorityChange(ctx context.Context, actor model.Per
 	}
 }
 
-// afterBindingReduced runs after a binding was lowered or removed. It will
-// revoke the leases the person's agents no longer qualify for (§17.6).
+// afterBindingReduced runs after a binding was lowered or removed. It
+// re-checks every pending and active lease of the person's agents and
+// revokes those the new role no longer permits (§17.6). Leases on other
+// cloud accounts pass the re-check and are left alone.
 func (s *Server) afterBindingReduced(ctx context.Context, personID, providerID string) {
 	if s.hookAfterAuthorityWrite != nil {
 		s.hookAfterAuthorityWrite("binding")
+	}
+	revoked, err := s.revokeOwnedAgentLeases(ctx, personID, "owner's role on the cloud account was lowered or removed", map[string]any{
+		"cause": "binding_reduced", "owner_id": personID, "provider_id": providerID,
+	})
+	if err != nil {
+		s.logf("revoke leases after binding change for %s on %s: %v", personID, providerID, err)
+	}
+	if len(revoked) > 0 {
+		s.systemAudit(ctx, "binding.agent_leases_revoked", "ok", "warning", "provider", providerID,
+			map[string]any{"person_id": personID, "revoked_lease_ids": revoked})
 	}
 }

@@ -148,6 +148,13 @@ func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.Creat
 		PolicyViolation:         policyViolation(capability, in.Params),
 	})
 
+	return s.submitLease(ctx, ag, capability, selected, decision, in, now)
+}
+
+// submitLease persists a decided lease request (in every outcome) and, when
+// the decision is auto-approve, mints and activates it. It is the shared
+// second half of the §16 capability request and the §17 access request.
+func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability model.Capability, selected *model.Provider, decision model.PolicyDecision, in model.CreateLeaseInput, now time.Time) (model.Lease, error) {
 	leaseID, err := newID("lea_")
 	if err != nil {
 		return model.Lease{}, err
@@ -222,7 +229,7 @@ func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.Creat
 		// an earlier read; if the capability changed since, do not mint.
 		unlockCapability := s.lockCapabilityRead(capability.ID)
 		defer unlockCapability()
-		fresh, err := s.db.GetCapability(ctx, capability.ID)
+		fresh, err := s.capabilityByID(ctx, capability.ID)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return model.Lease{}, err
 		}
@@ -582,98 +589,114 @@ func (s *Server) handleAdminApproveLease(w http.ResponseWriter, r *http.Request)
 		s.badRequest(w, "invalid request body: "+err.Error())
 		return
 	}
+	lease, err := s.approveLease(r.Context(), r.PathValue("id"), in, nil)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	s.writeData(w, http.StatusOK, lease)
+}
+
+// approveLease approves a pending lease and mints its credential. approver
+// is nil for the operator (admin token) and the signed-in person otherwise.
+//
+// Who may approve what:
+//   - a §17 access request (its capability is an access template): only the
+//     person who owns the requesting agent. Nobody else, including the
+//     operator and supervisors (CONTRACT §17.5).
+//   - a §16 capability lease: only the operator.
+//
+// A person asking about a lease that is not theirs gets "not found", the
+// same as for a lease that does not exist.
+func (s *Server) approveLease(ctx context.Context, leaseID string, in model.ApproveLeaseInput, approver *model.Person) (model.Lease, error) {
 	// Serialize with any other approval of this lease; the status read below
 	// happens under the lock, so a second approval sees the first one's result.
-	unlock := s.lockLease(r.PathValue("id"))
+	unlock := s.lockLease(leaseID)
 	defer unlock()
-	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
+	notFound := errNotFoundAPI("lease not found")
+	if approver != nil {
+		notFound = errNotFoundAPI("request not found")
+	}
+	lease, err := s.db.GetLease(ctx, leaseID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
-			return
+			return model.Lease{}, notFound
 		}
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
+	}
+	ag, err := s.db.GetAgent(ctx, lease.AgentID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return model.Lease{}, err
+	}
+	agentMissing := err != nil
+	accessRequest := capcatalog.IsAccessTemplateID(lease.CapabilityID)
+	switch {
+	case approver == nil && accessRequest:
+		return model.Lease{}, errConflictAPI("only the person who owns the agent can approve this request")
+	case approver != nil && (!accessRequest || agentMissing || ag.OwnerID == "" || ag.OwnerID != approver.ID):
+		return model.Lease{}, notFound
 	}
 	if lease.Status != model.LeasePending {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease is "+string(lease.Status)+", only pending leases can be approved")
-		return
+		return model.Lease{}, errConflictAPI("lease is " + string(lease.Status) + ", only pending leases can be approved")
 	}
 	now := s.nowUTC()
-	settings, err := s.db.GetPolicySettings(r.Context())
+	settings, err := s.db.GetPolicySettings(ctx)
 	if err != nil {
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
 	}
 	if now.Sub(lease.CreatedAt) > time.Duration(settings.PendingTimeoutSeconds)*time.Second {
 		// The sweeper may not have run yet; expire it inline then report 409.
-		s.expireLease(r.Context(), lease, "pending request timed out")
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease approval window has expired")
-		return
+		s.expireLease(ctx, lease, "pending request timed out")
+		return model.Lease{}, errConflictAPI("lease approval window has expired")
 	}
 	// Hold the capability's read lock from here until the lease is active, so
 	// no edit of this capability can commit in between (an edit that narrows
 	// the policy would otherwise leave this lease active with the old one).
 	unlockCapability := s.lockCapabilityRead(lease.CapabilityID)
 	defer unlockCapability()
-	capability, err := s.db.GetCapability(r.Context(), lease.CapabilityID)
+	capability, err := s.capabilityByID(ctx, lease.CapabilityID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "capability no longer exists")
-			return
+			return model.Lease{}, errConflictAPI("capability no longer exists")
 		}
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
 	}
-	ag, err := s.db.GetAgent(r.Context(), lease.AgentID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "agent no longer exists")
-			return
-		}
-		s.writeHandlerError(w, err)
-		return
+	if agentMissing {
+		return model.Lease{}, errConflictAPI("agent no longer exists")
 	}
 	if lease.ProviderID == "" {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease has no provider")
-		return
+		return model.Lease{}, errConflictAPI("lease has no provider")
 	}
-	prov, err := s.db.GetProvider(r.Context(), lease.ProviderID)
+	prov, err := s.db.GetProvider(ctx, lease.ProviderID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "provider no longer exists")
-			return
+			return model.Lease{}, errConflictAPI("provider no longer exists")
 		}
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
 	}
 	if !capability.Enabled {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "capability is disabled")
-		return
+		return model.Lease{}, errConflictAPI("capability is disabled")
 	}
 	if prov.Status != model.ProviderActive {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "provider is not active")
-		return
+		return model.Lease{}, errConflictAPI("provider is not active")
 	}
 	// Re-check the authorization that held when the lease was requested: an
-	// approval can arrive after a suspension, a grant removal, a demotion or a
-	// capability edit, and must never mint in those cases (CONTRACT §16.5).
-	// activateLease repeats this check after minting.
-	if problem := leaseAuthorizationProblem(ag, capability, lease); problem != "" {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, problem)
-		return
-	}
-	if problem, err := s.agentOwnerProblem(r.Context(), ag); err != nil {
-		s.writeHandlerError(w, err)
-		return
+	// approval can arrive after a suspension, a grant removal, a demotion, a
+	// lowered role binding or a capability edit, and must never mint in those
+	// cases (CONTRACT §16.5, §17.5). activateLease repeats this after minting.
+	if problem, err := s.leaseAuthorityProblem(ctx, ag, capability, lease); err != nil {
+		return model.Lease{}, err
 	} else if problem != "" {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, problem)
-		return
+		return model.Lease{}, errConflictAPI(problem)
+	}
+	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil {
+		return model.Lease{}, err
+	} else if problem != "" {
+		return model.Lease{}, errConflictAPI(problem)
 	}
 
 	if in.TTLSeconds < 0 {
-		s.badRequest(w, "ttl_seconds must be positive")
-		return
+		return model.Lease{}, errBadRequestAPI("ttl_seconds must be positive")
 	}
 	ttl := in.TTLSeconds
 	if ttl == 0 { // omitted: keep the requested validity period
@@ -683,8 +706,12 @@ func (s *Server) handleAdminApproveLease(w http.ResponseWriter, r *http.Request)
 		ttl = lease.EffectiveTTLSeconds
 	}
 	if ttl <= 0 {
-		s.badRequest(w, "ttl_seconds must be positive")
-		return
+		return model.Lease{}, errBadRequestAPI("ttl_seconds must be positive")
+	}
+	// The owner approves exactly what was asked for; only the operator may
+	// set another validity period on a §16 lease.
+	if accessRequest && ttl != lease.RequestedTTLSeconds {
+		return model.Lease{}, errBadRequestAPI("the validity period of an access request cannot be changed at approval")
 	}
 	maxTTL := capability.MaxTTLSeconds
 	if ag.MaxTTLSeconds < maxTTL {
@@ -694,45 +721,51 @@ func (s *Server) handleAdminApproveLease(w http.ResponseWriter, r *http.Request)
 		maxTTL = settings.MaxLeaseTTLSeconds
 	}
 	if ttl > maxTTL {
-		s.badRequest(w, fmt.Sprintf("ttl_seconds %d exceeds the allowed maximum %d", ttl, maxTTL))
-		return
+		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("ttl_seconds %d exceeds the allowed maximum %d", ttl, maxTTL))
 	}
 
+	audit := func(action, status, severity string, metadata map[string]any) {
+		if approver == nil {
+			s.adminAudit(ctx, action, status, severity, "lease", lease.ID, metadata)
+			return
+		}
+		metadata["agent_id"] = ag.ID
+		metadata["agent_name"] = ag.Name
+		s.personAudit(ctx, *approver, action, status, severity, "lease", lease.ID, metadata)
+	}
 	approvedAt := now
 	lease.ApprovedBy = "admin"
+	if approver != nil {
+		lease.ApprovedBy = "owner:" + approver.ID
+	}
 	lease.ApprovalNote = in.Note
 	lease.ApprovedAt = &approvedAt
 	lease.EffectiveTTLSeconds = ttl
-	if err := s.mintCredentialForLease(r.Context(), &lease, capability, &prov, ttl); err != nil {
-		if ferr := s.failLease(r.Context(), &lease, err); ferr != nil {
-			s.writeHandlerError(w, ferr)
-			return
+	if err := s.mintCredentialForLease(ctx, &lease, capability, &prov, ttl); err != nil {
+		if ferr := s.failLease(ctx, &lease, err); ferr != nil {
+			return model.Lease{}, ferr
 		}
-		s.adminAudit(r.Context(), "lease.failed", "failed", "warning", "lease", lease.ID, map[string]any{
-			"reason": lease.FailureReason,
-		})
+		audit("lease.failed", "failed", "warning", map[string]any{"reason": lease.FailureReason})
 		// Contract: provider failure returns 200 with the failed lease.
-		s.writeData(w, http.StatusOK, lease)
-		return
+		return lease, nil
 	}
 	issuedAt := now
 	expiresAt := now.Add(time.Duration(ttl) * time.Second)
 	lease.Status = model.LeaseActive
 	lease.IssuedAt = &issuedAt
 	lease.ExpiresAt = &expiresAt
-	if err := s.activateLease(r.Context(), lease); err != nil {
-		s.writeHandlerError(w, err)
-		return
+	if err := s.activateLease(ctx, lease); err != nil {
+		return model.Lease{}, err
 	}
-	s.adminAudit(r.Context(), "lease.approved", "ok", approveSeverity(lease.BreakGlass), "lease", lease.ID, map[string]any{
+	audit("lease.approved", "ok", approveSeverity(lease.BreakGlass), map[string]any{
 		"ttl_seconds": ttl,
 		"note":        in.Note,
 	})
-	s.adminAudit(r.Context(), "lease.credential_issued", "ok", "info", "lease", lease.ID, map[string]any{
+	audit("lease.credential_issued", "ok", "info", map[string]any{
 		"fingerprint": lease.CredentialFingerprint,
 		"expires_at":  expiresAt.UTC().Format(time.RFC3339Nano),
 	})
-	s.writeData(w, http.StatusOK, lease)
+	return lease, nil
 }
 
 // handleAdminDenyLease implements POST /api/v1/admin/leases/{id}/deny.
@@ -996,7 +1029,7 @@ func (s *Server) recheckLeaseAuthorization(ctx context.Context, lease model.Leas
 	if err != nil {
 		return "", err
 	}
-	capability, err := s.db.GetCapability(ctx, lease.CapabilityID)
+	capability, err := s.capabilityByID(ctx, lease.CapabilityID)
 	if errors.Is(err, store.ErrNotFound) {
 		return "capability no longer exists", nil
 	}
@@ -1035,7 +1068,60 @@ func (s *Server) recheckLeaseAuthorization(ctx context.Context, lease model.Leas
 	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil || problem != "" {
 		return problem, err
 	}
-	return leaseAuthorizationProblem(ag, capability, lease), nil
+	return s.leaseAuthorityProblem(ctx, ag, capability, lease)
+}
+
+// capabilityByID resolves a lease's capability: an access template from the
+// code catalog (CONTRACT §17.4) or a stored capability. IDs reserved for
+// access templates never resolve to a stored row.
+func (s *Server) capabilityByID(ctx context.Context, id string) (model.Capability, error) {
+	if capcatalog.IsAccessTemplateID(id) {
+		template, ok := capcatalog.AccessTemplateByID(id)
+		if !ok {
+			return model.Capability{}, store.ErrNotFound
+		}
+		return template.Capability, nil
+	}
+	return s.db.GetCapability(ctx, id)
+}
+
+// leaseAuthorityProblem is the single definition of "may this agent hold
+// this lease now". It returns "" when the lease is still authorized.
+//
+//   - §16 capability lease: the agent's own role and grants
+//     (leaseAuthorizationProblem).
+//   - §17 access request: the agent has an owner, and the owner's current
+//     role on the lease's cloud account permits the template's level. The
+//     binding is read here, at every check; it is never copied onto the
+//     agent or the lease.
+func (s *Server) leaseAuthorityProblem(ctx context.Context, ag model.Agent, capability model.Capability, lease model.Lease) (string, error) {
+	if !capcatalog.IsAccessTemplateID(capability.ID) {
+		return leaseAuthorizationProblem(ag, capability, lease), nil
+	}
+	if ag.Status != model.AgentActive {
+		return "agent is " + string(ag.Status), nil
+	}
+	if ag.OwnerID == "" {
+		return "agent has no owner", nil
+	}
+	if lease.ProviderID == "" {
+		return "request has no cloud account", nil
+	}
+	binding, err := s.db.GetBinding(ctx, ag.OwnerID, lease.ProviderID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "the agent's owner has no role on this cloud account", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !binding.Role.Permits(capability.Access) {
+		template, _ := capcatalog.AccessTemplateByID(capability.ID)
+		return "the owner's role " + string(binding.Role) + " does not permit " + string(template.Permission) + " access", nil
+	}
+	if violation := policyViolation(capability, lease.Params); violation != "" {
+		return "access template " + capability.ID + " renders a prohibited policy: " + violation, nil
+	}
+	return "", nil
 }
 
 // leaseAuthorizationProblem is the single definition of "may this lease be
@@ -1093,7 +1179,15 @@ func (s *Server) credentialReleaseProblem(ctx context.Context, agentID, leaseID 
 	if ag.Status != model.AgentActive {
 		return "agent is " + string(ag.Status), nil
 	}
-	return s.agentOwnerProblem(ctx, ag)
+	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil || problem != "" {
+		return problem, err
+	}
+	// An access request depends on the owner's role, which can change at
+	// any time: read it again now (CONTRACT §17.2).
+	if capcatalog.IsAccessTemplateID(lease.CapabilityID) {
+		return s.recheckLeaseAuthorization(ctx, lease)
+	}
+	return "", nil
 }
 
 // revalidateLeases re-runs the full activation check (recheckLeaseAuthorization)
@@ -1276,7 +1370,7 @@ func (s *Server) retireCapabilityLeases(ctx context.Context) error {
 	for _, lease := range leases {
 		capability, seen := capabilities[lease.CapabilityID]
 		if !seen {
-			c, err := s.db.GetCapability(ctx, lease.CapabilityID)
+			c, err := s.capabilityByID(ctx, lease.CapabilityID)
 			switch {
 			case err == nil:
 				capability = &c

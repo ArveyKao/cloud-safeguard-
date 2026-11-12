@@ -60,6 +60,13 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   agent-first sign-in built by Lead (schema v4, `internal/server/agentsignin.go`), verified
   locally, not yet reviewed. GitHub issues cannot be filed or read from this machine (no `gh`,
   connector failing), so QA findings arrive in task reports.
+- **§17 access requests (2026-11-11):** built by Lead: code-defined access templates with an
+  action classification table (`internal/capcatalog/access.go`), cloud account IDs on providers
+  (schema v5), `POST /agent/access-requests` with the owner's role read live, owner
+  approve/deny/revoke under `/me/requests`, and revocation when a binding is lowered or
+  removed. Verified locally (tests, race, demo, live run against the mock cloud); not yet
+  cross-family reviewed. Templates are untested on real Alibaba Cloud. Remaining: CLI,
+  MCP server, console redesign, removal of the §16 agent role and the admin token.
 - **Blocked:** none. Future work (not v0.1): credential-free proxy mode, per-parameter
   grant constraints, chat approvals, multi-cloud, SSO/multi-tenant (see README roadmap).
 

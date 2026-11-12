@@ -9,6 +9,7 @@ package model
 
 import (
 	"fmt"
+	"regexp"
 	"time"
 )
 
@@ -233,6 +234,12 @@ type Provider struct {
 	Region string `json:"region"`
 	// RoleARN is the RAM role assumed when minting credentials (sts mode).
 	RoleARN string `json:"role_arn,omitempty"`
+	// CloudAccountID is the cloud's own account ID (for Alibaba Cloud the
+	// numeric UID), taken from RoleARN when the provider is created. It never
+	// changes afterwards and is unique across providers; access requests
+	// name the account by it (CONTRACT §17.2). Empty when unknown: such a
+	// provider cannot serve access requests.
+	CloudAccountID string `json:"cloud_account_id,omitempty"`
 	// AccessKeyIDMasked is a display-only form such as "LTAI****9f2c". The raw
 	// broker AccessKey ID is never returned by the API.
 	AccessKeyIDMasked string         `json:"access_key_id_masked"`
@@ -721,3 +728,17 @@ const (
 	ErrCodeProviderError         = "provider_error"
 	ErrCodePolicyDenied          = "policy_denied"
 )
+
+var aliyunRoleARN = regexp.MustCompile(`^acs:ram::([0-9]{6,32}):role/[A-Za-z0-9._/-]+$`)
+
+// CloudAccountIDFromRoleARN extracts the cloud account ID from a role ARN,
+// or returns "" when the ARN does not have the provider type's form.
+func CloudAccountIDFromRoleARN(t ProviderType, roleARN string) string {
+	if t != ProviderAliyun {
+		return ""
+	}
+	if m := aliyunRoleARN.FindStringSubmatch(roleARN); m != nil {
+		return m[1]
+	}
+	return ""
+}

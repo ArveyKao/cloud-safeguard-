@@ -303,6 +303,7 @@ func seedDemoProvider(ctx context.Context, db *store.DB, v *vault.Vault, now tim
 		Mode:              model.ModeMock,
 		Region:            demoProviderRegion,
 		RoleARN:           demoProviderRoleARN,
+		CloudAccountID:    model.CloudAccountIDFromRoleARN(model.ProviderAliyun, demoProviderRoleARN),
 		AccessKeyIDMasked: maskAccessKeyID(demoBrokerAccessKeyID),
 		Status:            model.ProviderActive,
 		CreatedAt:         now,
