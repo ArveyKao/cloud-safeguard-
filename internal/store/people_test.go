@@ -335,6 +335,9 @@ func TestCloudAccountIDMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
+		`ALTER TABLE persons DROP COLUMN approval_mode`,
+		`ALTER TABLE persons DROP COLUMN approval_mode_expires_at`,
+		`ALTER TABLE providers DROP COLUMN max_auto_level`,
 		`DROP INDEX idx_providers_cloud_account`,
 		`ALTER TABLE providers DROP COLUMN cloud_account_id`,
 		`INSERT INTO providers(id, name, type, mode, region, role_arn, status, created_at, updated_at) VALUES
@@ -373,5 +376,26 @@ func TestCloudAccountIDMigration(t *testing.T) {
 		CloudAccountID: "2222222222222222", CreatedAt: peopleNow, UpdatedAt: peopleNow}
 	if err := db.CreateProvider(ctx, dup, ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate cloud account: %v", err)
+	}
+}
+
+// A provider stored without a level starts at read.
+func TestNewProviderStartsAtReadLevel(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	p := model.Provider{ID: "p1", Name: "x", Type: model.ProviderAliyun, Mode: model.ModeMock, Status: model.ProviderActive,
+		CreatedAt: peopleNow, UpdatedAt: peopleNow}
+	if err := db.CreateProvider(ctx, p, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetProvider(ctx, "p1")
+	if err != nil || got.MaxAutoLevel != model.ModeRead {
+		t.Fatalf("level = %q, %v", got.MaxAutoLevel, err)
+	}
+	if err := db.SetProviderMaxAutoLevel(ctx, "p1", "everything", peopleNow); err == nil {
+		t.Fatal("an unknown level was stored")
+	}
+	if err := db.SetProviderMaxAutoLevel(ctx, "missing", model.ModeFull, peopleNow); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown provider: %v", err)
 	}
 }

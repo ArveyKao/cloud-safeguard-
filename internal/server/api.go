@@ -102,6 +102,7 @@ func (s *Server) buildHandler() http.Handler {
 	meMux.HandleFunc("POST /api/v1/me/signins/{code}/deny", s.handleDenySignIn)
 	meMux.HandleFunc("GET /api/v1/me/agents", s.handleListMyAgents)
 	meMux.HandleFunc("POST /api/v1/me/agents/{id}/revoke", s.handleRevokeMyAgent)
+	meMux.HandleFunc("PUT /api/v1/me/approval-mode", s.handleSetMyApprovalMode)
 	meMux.HandleFunc("GET /api/v1/me/requests", s.handleListMyRequests)
 	meMux.HandleFunc("POST /api/v1/me/requests/{id}/approve", s.handleApproveMyRequest)
 	meMux.HandleFunc("POST /api/v1/me/requests/{id}/deny", s.handleDenyMyRequest)
@@ -116,6 +117,7 @@ func (s *Server) buildHandler() http.Handler {
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/bindings", s.handleListBindings)
 	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/people/{person}", s.handlePutBinding)
 	supervisorMux.HandleFunc("DELETE /api/v1/supervisor/accounts/{provider}/people/{person}", s.handleDeleteBinding)
+	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/auto-level", s.handleSetAccountAutoLevel)
 	supervisorMux.HandleFunc("/", s.handleUnknownAPI)
 
 	root := http.NewServeMux()

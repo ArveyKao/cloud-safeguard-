@@ -30,7 +30,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 5
+const CurrentSchemaVersion = 6
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -229,6 +229,13 @@ var migrations = []migration{
 				ON providers(cloud_account_id) WHERE cloud_account_id <> ''`,
 		},
 		transform: migrateCloudAccountIDs,
+	},
+	{ // version 5 -> 6: approval modes (CONTRACT §17.5)
+		statements: []string{
+			`ALTER TABLE persons ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'read'`,
+			`ALTER TABLE persons ADD COLUMN approval_mode_expires_at INTEGER`,
+			`ALTER TABLE providers ADD COLUMN max_auto_level TEXT NOT NULL DEFAULT 'read'`,
+		},
 	},
 }
 

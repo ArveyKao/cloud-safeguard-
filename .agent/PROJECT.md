@@ -67,6 +67,14 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   removed. Verified locally (tests, race, demo, live run against the mock cloud); not yet
   cross-family reviewed. Templates are untested on real Alibaba Cloud. Remaining: CLI,
   MCP server, console redesign, removal of the §16 agent role and the admin token.
+- **§17 approval modes (2026-11-12, plan confirmed by the owner with the explainer video):**
+  each person chooses one mode for all their agents (read default, write, full; optional
+  expiry); a supervisor sets each cloud account's highest automatic level (default read);
+  automatic = the lower of the two, after the role check. Schema v6. Built by Lead, verified
+  locally (tests, race, demo, live run); not yet committed or cross-family reviewed.
+- **Agreed next (owner, 2026-11-11):** remove the admin token and the §16 agent model once
+  supervisors can manage cloud accounts, audit and settings, and the console and `csg` use the
+  new login. Supervisors keep an emergency revoke/deny, never approve.
 - **Blocked:** none. Future work (not v0.1): credential-free proxy mode, per-parameter
   grant constraints, chat approvals, multi-cloud, SSO/multi-tenant (see README roadmap).
 

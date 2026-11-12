@@ -28,7 +28,7 @@ import (
 const (
 	ruleOwnerBound       = "owner_bound_to_account"
 	ruleOwnerRolePermits = "owner_role_permits"
-	ruleReadAuto         = "read_is_automatic"
+	ruleAutomatic        = "automatic_by_mode"
 	ruleOwnerApproval    = "owner_approval_required"
 )
 
@@ -185,6 +185,7 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	}
 
 	decision := model.PolicyDecision{EffectiveTTLSeconds: in.TTLSeconds, Outcome: model.OutcomeAutoApprove}
+	var auditExtra map[string]any
 	add := func(rule, outcome, detail string) {
 		decision.Reasons = append(decision.Reasons, model.DecisionReason{Rule: rule, Outcome: outcome, Detail: detail})
 		if outcome == policy.OutcomeDeny {
@@ -214,16 +215,28 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 			fmt.Sprintf("%d requests in the last minute; the limit is %d", lastMinute, settings.LeasesPerMinutePerAgent))
 	}
 	if decision.Outcome != model.OutcomeDeny {
-		if permission == capcatalog.PermissionRead {
-			add(ruleReadAuto, policy.OutcomeAllow, "read access is issued without approval")
+		// What is automatic: the lower of the owner's approval mode and the
+		// cloud account's highest automatic level (§17.5). The role check
+		// above already held; a mode never widens it.
+		owner, err := s.db.GetPerson(ctx, ag.OwnerID)
+		if err != nil {
+			return model.Lease{}, err
+		}
+		mode, level, automatic := automaticLevel(owner, prov, now)
+		auditExtra = map[string]any{"approval_mode": string(mode), "max_auto_level": string(level)}
+		if permission.Rank() <= automatic.Rank() {
+			add(ruleAutomatic, policy.OutcomeAllow, fmt.Sprintf(
+				"%s access is issued without approval (owner's mode %s, account's highest automatic level %s)",
+				permission, mode, level))
 		} else {
 			decision.Outcome = model.OutcomeRequireApproval
-			add(ruleOwnerApproval, policy.OutcomeRequireApproval,
-				fmt.Sprintf("%s access waits for the owner's approval", permission))
+			add(ruleOwnerApproval, policy.OutcomeRequireApproval, fmt.Sprintf(
+				"%s access waits for the owner's approval (owner's mode %s, account's highest automatic level %s)",
+				permission, mode, level))
 		}
 	}
 
-	return s.submitLease(ctx, ag, capability, &prov, decision, model.CreateLeaseInput{
+	return s.submitLease(ctx, ag, capability, &prov, decision, auditExtra, model.CreateLeaseInput{
 		CapabilityID: capability.ID,
 		Params:       params,
 		TTLSeconds:   in.TTLSeconds,
@@ -312,9 +325,18 @@ func (s *Server) handleAgentListAccounts(w http.ResponseWriter, r *http.Request)
 					highest = p
 				}
 			}
+			owner, err := s.db.GetPerson(r.Context(), ag.OwnerID)
+			if err != nil {
+				s.writeHandlerError(w, err)
+				return
+			}
+			_, _, automatic := automaticLevel(owner, prov, s.nowUTC())
+			if automatic.Rank() > highest.Rank() {
+				automatic = model.ApprovalMode(highest)
+			}
 			accounts = append(accounts, model.AgentAccount{
 				CloudAccountID: prov.CloudAccountID, Name: prov.Name, ProviderType: prov.Type,
-				Role: b.Role, HighestPermission: string(highest),
+				Role: b.Role, HighestPermission: string(highest), AutomaticUpTo: string(automatic),
 				Resources: capcatalog.AccessResources(prov.Type),
 			})
 		}
@@ -502,4 +524,114 @@ func (s *Server) ownedAccessLease(ctx context.Context, leaseID, personID string)
 		return model.Lease{}, model.Agent{}, false
 	}
 	return lease, ag, true
+}
+
+// ---- approval modes (CONTRACT §17.5) ----
+
+// maxModeExpiry bounds a temporary approval mode.
+const maxModeExpiry = 30 * 24 * time.Hour
+
+// handleSetMyApprovalMode implements PUT /api/v1/me/approval-mode. A person
+// sets only their own mode; it applies to all their agents.
+func (s *Server) handleSetMyApprovalMode(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	actor, _ := sessionFromContext(ctx)
+	var in model.SetApprovalModeInput
+	if err := s.decodeJSON(w, r, &in); err != nil {
+		s.badRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+	if !in.Mode.Valid() {
+		s.badRequest(w, "mode must be read, write or full")
+		return
+	}
+	if in.ExpiresInSeconds < 0 || time.Duration(in.ExpiresInSeconds)*time.Second > maxModeExpiry {
+		s.badRequest(w, "expires_in_seconds must be between 0 and 30 days")
+		return
+	}
+	now := s.nowUTC()
+	var expiresAt *time.Time
+	if in.ExpiresInSeconds > 0 && in.Mode != model.ModeRead {
+		t := now.Add(time.Duration(in.ExpiresInSeconds) * time.Second)
+		expiresAt = &t
+	}
+	previous := actor.person.EffectiveApprovalMode(now)
+	if err := s.db.SetApprovalMode(ctx, actor.person.ID, in.Mode, expiresAt, now); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "your account is not active")
+			return
+		}
+		s.writeHandlerError(w, err)
+		return
+	}
+	severity := "info"
+	if in.Mode.Rank() > previous.Rank() {
+		severity = "warning"
+	}
+	metadata := map[string]any{"mode": string(in.Mode), "previous_mode": string(previous)}
+	if expiresAt != nil {
+		metadata["expires_at"] = expiresAt.Format(time.RFC3339)
+	}
+	s.personAudit(ctx, actor.person, "person.approval_mode_changed", "ok", severity, "person", actor.person.ID, metadata)
+	updated, err := s.db.GetPerson(ctx, actor.person.ID)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	s.writeData(w, http.StatusOK, updated)
+}
+
+// handleSetAccountAutoLevel implements
+// PUT /api/v1/supervisor/accounts/{provider}/auto-level.
+func (s *Server) handleSetAccountAutoLevel(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	actor, _ := sessionFromContext(ctx)
+	var in model.SetAutoLevelInput
+	if err := s.decodeJSON(w, r, &in); err != nil {
+		s.badRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+	if !in.MaxAutoLevel.Valid() {
+		s.badRequest(w, "max_auto_level must be read, write or full")
+		return
+	}
+	prov, err := s.db.GetProvider(ctx, r.PathValue("provider"))
+	if err != nil {
+		s.storeErrorResponse(w, err, "cloud account not found")
+		return
+	}
+	if err := s.db.SetProviderMaxAutoLevel(ctx, prov.ID, in.MaxAutoLevel, s.nowUTC()); err != nil {
+		s.storeErrorResponse(w, err, "cloud account not found")
+		return
+	}
+	severity := "info"
+	if in.MaxAutoLevel.Rank() > prov.MaxAutoLevel.Rank() {
+		severity = "warning"
+	}
+	s.personAudit(ctx, actor.person, "provider.auto_level_changed", "ok", severity, "provider", prov.ID, map[string]any{
+		"max_auto_level": string(in.MaxAutoLevel), "previous": string(prov.MaxAutoLevel), "cloud_account_id": prov.CloudAccountID,
+	})
+	updated, err := s.db.GetProvider(ctx, prov.ID)
+	if err != nil {
+		s.storeErrorResponse(w, err, "cloud account not found")
+		return
+	}
+	s.writeData(w, http.StatusOK, updated)
+}
+
+// automaticLevel returns the owner's effective approval mode, the cloud
+// account's highest automatic level, and the lower of the two: requests at
+// or below it are issued without asking (CONTRACT §17.5). Unknown or
+// missing values count as read, so they can never widen anything.
+func automaticLevel(owner model.Person, prov model.Provider, now time.Time) (mode, level, automatic model.ApprovalMode) {
+	mode = owner.EffectiveApprovalMode(now)
+	level = prov.MaxAutoLevel
+	if !level.Valid() {
+		level = model.ModeRead
+	}
+	automatic = mode
+	if level.Rank() < automatic.Rank() {
+		automatic = level
+	}
+	return mode, level, automatic
 }

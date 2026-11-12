@@ -304,6 +304,7 @@ func seedDemoProvider(ctx context.Context, db *store.DB, v *vault.Vault, now tim
 		Region:            demoProviderRegion,
 		RoleARN:           demoProviderRoleARN,
 		CloudAccountID:    model.CloudAccountIDFromRoleARN(model.ProviderAliyun, demoProviderRoleARN),
+		MaxAutoLevel:      model.ModeRead,
 		AccessKeyIDMasked: maskAccessKeyID(demoBrokerAccessKeyID),
 		Status:            model.ProviderActive,
 		CreatedAt:         now,

@@ -878,11 +878,30 @@ agent or the request.
 
 ### 17.5 Approval
 
-- `read` requests that pass verification are approved automatically.
-- `write` and `full` requests always wait for approval. The approver is the **agent's owner**,
-  signed in to the console. Nobody else can approve, including supervisors and the operator
-  token; to anyone else the request does not exist (404). The owner cannot change the
-  validity period at approval.
+- **Approval mode.** Each person chooses one mode for all their agents: `read` (default),
+  `write` or `full`. A request at or below the mode is issued automatically; a request above
+  it waits for approval.
+
+  | Mode | Issued automatically | Waits for the owner |
+  | --- | --- | --- |
+  | `read` | read | write, full |
+  | `write` | read, write | full |
+  | `full` | read, write, full | nothing |
+
+  - Only the person sets their own mode, in a console session. No agent, supervisor or API
+    token can set it. A mode above `read` may carry an expiry; after it the mode is `read`.
+  - Each cloud account has a **highest automatic level** set by a supervisor (default
+    `read`). On that account nothing above it is automatic, whatever the person's mode.
+  - What is automatic for a request = the lower of the person's mode and the account's
+    highest automatic level. The role check comes first and is unaffected: a mode never
+    lets an agent get more than its owner's role allows.
+  - The mode is read when the request is made. Changing it later does not approve requests
+    already waiting and does not revoke credentials already issued.
+  - Changes of a mode or of an account's level are audited; an automatic issue records the
+    mode and level that allowed it.
+- A request that waits is approved by the **agent's owner**, signed in to the console. Nobody
+  else can approve, including supervisors and the operator token; to anyone else the request
+  does not exist (404). The owner cannot change the validity period at approval.
 - The owner can also deny a pending request and revoke an issued one early.
 - The operator token (until it is removed) can see, deny and revoke access requests as a
   safety control, with every such action audited. It can never approve one. The note an
@@ -924,6 +943,7 @@ agent API; it holds the agent token and no cloud credentials beyond the lease it
 | `csg init` first supervisor, `csg supervisor recover` | implemented |
 | Agent ownership and agent-first sign-in (§17.3 item 2) | implemented (API), schema version 4; CLI and console not yet |
 | Five-field request, permission levels, owner approval (§17.4, §17.5) | implemented (API), schema version 5; CLI and console not yet |
+| Approval modes and per-account highest automatic level (§17.5) | implemented (API), schema version 6 |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) | not started |
 | Console redesign | not started |
@@ -945,3 +965,5 @@ unchanged alongside the new endpoints:
   for `POST /api/v1/agent/leases/{id}/credential` and `.../revoke`.
 - `GET /api/v1/me/requests[?status=pending]`,
   `POST /api/v1/me/requests/{id}/approve|deny|revoke` (person session)
+- `PUT /api/v1/me/approval-mode` (person session; the current mode is in `GET /auth/me`),
+  `PUT /api/v1/supervisor/accounts/{provider_id}/auto-level` (supervisor)

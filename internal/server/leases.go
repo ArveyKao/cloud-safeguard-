@@ -164,13 +164,13 @@ func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.Creat
 		PolicyViolation:         policyViolation(capability, in.Params),
 	})
 
-	return s.submitLease(ctx, ag, capability, selected, decision, in, now)
+	return s.submitLease(ctx, ag, capability, selected, decision, nil, in, now)
 }
 
 // submitLease persists a decided lease request (in every outcome) and, when
 // the decision is auto-approve, mints and activates it. It is the shared
 // second half of the §16 capability request and the §17 access request.
-func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability model.Capability, selected *model.Provider, decision model.PolicyDecision, in model.CreateLeaseInput, now time.Time) (model.Lease, error) {
+func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability model.Capability, selected *model.Provider, decision model.PolicyDecision, auditExtra map[string]any, in model.CreateLeaseInput, now time.Time) (model.Lease, error) {
 	leaseID, err := newID("lea_")
 	if err != nil {
 		return model.Lease{}, err
@@ -217,14 +217,18 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 	if decision.Outcome == model.OutcomeDeny {
 		requestedStatus = "denied"
 	}
-	s.agentAudit(ctx, ag, "lease.requested", requestedStatus, "info", "lease", lease.ID, map[string]any{
+	requested := map[string]any{
 		"capability":  capability.ID,
 		"risk":        string(capability.Risk),
 		"params":      in.Params,
 		"ttl_seconds": decision.EffectiveTTLSeconds,
 		"decision":    string(decision.Outcome),
 		"break_glass": in.BreakGlass,
-	})
+	}
+	for k, v := range auditExtra {
+		requested[k] = v
+	}
+	s.agentAudit(ctx, ag, "lease.requested", requestedStatus, "info", "lease", lease.ID, requested)
 
 	switch decision.Outcome {
 	case model.OutcomeAutoApprove:

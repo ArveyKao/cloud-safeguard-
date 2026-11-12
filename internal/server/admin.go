@@ -236,6 +236,7 @@ func (s *Server) handleAdminCreateProvider(w http.ResponseWriter, r *http.Reques
 		Region:            in.Region,
 		RoleARN:           in.RoleARN,
 		CloudAccountID:    model.CloudAccountIDFromRoleARN(in.Type, in.RoleARN),
+		MaxAutoLevel:      model.ModeRead,
 		AccessKeyIDMasked: maskAccessKeyID(in.AccessKeyID),
 		Status:            model.ProviderActive,
 		CreatedAt:         now,

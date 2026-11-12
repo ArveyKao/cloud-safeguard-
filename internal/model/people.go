@@ -34,10 +34,15 @@ type Person struct {
 	Status      PersonStatus `json:"status"`
 	// Supervisor is the platform flag: may manage cloud accounts, people and
 	// role bindings. It grants no cloud access.
-	Supervisor  bool       `json:"supervisor"`
-	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	Supervisor bool `json:"supervisor"`
+	// ApprovalMode is the level up to which this person's agents get access
+	// without asking (CONTRACT §17.5). Only the person sets it.
+	ApprovalMode ApprovalMode `json:"approval_mode"`
+	// ApprovalModeExpiresAt, when set, is when the mode falls back to read.
+	ApprovalModeExpiresAt *time.Time `json:"approval_mode_expires_at,omitempty"`
+	LastLoginAt           *time.Time `json:"last_login_at,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
 // RoleBinding gives one person a role on one cloud account.
@@ -229,11 +234,71 @@ type AgentAccount struct {
 	ProviderType   ProviderType `json:"provider_type"`
 	Role           Role         `json:"role"`
 	// HighestPermission is the highest permission the role allows.
-	HighestPermission string   `json:"highest_permission"`
-	Resources         []string `json:"resources"`
+	HighestPermission string `json:"highest_permission"`
+	// AutomaticUpTo is the highest permission issued here without waiting
+	// for the owner: the lowest of the role, the owner's approval mode and
+	// the account's highest automatic level.
+	AutomaticUpTo string   `json:"automatic_up_to"`
+	Resources     []string `json:"resources"`
 }
 
 // DenyRequestInput is the owner's request body for denying a request.
 type DenyRequestInput struct {
 	Reason string `json:"reason,omitempty"`
+}
+
+// ---- approval modes (CONTRACT §17.5) ----
+
+// ApprovalMode is a permission level used as a threshold: requests at or
+// below it are issued automatically. It is also used for a cloud account's
+// highest automatic level.
+type ApprovalMode string
+
+const (
+	ModeRead  ApprovalMode = "read"
+	ModeWrite ApprovalMode = "write"
+	ModeFull  ApprovalMode = "full"
+)
+
+// Rank orders modes: read=1, write=2, full=3. Unknown values rank 0, so an
+// unknown mode never makes anything automatic.
+func (m ApprovalMode) Rank() int {
+	switch m {
+	case ModeRead:
+		return 1
+	case ModeWrite:
+		return 2
+	case ModeFull:
+		return 3
+	}
+	return 0
+}
+
+// Valid reports whether m is a known mode.
+func (m ApprovalMode) Valid() bool { return m.Rank() > 0 }
+
+// EffectiveApprovalMode is the person's mode at time now: read once a mode
+// has expired, and read for any unknown value.
+func (p Person) EffectiveApprovalMode(now time.Time) ApprovalMode {
+	if !p.ApprovalMode.Valid() {
+		return ModeRead
+	}
+	if p.ApprovalModeExpiresAt != nil && !now.Before(*p.ApprovalModeExpiresAt) {
+		return ModeRead
+	}
+	return p.ApprovalMode
+}
+
+// SetApprovalModeInput is the person's request body for choosing a mode.
+type SetApprovalModeInput struct {
+	Mode ApprovalMode `json:"mode"`
+	// ExpiresInSeconds optionally limits a write or full mode; 0 means until
+	// changed.
+	ExpiresInSeconds int `json:"expires_in_seconds,omitempty"`
+}
+
+// SetAutoLevelInput is the supervisor's request body for a cloud account's
+// highest automatic level.
+type SetAutoLevelInput struct {
+	MaxAutoLevel ApprovalMode `json:"max_auto_level"`
 }

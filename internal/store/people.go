@@ -37,7 +37,8 @@ type Session struct {
 	ExpiresAt  time.Time
 }
 
-const personColumns = `id, username, display_name, status, supervisor, last_login_at, created_at, updated_at`
+const personColumns = `id, username, display_name, status, supervisor, last_login_at, created_at, updated_at,
+	approval_mode, approval_mode_expires_at`
 
 func scanPerson(row rowScanner) (model.Person, error) {
 	var (
@@ -45,10 +46,13 @@ func scanPerson(row rowScanner) (model.Person, error) {
 		supervisor           int
 		lastLogin            *int64
 		createdAt, updatedAt int64
+		modeExpires          *int64
 	)
-	if err := row.Scan(&p.ID, &p.Username, &p.DisplayName, &p.Status, &supervisor, &lastLogin, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&p.ID, &p.Username, &p.DisplayName, &p.Status, &supervisor, &lastLogin, &createdAt, &updatedAt,
+		&p.ApprovalMode, &modeExpires); err != nil {
 		return model.Person{}, mapErr(err)
 	}
+	p.ApprovalModeExpiresAt = timePtr(modeExpires)
 	p.Supervisor = intBool(supervisor)
 	p.LastLoginAt = timePtr(lastLogin)
 	p.CreatedAt = fromMillis(createdAt)
@@ -209,6 +213,7 @@ func (db *DB) ResetPersonSetup(ctx context.Context, id, setupCodeHash string, se
 		}
 		res, err := tx.ExecContext(ctx,
 			`UPDATE persons SET status = 'pending', password_hash = '', totp_secret_enc = '', totp_last_step = -1,
+				approval_mode = 'read', approval_mode_expires_at = NULL,
 				setup_code_hash = ?, setup_expires_at = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
 			 WHERE id = ?`+cond,
 			setupCodeHash, toMillis(setupExpiresAt), toMillis(now), id)
@@ -449,4 +454,33 @@ func (db *DB) ListBindings(ctx context.Context, personID, providerID string) ([]
 		out = append(out, b)
 	}
 	return out, mapErr(rows.Err())
+}
+
+// SetApprovalMode stores a person's approval mode. It only writes while the
+// person is active (ErrConflict otherwise).
+func (db *DB) SetApprovalMode(ctx context.Context, personID string, mode model.ApprovalMode, expiresAt *time.Time, now time.Time) error {
+	if !mode.Valid() {
+		return errors.New("store: invalid approval mode")
+	}
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE persons SET approval_mode = ?, approval_mode_expires_at = ?, updated_at = ?
+		 WHERE id = ? AND status = 'active'`,
+		string(mode), millisPtr(expiresAt), toMillis(now), personID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrConflict(res)
+}
+
+// SetProviderMaxAutoLevel stores a cloud account's highest automatic level.
+func (db *DB) SetProviderMaxAutoLevel(ctx context.Context, providerID string, level model.ApprovalMode, now time.Time) error {
+	if !level.Valid() {
+		return errors.New("store: invalid automatic level")
+	}
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE providers SET max_auto_level = ?, updated_at = ? WHERE id = ?`, string(level), toMillis(now), providerID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrNotFound(res)
 }

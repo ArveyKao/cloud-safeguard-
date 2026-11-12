@@ -240,6 +240,10 @@ type Provider struct {
 	// name the account by it (CONTRACT §17.2). Empty when unknown: such a
 	// provider cannot serve access requests.
 	CloudAccountID string `json:"cloud_account_id,omitempty"`
+	// MaxAutoLevel is the highest permission that may be issued on this
+	// cloud account without the owner's approval, whatever a person's
+	// approval mode is (CONTRACT §17.5). A supervisor sets it; default read.
+	MaxAutoLevel ApprovalMode `json:"max_auto_level"`
 	// AccessKeyIDMasked is a display-only form such as "LTAI****9f2c". The raw
 	// broker AccessKey ID is never returned by the API.
 	AccessKeyIDMasked string         `json:"access_key_id_masked"`
