@@ -869,9 +869,8 @@ func (s *Server) handleAdminDenyLease(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.ClearLeaseCredential(r.Context(), lease.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.logf("lease %s: scrub credential on deny: %v", lease.ID, err)
 	}
-	s.adminAudit(r.Context(), "lease.denied", "denied", denySeverity(lease.BreakGlass), "lease", lease.ID, map[string]any{
-		"reason": reason,
-	})
+	s.adminAudit(r.Context(), "lease.denied", "denied", denySeverity(lease.BreakGlass), "lease", lease.ID,
+		s.leaseAgentMetadata(r.Context(), lease, map[string]any{"reason": reason}))
 	s.writeData(w, http.StatusOK, lease)
 }
 
@@ -1367,10 +1366,10 @@ func (s *Server) revokeLease(ctx context.Context, lease model.Lease, reason stri
 	if err != nil {
 		return model.Lease{}, err
 	}
-	metadata := map[string]any{
+	metadata := s.leaseAgentMetadata(ctx, updated, map[string]any{
 		"reason":          reason,
 		"previous_status": string(previousStatus),
-	}
+	})
 	if actor != nil {
 		metadata["actor"] = "agent:" + actor.ID
 		s.agentAudit(ctx, *actor, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
@@ -1573,4 +1572,15 @@ func (s *Server) lockAgentRequests(agentID string) func() {
 	s.agentLocksMu.Unlock()
 	lock.Lock()
 	return lock.Unlock
+}
+
+// leaseAgentMetadata adds the lease's agent, and the person who owns it, to
+// audit metadata, so every event names both (CONTRACT §17.6).
+func (s *Server) leaseAgentMetadata(ctx context.Context, lease model.Lease, metadata map[string]any) map[string]any {
+	metadata["agent_id"] = lease.AgentID
+	metadata["agent_name"] = lease.AgentName
+	if ag, err := s.db.GetAgent(ctx, lease.AgentID); err == nil && ag.OwnerID != "" {
+		metadata["owner_id"] = ag.OwnerID
+	}
+	return metadata
 }

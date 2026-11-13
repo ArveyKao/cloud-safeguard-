@@ -991,5 +991,9 @@ unchanged alongside the new endpoints:
   - emergency stop: `GET /api/v1/supervisor/leases[/{id}]`,
     `POST /api/v1/supervisor/leases/{id}/deny|revoke`. There is no approve route: a
     supervisor can stop any request or credential, never grant one.
-  - Every action is recorded under the supervisor's own name. Creating a cloud account gives
+  - Every action is recorded under the supervisor's own name, and deny and revoke events
+    also name the agent and its owner. Account edits record the old and new role ARN, region
+    and status; a role ARN or status change is a warning. Creating a cloud account gives
     nobody a role on it, its creator included.
+- Every state-changing request runs to completion once it has started, even if the client
+  disconnects, so a change is never left without its follow-up revocations and audit record.

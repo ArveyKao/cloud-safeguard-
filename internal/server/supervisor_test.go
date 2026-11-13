@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -227,4 +230,193 @@ func TestMyAccounts(t *testing.T) {
 		t.Fatalf("supervisor without a role sees %d accounts", n)
 	}
 	requireStatus(t, a.do(http.MethodGet, "/api/v1/me/accounts", a.token, nil), http.StatusUnauthorized)
+}
+
+// ---- regression tests for the independent review of commit 7d486a5 ----
+
+// A browser that goes away right after an authority change is written must
+// not stop the sweep and the audit record that follow it.
+func TestAbortedRequestStillSweepsAndAudits(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	read := a.request(accessInput("ecs", "read"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.srv.hookAfterAuthorityWrite = func(kind string) {
+		if kind == "provider" {
+			cancel() // the client disconnects right after the write
+		}
+	}
+	disabled := model.ProviderDisabled
+	body, _ := json.Marshal(model.UpdateProviderInput{Status: &disabled})
+	req := httptest.NewRequest(http.MethodPatch, supAccounts+"/"+a.providerID, bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, a.sup.csrf)
+	req.AddCookie(a.sup.cookie)
+	a.srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	a.srv.hookAfterAuthorityWrite = nil
+
+	if ctx.Err() == nil {
+		t.Fatal("the hook did not run; the test did not abort the request")
+	}
+	if a.status(read.ID) != model.LeaseRevoked {
+		t.Fatalf("credential after an aborted disable = %s", a.status(read.ID))
+	}
+	a.requireActor(a.lastEvent("provider.updated"), a.sup)
+	a.requireActor(a.lastEvent("lease.revoked"), a.sup)
+}
+
+// The same for a settings change, cancelled before the handler starts.
+func TestCancelledSettingsChangeIsStillAudited(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	settings, _ := a.srv.db.GetPolicySettings(context.Background())
+	settings.LeasesPerMinutePerAgent = 21
+	body, _ := json.Marshal(settings)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/supervisor/settings", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, a.sup.csrf)
+	req.AddCookie(a.sup.cookie)
+	a.srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	if got, _ := a.srv.db.GetPolicySettings(context.Background()); got.LeasesPerMinutePerAgent != 21 {
+		t.Fatalf("settings = %d", got.LeasesPerMinutePerAgent)
+	}
+	a.requireActor(a.lastEvent("policy.updated"), a.sup)
+}
+
+// Deny and revoke events name the agent and its owner; settings-induced
+// revocations name the supervisor.
+func TestStopEventsNameAgentOwnerAndSupervisor(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	pending := a.request(accessInput("ecs", "write"))
+	active := a.request(accessInput("dns", "read"))
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+pending.ID+"/deny", model.DenyLeaseInput{Reason: "no"}), http.StatusOK)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+active.ID+"/revoke", nil), http.StatusOK)
+	for _, action := range []string{"lease.denied", "lease.revoked"} {
+		m := a.lastEvent(action).Metadata
+		if m["agent_id"] != a.agent.ID || m["agent_name"] != a.agent.Name || m["owner_id"] != a.mei.person.ID {
+			t.Errorf("%s metadata = %+v", action, m)
+		}
+	}
+
+	// Lowering the validity ceiling below an active credential revokes it,
+	// in the supervisor's name.
+	again := a.request(accessInput("oss", "read"))
+	settings, _ := a.srv.db.GetPolicySettings(context.Background())
+	settings.AutoApproveMaxTTLSeconds = 300
+	settings.MaxLeaseTTLSeconds = 300
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+	if a.status(again.ID) != model.LeaseRevoked {
+		t.Fatalf("credential above the new ceiling = %s", a.status(again.ID))
+	}
+	ev := a.lastEvent("lease.revoked")
+	a.requireActor(ev, a.sup)
+	if ev.TargetID != again.ID || ev.Metadata["agent_id"] != a.agent.ID {
+		t.Fatalf("settings revocation = %+v", ev)
+	}
+}
+
+// Account edits record what changed, and a role or status change is a warning.
+func TestAccountEditsRecordOldAndNewValues(t *testing.T) {
+	a := newAccessEnv(t, "")
+	arn := "acs:ram::" + demoAccountID + ":role/another"
+	requireStatus(t, a.sup.do(http.MethodPatch, supAccounts+"/"+a.providerID, model.UpdateProviderInput{RoleARN: &arn}), http.StatusOK)
+	ev := a.lastEvent("provider.updated")
+	changes, _ := ev.Metadata["changes"].(map[string]any)
+	roleARN, _ := changes["role_arn"].(map[string]any)
+	if ev.Severity != "warning" || roleARN["to"] != arn || roleARN["from"] == "" {
+		t.Fatalf("role ARN change audit = %+v", ev)
+	}
+	region := "cn-shanghai"
+	requireStatus(t, a.sup.do(http.MethodPatch, supAccounts+"/"+a.providerID, model.UpdateProviderInput{Region: &region}), http.StatusOK)
+	if ev := a.lastEvent("provider.updated"); ev.Severity != "info" {
+		t.Fatalf("region change severity = %s", ev.Severity)
+	}
+}
+
+// A disabled account issues nothing, so it shows no automatic level.
+func TestMyAccountsOnADisabledAccount(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	disabled := model.ProviderDisabled
+	requireStatus(t, a.sup.do(http.MethodPatch, supAccounts+"/"+a.providerID, model.UpdateProviderInput{Status: &disabled}), http.StatusOK)
+	rec := a.mei.do(http.MethodGet, "/api/v1/me/accounts", nil)
+	acct := decodeEnvelope[listData[model.PersonAccount]](t, rec).Items[0]
+	if acct.Status != model.ProviderDisabled || acct.AutomaticUpTo != "" {
+		t.Fatalf("disabled account = %+v", acct)
+	}
+	if _, err := a.srv.db.SQL().Exec(`UPDATE role_bindings SET role = 'owner' WHERE person_id = ?`, a.mei.person.ID); err != nil {
+		t.Fatal(err)
+	}
+	rec = a.mei.do(http.MethodGet, "/api/v1/me/accounts", nil)
+	if acct := decodeEnvelope[listData[model.PersonAccount]](t, rec).Items[0]; acct.HighestPermission != "" || acct.AutomaticUpTo != "" {
+		t.Fatalf("unknown role = %+v", acct)
+	}
+}
+
+// No secret appears in any supervisor or account response.
+func TestSupervisorResponsesCarryNoSecrets(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	const canaryID, canarySecret = "LTAI5tCanaryKeyIdXyz", "canary-broker-secret-value"
+	in := newMockAccount("canary", "6543210987654321")
+	in.AccessKeyID, in.AccessKeySecret = canaryID, canarySecret
+	rec := a.sup.do(http.MethodPost, supAccounts, in)
+	requireStatus(t, rec, http.StatusCreated)
+	created := decodeEnvelope[model.Provider](t, rec)
+	read := a.request(accessInput("ecs", "read"))
+	requireStatus(t, a.credential(read.ID), http.StatusOK)
+	cred, _ := a.srv.db.GetLeaseCredential(context.Background(), read.ID)
+
+	bodies := map[string]string{"create": rec.Body.String()}
+	for _, path := range []string{supAccounts, supAccounts + "/" + created.ID, "/api/v1/supervisor/audit?limit=200",
+		"/api/v1/supervisor/leases", "/api/v1/supervisor/leases/" + read.ID, "/api/v1/supervisor/settings", "/api/v1/me/accounts"} {
+		r := a.sup.do(http.MethodGet, path, nil)
+		requireStatus(t, r, http.StatusOK)
+		bodies[path] = r.Body.String()
+	}
+	for _, path := range []string{supAccounts + "/" + created.ID + "/test", supAccounts + "/" + created.ID + "/rotate"} {
+		r := a.sup.do(http.MethodPost, path, model.RotateProviderCredentialInput{AccessKeyID: "LTAI5tRotatedCanary1", AccessKeySecret: "rotated-canary-secret"})
+		bodies[path] = r.Body.String()
+	}
+	for where, body := range bodies {
+		for _, secret := range []string{canaryID, canarySecret, "rotated-canary-secret", cred, a.token, a.sup.csrf} {
+			if secret != "" && strings.Contains(body, secret) {
+				t.Errorf("%s contains a secret", where)
+			}
+		}
+	}
+	// A supervisor session cannot fetch a credential.
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/agent/leases/"+read.ID+"/credential", nil), http.StatusUnauthorized)
+}
+
+// Every new write refuses a request without the CSRF token or from another
+// origin.
+func TestEverySupervisorWriteNeedsCSRF(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	pending := a.request(accessInput("ecs", "write"))
+	writes := []struct {
+		method, path string
+		body         any
+	}{
+		{http.MethodPost, supAccounts, newMockAccount("x", "6543210987654321")},
+		{http.MethodPatch, supAccounts + "/" + a.providerID, map[string]string{"status": "disabled"}},
+		{http.MethodPost, supAccounts + "/" + a.providerID + "/rotate", model.RotateProviderCredentialInput{AccessKeyID: "LTAI5tRotatedKeyId2", AccessKeySecret: "x"}},
+		{http.MethodPost, supAccounts + "/" + a.providerID + "/test", nil},
+		{http.MethodPut, "/api/v1/supervisor/settings", model.DefaultPolicySettings()},
+		{http.MethodPost, "/api/v1/supervisor/leases/" + pending.ID + "/deny", model.DenyLeaseInput{Reason: "x"}},
+		{http.MethodPost, "/api/v1/supervisor/leases/" + pending.ID + "/revoke", nil},
+	}
+	for _, w := range writes {
+		for name, headers := range map[string]map[string]string{
+			"no token":     nil,
+			"cross origin": {csrfHeader: a.sup.csrf, "Origin": "https://evil.example"},
+		} {
+			if code := a.testEnv.request(w.method, w.path, a.sup.cookie, headers, w.body).Code; code != http.StatusForbidden {
+				t.Errorf("%s %s (%s) = %d", w.method, w.path, name, code)
+			}
+		}
+	}
+	prov, _ := a.srv.db.GetProvider(context.Background(), a.providerID)
+	if prov.Status != model.ProviderActive || a.status(pending.ID) != model.LeasePending {
+		t.Fatal("a refused write changed something")
+	}
 }

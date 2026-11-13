@@ -657,7 +657,10 @@ func (s *Server) handleListMyAccounts(w http.ResponseWriter, r *http.Request) {
 			s.writeHandlerError(w, err)
 			return
 		}
-		highest := capcatalog.PermissionRead
+		// An unknown role allows nothing, and a disabled account (or one
+		// without a cloud account ID) issues nothing: show no level rather
+		// than one requests would not get.
+		var highest capcatalog.Permission
 		for _, p := range capcatalog.Permissions() {
 			if b.Role.Permits(p.Access()) {
 				highest = p
@@ -666,6 +669,9 @@ func (s *Server) handleListMyAccounts(w http.ResponseWriter, r *http.Request) {
 		_, level, automatic := automaticLevel(actor.person, prov, now)
 		if automatic.Rank() > model.ApprovalMode(highest).Rank() {
 			automatic = model.ApprovalMode(highest)
+		}
+		if prov.Status != model.ProviderActive || prov.CloudAccountID == "" {
+			automatic = ""
 		}
 		accounts = append(accounts, model.PersonAccount{
 			ProviderID: prov.ID, CloudAccountID: prov.CloudAccountID, Name: prov.Name,

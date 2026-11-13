@@ -150,7 +150,7 @@ func (s *Server) buildHandler() http.Handler {
 	root.HandleFunc("/mock-cloud/", s.handleMockCloud)
 	root.HandleFunc("/", s.handleStatic)
 
-	return s.withAccessLog(s.recoverPanics(root))
+	return s.withAccessLog(s.recoverPanics(runToCompletion(root)))
 }
 
 // ================= middleware =================
@@ -625,7 +625,8 @@ func sanitizeSessionName(name string) string {
 
 // appendAudit appends an audit event, logging (never leaking) append failures.
 func (s *Server) appendAudit(ctx context.Context, ev model.AuditEvent) {
-	if err := s.db.AppendAudit(ctx, &ev); err != nil {
+	// An audit record must not be lost because the caller went away.
+	if err := s.db.AppendAudit(context.WithoutCancel(ctx), &ev); err != nil {
 		s.logf("audit append failed: %v", err)
 	}
 }
@@ -727,4 +728,19 @@ func denyDecisionReasons(decision model.PolicyDecision) []string {
 		}
 	}
 	return out
+}
+
+// runToCompletion detaches state-changing requests from the client's
+// connection. A browser that aborts after an authority change has been
+// written (a cloud account disabled, settings lowered, a key rotated) would
+// otherwise cancel the request context and stop the lease sweep and the
+// audit record that follow the write, leaving a committed change with no
+// record of who made it. Reads stay cancellable.
+func runToCompletion(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isSafeMethod(r.Method) {
+			r = r.WithContext(context.WithoutCancel(r.Context()))
+		}
+		next.ServeHTTP(w, r)
+	})
 }

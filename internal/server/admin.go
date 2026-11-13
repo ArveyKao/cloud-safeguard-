@@ -291,6 +291,7 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	changed := make([]string, 0, 4)
+	values := map[string]any{}
 	if in.Name != nil {
 		name := strings.TrimSpace(*in.Name)
 		if name == "" {
@@ -309,6 +310,7 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if prov.Region != region {
+			values["region"] = map[string]string{"from": prov.Region, "to": region}
 			prov.Region = region
 			changed = append(changed, "region")
 		}
@@ -321,6 +323,7 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 				"role_arn must stay in the same cloud account; connect the other account as a new provider")
 			return
 		}
+		values["role_arn"] = map[string]string{"from": prov.RoleARN, "to": *in.RoleARN}
 		prov.RoleARN = *in.RoleARN
 		changed = append(changed, "role_arn")
 	}
@@ -330,6 +333,7 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if prov.Status != *in.Status {
+			values["status"] = map[string]string{"from": string(prov.Status), "to": string(*in.Status)}
 			prov.Status = *in.Status
 			changed = append(changed, "status")
 		}
@@ -353,8 +357,15 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 		}
 		revoked = ids
 	}
-	s.adminAudit(r.Context(), "provider.updated", "ok", "info", "provider", prov.ID, map[string]any{
+	// Repointing the role or switching an account on or off changes what
+	// credentials can do: record it as a warning.
+	severity := "info"
+	if values["role_arn"] != nil || values["status"] != nil {
+		severity = "warning"
+	}
+	s.adminAudit(r.Context(), "provider.updated", "ok", severity, "provider", prov.ID, map[string]any{
 		"changed_fields":    changed,
+		"changes":           values,
 		"revoked_lease_ids": revoked,
 	})
 	s.writeData(w, http.StatusOK, prov)

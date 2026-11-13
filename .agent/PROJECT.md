@@ -76,6 +76,9 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   under `/api/v1/supervisor/`, reusing the operator handlers with actions attributed to the
   signed-in supervisor; `GET /api/v1/me/accounts` for everyone. Verified locally; not yet
   committed or cross-family reviewed. Step 1 of the four-step plan below is done.
+- **Open decision (review of 7d486a5, F2):** a supervisor receives the one-time setup code
+  when creating or resetting a person, so they can complete setup themselves and act as that
+  person (approve requests, sign in agents). Waiting for the owner's choice of mitigation.
 - **Agreed next (owner, 2026-11-11):** remove the admin token and the §16 agent model once
   supervisors can manage cloud accounts, audit and settings, and the console and `csg` use the
   new login. Supervisors keep an emergency revoke/deny, never approve.
