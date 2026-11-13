@@ -79,6 +79,10 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 - **Decided (review of 7d486a5, F2, owner 2026-11-12): accept and trace.** Supervisors are
   trusted to hand over setup codes; every setup records who issued the code (schema v7) and the
   setup-completed audit event names the issuer.
+- **Agent CLI and MCP server (2026-11-12):** `csg login` agent sign-in, `csg accounts`,
+  `csg access request|status`, `csg exec --account`, and `csg mcp` (five tools; credentials go
+  to a 0600 file, never to the model). End-to-end tests against a real server. Verified
+  locally; not yet committed or cross-family reviewed. Step 2 of the four-step plan is done.
 - **Agreed next (owner, 2026-11-11):** remove the admin token and the §16 agent model once
   supervisors can manage cloud accounts, audit and settings, and the console and `csg` use the
   new login. Supervisors keep an emergency revoke/deny, never approve.

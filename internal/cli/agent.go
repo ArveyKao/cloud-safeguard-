@@ -266,19 +266,22 @@ func (a *App) runExec(args []string) error {
 		return usagef("exec requires a command after --")
 	}
 
-	fs := a.newFlagSet("exec", `Usage: csg exec --capability ID [--param k=v]... [--ttl DUR] [--reason TEXT]
+	fs := a.newFlagSet("exec", `Usage: csg exec --account ID --resource R --permission P --ttl DUR [--name NAME]
+                [--reason TEXT] [--keep] [--wait DUR] -- CMD [ARGS...]
+       csg exec --capability ID [--param k=v]... [--ttl DUR] [--reason TEXT]
                 [--break-glass] [--keep] [--wait DUR] -- CMD [ARGS...]
 
-Requests a lease, injects the Alibaba Cloud credential environment variables and
-runs CMD. The lease is revoked when CMD exits unless --keep is given. The child's
-exit code becomes csg's exit code.
+Asks for access, injects the Alibaba Cloud credential environment variables and
+runs CMD. The credential is revoked when CMD exits unless --keep is given. The
+child's exit code becomes csg's exit code. The first form is for agents signed
+in with csg login; the second is the older capability lease.
 `)
 	cf := a.addClientFlags(fs)
-	capability := fs.String("capability", "", "capability ID (required)")
+	af := addAccessFlags(fs)
+	capability := fs.String("capability", "", "capability ID (older capability leases)")
 	var params paramValues
 	fs.Var(&params, "param", "capability parameter key=value (repeatable)")
-	ttl := fs.String("ttl", "", "requested lease TTL")
-	reason := fs.String("reason", "", "justification for the access")
+	ttl, reason := af.ttl, af.reason
 	breakGlass := fs.Bool("break-glass", false, "request break-glass access")
 	keep := fs.Bool("keep", false, "keep the lease active after the command exits")
 	wait := fs.String("wait", "120s", "wait up to DUR for approval (default 2m)")
@@ -289,8 +292,26 @@ exit code becomes csg's exit code.
 	if len(positionals) != 0 {
 		return usagef("exec flags must come before --: unexpected arguments %v", positionals)
 	}
+	if strings.TrimSpace(*af.account) != "" {
+		if strings.TrimSpace(*capability) != "" {
+			return usagef("use either --account or --capability, not both")
+		}
+		in, err := af.input()
+		if err != nil {
+			return err
+		}
+		waitSeconds, err := parseDurationSeconds(*wait)
+		if err != nil {
+			return usagef("--wait: %v", err)
+		}
+		client, err := a.agentClient(cf)
+		if err != nil {
+			return err
+		}
+		return a.execWithAccess(client, in, time.Duration(waitSeconds)*time.Second, *keep, cmdArgs)
+	}
 	if strings.TrimSpace(*capability) == "" {
-		return usagef("exec requires --capability")
+		return usagef("exec requires --account (or --capability)")
 	}
 	ttlSeconds, err := parseOptionalDurationSeconds(*ttl)
 	if err != nil {

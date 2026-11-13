@@ -266,7 +266,9 @@ func (c *apiClient) do(ctx context.Context, method, path string, body, out any) 
 	if err != nil {
 		return fmt.Errorf("cannot build request: %v", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

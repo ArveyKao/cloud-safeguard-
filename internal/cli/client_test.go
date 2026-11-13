@@ -198,8 +198,10 @@ func TestLoginValidation(t *testing.T) {
 	if code := ta.run("login", "--token", adminTokenA); code != ExitUsage {
 		t.Fatalf("login without server exit = %d, want %d", code, ExitUsage)
 	}
-	if code := ta.run("login", "--server", srv.URL); code != ExitUsage {
-		t.Fatalf("login without token exit = %d, want %d", code, ExitUsage)
+	// Without --token, login starts an agent sign-in; this fake server
+	// refuses everything, so the sign-in fails as an auth error.
+	if code := ta.run("login", "--server", srv.URL); code != ExitAuth {
+		t.Fatalf("login without token exit = %d, want %d", code, ExitAuth)
 	}
 	if code := ta.run("login", "--server", srv.URL, "--token", "not-a-csg-token"); code != ExitUsage {
 		t.Fatalf("login with unknown prefix exit = %d, want %d", code, ExitUsage)

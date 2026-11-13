@@ -19,13 +19,23 @@ type agentMe struct {
 
 // runLogin implements `csg login`.
 func (a *App) runLogin(args []string) error {
-	fs := a.newFlagSet("login", `Usage: csg login --server URL --token TOKEN [--json]
+	fs := a.newFlagSet("login", `Usage: csg login --server URL [--name NAME] [--description TEXT] [--json]
+       csg login --server URL --token TOKEN [--json]
 
-Validates an admin or agent token against the control plane and saves it to
-~/.config/cloud-safeguard/config.json with 0600 permissions.
+Without --token: signs this agent in. csg shows a short code and a link; a
+person opens the link in the console, checks the code and approves. The agent
+then belongs to that person and inherits their role on each cloud account.
+No token is copied by hand.
+
+With --token: validates an admin or agent token and saves it.
+
+Either way the result is saved to ~/.config/cloud-safeguard/config.json with
+0600 permissions.
 `)
-	server := fs.String("server", "", "control plane URL (required)")
-	tokenFlag := fs.String("token", "", "admin (csg_adm_) or agent (csg_agt_) bearer token (required)")
+	server := fs.String("server", "", "control plane URL (default: $CSG_SERVER or saved config)")
+	tokenFlag := fs.String("token", "", "admin (csg_adm_) or agent (csg_agt_) bearer token")
+	name := fs.String("name", "", "agent name shown to the person who approves (default: csg-<hostname>)")
+	description := fs.String("description", "", "optional description shown with the sign-in")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
@@ -34,8 +44,15 @@ Validates an admin or agent token against the control plane and saves it to
 	if len(positionals) != 0 {
 		return usagef("login takes no positional arguments")
 	}
-	if strings.TrimSpace(*server) == "" || strings.TrimSpace(*tokenFlag) == "" {
-		return usagef("login requires --server and --token")
+	if strings.TrimSpace(*tokenFlag) == "" {
+		serverURL, err := a.resolveServer(&clientFlags{server: *server})
+		if err != nil {
+			return err
+		}
+		return a.agentSignIn(serverURL, *name, *description, *jsonOut)
+	}
+	if strings.TrimSpace(*server) == "" {
+		return usagef("login with --token requires --server")
 	}
 
 	serverURL := normalizeServer(*server)

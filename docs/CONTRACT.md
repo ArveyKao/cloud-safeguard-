@@ -948,11 +948,33 @@ agent or the request.
   an agent, a re-sign-in) is recorded as the control plane's, with `caused_by`, `owner_id`,
   `agent_id` and `agent_name` in its metadata.
 
-### 17.7 MCP server
+### 17.7 MCP server and agent CLI
 
-Tools: `request_access` (the §17.4 fields), `check_status`, `get_credential`, `revoke`,
-`list_accounts` (accounts and the owner's role on each). The MCP server is a thin client of the
-agent API; it holds the agent token and no cloud credentials beyond the lease it fetched.
+`csg mcp` runs the MCP server on stdio (protocol revisions 2025-06-18, 2025-03-26, 2024-11-05).
+It is a thin client of the agent API and holds only the agent token saved by `csg login`.
+
+| Tool | Does |
+| --- | --- |
+| `list_accounts` | Cloud accounts the agent may ask for, with the inherited role, highest permission and `automatic_up_to`. |
+| `request_access` | The §17.4 fields: `cloud_account_id`, `resource`, `permission`, `ttl_seconds`, optional `resource_name` and `reason`. |
+| `check_status` | Status of a request. |
+| `get_credential` | Writes the credential to `~/.config/cloud-safeguard/credentials/<request id>.env` (directory 0700, file 0600) as `export` lines and returns only the path, expiry and `source <path>`. The secret is never returned to the model, so it stays out of transcripts, logs and model-provider requests. |
+| `revoke` | Ends the request and deletes its credential file. |
+
+Request IDs are validated (`lea_` + 32 hex) before use, so a tool argument can never name another
+file.
+
+Agent CLI, same flow from a terminal:
+
+- `csg login --server URL [--name NAME]` without `--token` runs the agent-first sign-in: it
+  prints the link and the short code, waits for a person to approve, and saves the agent token
+  (0600). The device code and the token are never printed. `csg login --token` still saves a
+  token directly.
+- `csg accounts`, `csg access request --account ID --resource R --permission P --ttl DUR
+  [--name] [--reason] [--wait]`, `csg access status ID`.
+- `csg exec --account ID --resource R --permission P --ttl DUR -- CMD` asks for access, runs
+  CMD with the credential environment and revokes it when CMD exits (unless `--keep`).
+- `csg credential --lease ID --export` and `csg revoke --lease ID` work with a request ID.
 
 ### 17.8 Implementation status
 
@@ -967,7 +989,7 @@ agent API; it holds the agent token and no cloud credentials beyond the lease it
 | Supervisor API for cloud accounts, settings, audit and the emergency stop | implemented (API) |
 | Removal of the admin token and the §16 agent model | not started; follows the CLI, MCP and console work |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
-| MCP server (§17.7) | not started |
+| MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
 | Console redesign | not started |
 
 Until the remaining parts ship, the §2 admin token and the §16 agent API keep working

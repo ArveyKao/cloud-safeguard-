@@ -78,6 +78,10 @@ type App struct {
 	Getenv     func(string) string
 	HomeDir    func() (string, error)
 	HTTPClient HTTPDoer // optional; nil uses the default client
+
+	// afterSignInStart runs once an agent sign-in has started (tests use it
+	// to approve the sign-in as a person).
+	afterSignInStart func(model.AgentSignInStart)
 }
 
 // NewApp returns an App wired to the real process environment.
@@ -159,6 +163,12 @@ func (a *App) Run(args []string) int {
 		err = a.runExec(rest)
 	case "revoke":
 		err = a.runRevoke(rest)
+	case "accounts":
+		err = a.runAccounts(rest)
+	case "access":
+		err = a.runAccess(rest)
+	case "mcp":
+		err = a.runMCP(rest)
 	case "mock":
 		err = a.runMock(rest)
 	default:
@@ -212,8 +222,14 @@ Local:
   version    Print the version
 
 Authentication:
-  login      Validate and save an admin or agent token
+  login      Sign this agent in (a person approves a short code), or save a token
   whoami     Show the current identity
+
+Agent (signed in with csg login):
+  accounts   Cloud accounts you may ask for, with your owner's role
+  access     request | status: ask for read, write or full access
+  exec       Ask for access and run a command with the credential env
+  mcp        Run the MCP server for Claude, Cursor and other agents
 
 Admin:
   caps       list | show ID
@@ -223,7 +239,7 @@ Admin:
   audit      list | verify
   policy     show | set
 
-Agent:
+Agent (older capability leases):
   request    Request a capability lease
   credential Fetch the credential for a lease
   exec       Request a lease and run a command with the credential env
