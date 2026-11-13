@@ -955,6 +955,8 @@ agent API; it holds the agent token and no cloud credentials beyond the lease it
 | Agent ownership and agent-first sign-in (§17.3 item 2) | implemented (API), schema version 4; CLI and console not yet |
 | Five-field request, permission levels, owner approval (§17.4, §17.5) | implemented (API), schema version 5; CLI and console not yet |
 | Approval modes and per-account highest automatic level (§17.5) | implemented (API), schema version 6 |
+| Supervisor API for cloud accounts, settings, audit and the emergency stop | implemented (API) |
+| Removal of the admin token and the §16 agent model | not started; follows the CLI, MCP and console work |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) | not started |
 | Console redesign | not started |
@@ -978,3 +980,16 @@ unchanged alongside the new endpoints:
   `POST /api/v1/me/requests/{id}/approve|deny|revoke` (person session)
 - `PUT /api/v1/me/approval-mode` (person session; the current mode is in `GET /auth/me`),
   `PUT /api/v1/supervisor/accounts/{provider_id}/auto-level` (supervisor)
+- `GET /api/v1/me/accounts` (person session): the person's own cloud accounts with their
+  role, the account's highest automatic level and what their agents get there automatically
+- Supervisor session, same request and response bodies as the operator's routes:
+  - cloud accounts: `GET|POST /api/v1/supervisor/accounts`,
+    `GET|PATCH /api/v1/supervisor/accounts/{id}`,
+    `POST /api/v1/supervisor/accounts/{id}/rotate|test`
+  - settings: `GET|PUT /api/v1/supervisor/settings`
+  - audit: `GET /api/v1/supervisor/audit`, `GET /api/v1/supervisor/audit/verify`
+  - emergency stop: `GET /api/v1/supervisor/leases[/{id}]`,
+    `POST /api/v1/supervisor/leases/{id}/deny|revoke`. There is no approve route: a
+    supervisor can stop any request or credential, never grant one.
+  - Every action is recorded under the supervisor's own name. Creating a cloud account gives
+    nobody a role on it, its creator included.

@@ -72,6 +72,10 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   expiry); a supervisor sets each cloud account's highest automatic level (default read);
   automatic = the lower of the two, after the role check. Schema v6. Built by Lead, verified
   locally (tests, race, demo, live run); not yet committed or cross-family reviewed.
+- **Supervisor API (2026-11-12):** cloud accounts, settings, audit and the emergency stop
+  under `/api/v1/supervisor/`, reusing the operator handlers with actions attributed to the
+  signed-in supervisor; `GET /api/v1/me/accounts` for everyone. Verified locally; not yet
+  committed or cross-family reviewed. Step 1 of the four-step plan below is done.
 - **Agreed next (owner, 2026-11-11):** remove the admin token and the §16 agent model once
   supervisors can manage cloud accounts, audit and settings, and the console and `csg` use the
   new login. Supervisors keep an emergency revoke/deny, never approve.

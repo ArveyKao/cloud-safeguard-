@@ -633,3 +633,46 @@ func automaticLevel(owner model.Person, prov model.Provider, now time.Time) (mod
 	}
 	return mode, level, automatic
 }
+
+// handleListMyAccounts implements GET /api/v1/me/accounts: the cloud accounts
+// the signed-in person has a role on, with what their agents get there.
+// Everyone sees only their own accounts; supervisors manage all of them under
+// /supervisor/accounts.
+func (s *Server) handleListMyAccounts(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	actor, _ := sessionFromContext(ctx)
+	bindings, err := s.db.ListBindings(ctx, actor.person.ID, "")
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	now := s.nowUTC()
+	accounts := make([]model.PersonAccount, 0, len(bindings))
+	for _, b := range bindings {
+		prov, err := s.db.GetProvider(ctx, b.ProviderID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			s.writeHandlerError(w, err)
+			return
+		}
+		highest := capcatalog.PermissionRead
+		for _, p := range capcatalog.Permissions() {
+			if b.Role.Permits(p.Access()) {
+				highest = p
+			}
+		}
+		_, level, automatic := automaticLevel(actor.person, prov, now)
+		if automatic.Rank() > model.ApprovalMode(highest).Rank() {
+			automatic = model.ApprovalMode(highest)
+		}
+		accounts = append(accounts, model.PersonAccount{
+			ProviderID: prov.ID, CloudAccountID: prov.CloudAccountID, Name: prov.Name,
+			ProviderType: prov.Type, Status: prov.Status, Role: b.Role,
+			HighestPermission: string(highest), MaxAutoLevel: level, AutomaticUpTo: string(automatic),
+		})
+	}
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Name < accounts[j].Name })
+	writeList(s, w, http.StatusOK, accounts, len(accounts))
+}

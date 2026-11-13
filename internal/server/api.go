@@ -103,6 +103,7 @@ func (s *Server) buildHandler() http.Handler {
 	meMux.HandleFunc("GET /api/v1/me/agents", s.handleListMyAgents)
 	meMux.HandleFunc("POST /api/v1/me/agents/{id}/revoke", s.handleRevokeMyAgent)
 	meMux.HandleFunc("PUT /api/v1/me/approval-mode", s.handleSetMyApprovalMode)
+	meMux.HandleFunc("GET /api/v1/me/accounts", s.handleListMyAccounts)
 	meMux.HandleFunc("GET /api/v1/me/requests", s.handleListMyRequests)
 	meMux.HandleFunc("POST /api/v1/me/requests/{id}/approve", s.handleApproveMyRequest)
 	meMux.HandleFunc("POST /api/v1/me/requests/{id}/deny", s.handleDenyMyRequest)
@@ -118,6 +119,24 @@ func (s *Server) buildHandler() http.Handler {
 	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/people/{person}", s.handlePutBinding)
 	supervisorMux.HandleFunc("DELETE /api/v1/supervisor/accounts/{provider}/people/{person}", s.handleDeleteBinding)
 	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/auto-level", s.handleSetAccountAutoLevel)
+	// Cloud accounts, settings, audit and the emergency stop (CONTRACT §17.8).
+	// They reuse the operator's handlers; actions are attributed to the
+	// signed-in supervisor. There is deliberately no approve route: a
+	// supervisor can stop any request or credential but never grant one.
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts", s.handleAdminListProviders)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts", s.handleAdminCreateProvider)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts/{id}", s.handleAdminGetProvider)
+	supervisorMux.HandleFunc("PATCH /api/v1/supervisor/accounts/{id}", s.handleAdminUpdateProvider)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/rotate", s.handleAdminRotateProvider)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/test", s.handleAdminTestProvider)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/settings", s.handleAdminGetPolicy)
+	supervisorMux.HandleFunc("PUT /api/v1/supervisor/settings", s.handleAdminPutPolicy)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit", s.handleAdminListAudit)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit/verify", s.handleAdminVerifyAudit)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases", s.handleAdminListLeases)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases/{id}", s.handleAdminGetLease)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/deny", s.handleAdminDenyLease)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/revoke", s.handleAdminRevokeLease)
 	supervisorMux.HandleFunc("/", s.handleUnknownAPI)
 
 	root := http.NewServeMux()
@@ -636,7 +655,15 @@ func (s *Server) agentAudit(ctx context.Context, ag model.Agent, action, status,
 }
 
 // adminAudit appends an audit event attributed to the operator.
+//
+// The same handlers serve the operator token and supervisors (CONTRACT §17.8).
+// When the request runs in a person's console session, the event names that
+// person; only the operator token is recorded as "operator".
 func (s *Server) adminAudit(ctx context.Context, action, status, severity, targetType, targetID string, metadata map[string]any) {
+	if sc, ok := sessionFromContext(ctx); ok {
+		s.personAudit(ctx, sc.person, action, status, severity, targetType, targetID, metadata)
+		return
+	}
 	s.appendAudit(ctx, model.AuditEvent{
 		ActorType:  "admin",
 		ActorID:    "admin",

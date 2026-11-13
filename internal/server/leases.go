@@ -891,7 +891,11 @@ func (s *Server) handleAdminRevokeLease(w http.ResponseWriter, r *http.Request) 
 		s.writeHandlerError(w, err)
 		return
 	}
-	reason, err := revokeReason(in.Reason, "revoked by operator")
+	fallback := "revoked by operator"
+	if sc, ok := sessionFromContext(r.Context()); ok {
+		fallback = "revoked by supervisor " + sc.person.Username
+	}
+	reason, err := revokeReason(in.Reason, fallback)
 	if err != nil {
 		s.writeHandlerError(w, err)
 		return
@@ -1372,6 +1376,9 @@ func (s *Server) revokeLease(ctx context.Context, lease model.Lease, reason stri
 		s.agentAudit(ctx, *actor, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
 	} else {
 		metadata["actor"] = "admin"
+		if sc, ok := sessionFromContext(ctx); ok {
+			metadata["actor"] = "person:" + sc.person.ID
+		}
 		s.adminAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
 	}
 	return updated, nil

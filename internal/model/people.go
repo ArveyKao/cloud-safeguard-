@@ -314,3 +314,21 @@ func (p Person) AsOf(now time.Time) Person {
 	}
 	return p
 }
+
+// PersonAccount is one cloud account a person has a role on, as shown to
+// that person in the console.
+type PersonAccount struct {
+	ProviderID     string         `json:"provider_id"`
+	CloudAccountID string         `json:"cloud_account_id"`
+	Name           string         `json:"name"`
+	ProviderType   ProviderType   `json:"provider_type"`
+	Status         ProviderStatus `json:"status"`
+	Role           Role           `json:"role"`
+	// HighestPermission is the highest permission the role allows.
+	HighestPermission string `json:"highest_permission"`
+	// MaxAutoLevel is the account's highest automatic level (set by a
+	// supervisor); AutomaticUpTo is what the person's agents get without
+	// asking here: the lowest of role, mode and level.
+	MaxAutoLevel  ApprovalMode `json:"max_auto_level"`
+	AutomaticUpTo string       `json:"automatic_up_to"`
+}
