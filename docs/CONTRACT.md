@@ -770,6 +770,15 @@ merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR
      and enrolls an authenticator app; a correct first code activates the account, consumes
      the setup code and signs them in. Until then the code can be used again to choose a
      different password, which also replaces the authenticator secret. Supervisors never see or set passwords.
+   - **Who holds the code.** A setup code is a bearer secret: whoever uses it first sets the
+     password, so the supervisor who issued it could complete the setup and act as that
+     person. This is accepted (owner's decision, 2026-11-12): supervisors are trusted to hand
+     codes over. It is traced instead: every person records who issued their current setup
+     code, how (`created`, `reset`, `recovered`, `bootstrap`) and when (`setup_issued` on the
+     person, visible to the person in `GET /auth/me` and to supervisors in the people list),
+     and the `person.setup_completed` audit event names the issuer. The console shows the
+     person who created or reset their account, so a person who did not set their own
+     password can tell another supervisor.
    - **Login.** Every failure returns the same 401, whatever the cause. A TOTP code works
      once: the accepted time step is consumed atomically. Five consecutive failures lock the
      account for 15 minutes. The limit is exact under parallel requests: attempts for one
