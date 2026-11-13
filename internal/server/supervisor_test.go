@@ -420,3 +420,64 @@ func TestEverySupervisorWriteNeedsCSRF(t *testing.T) {
 		t.Fatal("a refused write changed something")
 	}
 }
+
+// Whoever holds a setup code can complete the setup, so every setup records
+// who issued the code; the person and other supervisors can see it, and the
+// setup-completed event names the issuer (owner's decision: accept and trace).
+func TestSetupCodeIssuerIsTraced(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	issued := func(p model.Person) model.SetupIssue {
+		t.Helper()
+		if p.SetupIssued == nil {
+			t.Fatalf("%s has no setup issuer", p.Username)
+		}
+		return *p.SetupIssued
+	}
+
+	// The bootstrap supervisor came from csg init.
+	if got := issued(a.sup.person); got.ByID != "system" || got.Kind != model.SetupBootstrap {
+		t.Fatalf("bootstrap issuer = %+v", got)
+	}
+
+	// A created person: issued by the supervisor, shown to the person.
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/people", model.CreatePersonInput{Username: "jun"})
+	requireStatus(t, rec, http.StatusCreated)
+	created := decodeEnvelope[model.PersonWithSetupCode](t, rec)
+	if got := issued(created.Person); got.ByID != a.sup.person.ID || got.ByName != a.sup.person.Username || got.Kind != model.SetupCreated {
+		t.Fatalf("created issuer = %+v", got)
+	}
+	jun := a.completeSetup(created.SetupCode)
+	rec = jun.do(http.MethodGet, "/api/v1/auth/me", nil)
+	if got := issued(decodeEnvelope[model.SessionInfo](t, rec).Person); got.ByID != a.sup.person.ID || got.Kind != model.SetupCreated {
+		t.Fatalf("/auth/me issuer = %+v", got)
+	}
+
+	// A reset used by the supervisor themselves: the account now acts as mei,
+	// but the setup-completed event and mei's record name the supervisor.
+	rec = a.sup.do(http.MethodPost, "/api/v1/supervisor/people/"+a.mei.person.ID+"/reset", nil)
+	requireStatus(t, rec, http.StatusOK)
+	reset := decodeEnvelope[model.PersonWithSetupCode](t, rec)
+	a.completeSetup(reset.SetupCode)
+	ev := a.lastEvent("person.setup_completed")
+	if ev.ActorID != a.mei.person.ID || ev.Metadata["setup_issued_by"] != a.sup.person.ID ||
+		ev.Metadata["setup_issued_by_name"] != a.sup.person.Username || ev.Metadata["setup_issued_kind"] != model.SetupReset {
+		t.Fatalf("setup completed event = %+v", ev)
+	}
+	rec = a.sup.do(http.MethodGet, "/api/v1/supervisor/people", nil)
+	for _, p := range decodeEnvelope[listData[model.Person]](t, rec).Items {
+		if p.ID == a.mei.person.ID {
+			if got := issued(p); got.ByID != a.sup.person.ID || got.Kind != model.SetupReset {
+				t.Fatalf("people list issuer = %+v", got)
+			}
+		}
+	}
+
+	// Local recovery is issued by the system.
+	if _, err := RecoverSupervisor(context.Background(), RecoverOptions{DataDir: a.dir, Username: a.sup.person.Username}); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := a.srv.db.GetPerson(context.Background(), a.sup.person.ID)
+	if got := issued(p); got.ByID != "system" || got.Kind != model.SetupRecovered {
+		t.Fatalf("recovery issuer = %+v", got)
+	}
+}

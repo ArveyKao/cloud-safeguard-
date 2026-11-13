@@ -30,7 +30,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 6
+const CurrentSchemaVersion = 7
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -235,6 +235,14 @@ var migrations = []migration{
 			`ALTER TABLE persons ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'read'`,
 			`ALTER TABLE persons ADD COLUMN approval_mode_expires_at INTEGER`,
 			`ALTER TABLE providers ADD COLUMN max_auto_level TEXT NOT NULL DEFAULT 'read'`,
+		},
+	},
+	{ // version 6 -> 7: who issued each setup code (CONTRACT §17.3)
+		statements: []string{
+			`ALTER TABLE persons ADD COLUMN setup_issued_by TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE persons ADD COLUMN setup_issued_by_name TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE persons ADD COLUMN setup_issued_kind TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE persons ADD COLUMN setup_issued_at INTEGER`,
 		},
 	},
 }

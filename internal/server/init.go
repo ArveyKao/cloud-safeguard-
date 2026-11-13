@@ -467,7 +467,8 @@ func bootstrapSupervisor(ctx context.Context, db *store.DB, username string, now
 	if !ok {
 		return nil, fmt.Errorf("server: invalid supervisor username %q", username)
 	}
-	created, err := newPersonWithSetupCode(ctx, db, name, "", true, now)
+	created, err := newPersonWithSetupCode(ctx, db, name, "", true, now,
+		model.SetupIssue{ByID: "system", ByName: "csg init", Kind: model.SetupBootstrap})
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			return nil, fmt.Errorf("server: username %q exists but is not a supervisor; run `csg supervisor recover`", name)
@@ -530,6 +531,7 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 	now := time.Now().UTC()
 	var out model.PersonWithSetupCode
 	revokedLeases := []string{}
+	recoveryIssue := model.SetupIssue{ByID: "system", ByName: "csg supervisor recover", Kind: model.SetupRecovered}
 	previousStatus, previousMode := "(new)", model.ModeRead
 	person, err := db.GetPersonByUsername(ctx, username)
 	if err == nil {
@@ -538,7 +540,7 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		if out, err = newPersonWithSetupCode(ctx, db, username, "", true, now); err != nil {
+		if out, err = newPersonWithSetupCode(ctx, db, username, "", true, now, recoveryIssue); err != nil {
 			return zero, err
 		}
 	case err != nil:
@@ -552,7 +554,7 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 		if err := db.SetSupervisorFlag(ctx, person.ID, true, now); err != nil {
 			return zero, err
 		}
-		if err := db.ResetPersonSetup(ctx, person.ID, hash, expires, now, false); err != nil {
+		if err := db.ResetPersonSetup(ctx, person.ID, hash, expires, now, false, recoveryIssue); err != nil {
 			return zero, err
 		}
 		// The person is pending now: their agents' leases end with that

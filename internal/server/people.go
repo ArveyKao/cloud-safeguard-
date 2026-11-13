@@ -32,7 +32,7 @@ func cleanDisplayName(raw string) (string, bool) {
 
 // newPersonWithSetupCode creates a pending person and returns the one-time
 // setup code. It is shared by the supervisor API, bootstrap and recovery.
-func newPersonWithSetupCode(ctx context.Context, db *store.DB, username, displayName string, supervisor bool, now time.Time) (model.PersonWithSetupCode, error) {
+func newPersonWithSetupCode(ctx context.Context, db *store.DB, username, displayName string, supervisor bool, now time.Time, issue model.SetupIssue) (model.PersonWithSetupCode, error) {
 	id, err := newID("per_")
 	if err != nil {
 		return model.PersonWithSetupCode{}, err
@@ -45,6 +45,8 @@ func newPersonWithSetupCode(ctx context.Context, db *store.DB, username, display
 		ID: id, Username: username, DisplayName: displayName, Status: model.PersonPending,
 		Supervisor: supervisor, ApprovalMode: model.ModeRead, CreatedAt: now, UpdatedAt: now,
 	}
+	issue.At = now
+	person.SetupIssued = &issue
 	expires := now.Add(setupCodeTTL)
 	if err := db.CreatePerson(ctx, person, hash, expires); err != nil {
 		return model.PersonWithSetupCode{}, err
@@ -83,7 +85,8 @@ func (s *Server) handleCreatePerson(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
-	created, err := newPersonWithSetupCode(ctx, s.db, username, displayName, in.Supervisor, s.nowUTC())
+	created, err := newPersonWithSetupCode(ctx, s.db, username, displayName, in.Supervisor, s.nowUTC(),
+		model.SetupIssue{ByID: actor.person.ID, ByName: actor.person.Username, Kind: model.SetupCreated})
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "username is already taken")
@@ -216,7 +219,8 @@ func (s *Server) handleResetPerson(w http.ResponseWriter, r *http.Request) {
 	}
 	now := s.nowUTC()
 	expires := now.Add(setupCodeTTL)
-	if err := s.db.ResetPersonSetup(ctx, id, hash, expires, now, true); err != nil {
+	if err := s.db.ResetPersonSetup(ctx, id, hash, expires, now, true,
+		model.SetupIssue{ByID: actor.person.ID, ByName: actor.person.Username, Kind: model.SetupReset}); err != nil {
 		if errors.Is(err, store.ErrLastSupervisor) {
 			s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
 				"this is the last active supervisor; make another person a supervisor first")

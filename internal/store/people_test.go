@@ -162,7 +162,7 @@ func TestAuthorityChangesAndSessions(t *testing.T) {
 	if err := db.SetPersonAuthority(ctx, "root", model.PersonActive, false, peopleNow); !errors.Is(err, ErrLastSupervisor) {
 		t.Fatalf("demote last supervisor: %v", err)
 	}
-	if err := db.ResetPersonSetup(ctx, "root", "new", peopleNow.Add(time.Hour), peopleNow, true); !errors.Is(err, ErrLastSupervisor) {
+	if err := db.ResetPersonSetup(ctx, "root", "new", peopleNow.Add(time.Hour), peopleNow, true, testIssue); !errors.Is(err, ErrLastSupervisor) {
 		t.Fatalf("reset last supervisor: %v", err)
 	}
 	if !alive("r1") {
@@ -195,7 +195,7 @@ func TestAuthorityChangesAndSessions(t *testing.T) {
 
 	// Reset without the guard (local recovery) clears credentials and sessions.
 	session("mei", "s3")
-	if err := db.ResetPersonSetup(ctx, "mei", "recovery", peopleNow.Add(time.Hour), peopleNow, false); err != nil {
+	if err := db.ResetPersonSetup(ctx, "mei", "recovery", peopleNow.Add(time.Hour), peopleNow, false, testIssue); err != nil {
 		t.Fatal(err)
 	}
 	auth, _ := db.GetPersonAuth(ctx, "mei")
@@ -298,7 +298,7 @@ func TestSessionNeedsAnActivePerson(t *testing.T) {
 		CreatedAt: peopleNow, LastSeenAt: peopleNow, ExpiresAt: peopleNow.Add(time.Hour)}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("session after suspend: %v", err)
 	}
-	if err := db.ResetPersonSetup(ctx, "root", "again", peopleNow.Add(time.Hour), peopleNow, false); err != nil {
+	if err := db.ResetPersonSetup(ctx, "root", "again", peopleNow.Add(time.Hour), peopleNow, false, testIssue); err != nil {
 		t.Fatal(err)
 	}
 	if err := create("root"); !errors.Is(err, ErrConflict) {
@@ -335,6 +335,10 @@ func TestCloudAccountIDMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
+		`ALTER TABLE persons DROP COLUMN setup_issued_by`,
+		`ALTER TABLE persons DROP COLUMN setup_issued_by_name`,
+		`ALTER TABLE persons DROP COLUMN setup_issued_kind`,
+		`ALTER TABLE persons DROP COLUMN setup_issued_at`,
 		`ALTER TABLE persons DROP COLUMN approval_mode`,
 		`ALTER TABLE persons DROP COLUMN approval_mode_expires_at`,
 		`ALTER TABLE providers DROP COLUMN max_auto_level`,
@@ -431,7 +435,7 @@ func TestSetApprovalModeGuards(t *testing.T) {
 	if err := db.SetApprovalMode(ctx, "mei", model.ModeWrite, nil, peopleNow); !errors.Is(err, ErrConflict) {
 		t.Fatalf("suspended person: %v", err)
 	}
-	if err := db.ResetPersonSetup(ctx, "mei", "again", peopleNow.Add(time.Hour), peopleNow, false); err != nil {
+	if err := db.ResetPersonSetup(ctx, "mei", "again", peopleNow.Add(time.Hour), peopleNow, false, testIssue); err != nil {
 		t.Fatal(err)
 	}
 	if p, _ := db.GetPerson(ctx, "mei"); p.ApprovalMode != model.ModeRead || p.ApprovalModeExpiresAt != nil {
@@ -448,6 +452,10 @@ func TestApprovalModeMigrationDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
+		`ALTER TABLE persons DROP COLUMN setup_issued_by`,
+		`ALTER TABLE persons DROP COLUMN setup_issued_by_name`,
+		`ALTER TABLE persons DROP COLUMN setup_issued_kind`,
+		`ALTER TABLE persons DROP COLUMN setup_issued_at`,
 		`ALTER TABLE persons DROP COLUMN approval_mode`,
 		`ALTER TABLE persons DROP COLUMN approval_mode_expires_at`,
 		`ALTER TABLE providers DROP COLUMN max_auto_level`,
@@ -473,5 +481,36 @@ func TestApprovalModeMigrationDefaults(t *testing.T) {
 	prov, err := db.GetProvider(ctx, "p1")
 	if err != nil || prov.MaxAutoLevel != model.ModeRead {
 		t.Fatalf("provider after migration = %q, %v", prov.MaxAutoLevel, err)
+	}
+}
+
+var testIssue = model.SetupIssue{ByID: "root", ByName: "root", Kind: model.SetupReset}
+
+// Accounts set up before the issuer was recorded have none; a reset records it.
+func TestSetupIssueStorage(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	newPerson(t, db, "root", true)
+	activate(t, db, "root")
+	if p, _ := db.GetPerson(ctx, "root"); p.SetupIssued != nil {
+		t.Fatalf("issuer without one being recorded: %+v", p.SetupIssued)
+	}
+	at := peopleNow.Add(time.Minute)
+	p := model.Person{ID: "jun", Username: "jun", CreatedAt: at, UpdatedAt: at,
+		SetupIssued: &model.SetupIssue{ByID: "root", ByName: "root", Kind: model.SetupCreated, At: at}}
+	if err := db.CreatePerson(ctx, p, "code-jun", at.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.GetPerson(ctx, "jun")
+	if got.SetupIssued == nil || *got.SetupIssued != *p.SetupIssued {
+		t.Fatalf("stored issuer = %+v", got.SetupIssued)
+	}
+	if err := db.ResetPersonSetup(ctx, "jun", "again", at.Add(time.Hour), at, false,
+		model.SetupIssue{ByID: "system", ByName: "csg supervisor recover", Kind: model.SetupRecovered}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetPerson(ctx, "jun")
+	if got.SetupIssued == nil || got.SetupIssued.Kind != model.SetupRecovered || got.SetupIssued.ByID != "system" || !got.SetupIssued.At.Equal(at) {
+		t.Fatalf("issuer after reset = %+v", got.SetupIssued)
 	}
 }

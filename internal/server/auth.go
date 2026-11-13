@@ -434,8 +434,15 @@ func (s *Server) handleSetupFinish(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, "reload person", err)
 		return
 	}
-	s.personAudit(ctx, person, "person.setup_completed", "ok", "info", "person", person.ID,
-		map[string]any{"remote_addr": s.clientAddr(r)})
+	completed := map[string]any{"remote_addr": s.clientAddr(r)}
+	if person.SetupIssued != nil {
+		// Whoever held the code set this account up: record who issued it,
+		// so an account a supervisor set up for themselves is traceable.
+		completed["setup_issued_by"] = person.SetupIssued.ByID
+		completed["setup_issued_by_name"] = person.SetupIssued.ByName
+		completed["setup_issued_kind"] = person.SetupIssued.Kind
+	}
+	s.personAudit(ctx, person, "person.setup_completed", "ok", "info", "person", person.ID, completed)
 	info, err := s.startSession(w, r, person)
 	if err != nil {
 		if errors.Is(err, store.ErrConflict) { // suspended or reset since activation

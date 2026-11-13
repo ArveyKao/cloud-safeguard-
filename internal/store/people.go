@@ -38,7 +38,7 @@ type Session struct {
 }
 
 const personColumns = `id, username, display_name, status, supervisor, last_login_at, created_at, updated_at,
-	approval_mode, approval_mode_expires_at`
+	approval_mode, approval_mode_expires_at, setup_issued_by, setup_issued_by_name, setup_issued_kind, setup_issued_at`
 
 func scanPerson(row rowScanner) (model.Person, error) {
 	var (
@@ -47,10 +47,16 @@ func scanPerson(row rowScanner) (model.Person, error) {
 		lastLogin            *int64
 		createdAt, updatedAt int64
 		modeExpires          *int64
+		issue                model.SetupIssue
+		issuedAt             *int64
 	)
 	if err := row.Scan(&p.ID, &p.Username, &p.DisplayName, &p.Status, &supervisor, &lastLogin, &createdAt, &updatedAt,
-		&p.ApprovalMode, &modeExpires); err != nil {
+		&p.ApprovalMode, &modeExpires, &issue.ByID, &issue.ByName, &issue.Kind, &issuedAt); err != nil {
 		return model.Person{}, mapErr(err)
+	}
+	if issue.Kind != "" && issuedAt != nil {
+		issue.At = fromMillis(*issuedAt)
+		p.SetupIssued = &issue
 	}
 	p.ApprovalModeExpiresAt = timePtr(modeExpires)
 	p.Supervisor = intBool(supervisor)
@@ -62,12 +68,21 @@ func scanPerson(row rowScanner) (model.Person, error) {
 
 // CreatePerson stores a new pending person with the hash of a setup code.
 // It returns ErrConflict when the username is taken.
+// p.SetupIssued, when set, records who issued the setup code.
 func (db *DB) CreatePerson(ctx context.Context, p model.Person, setupCodeHash string, setupExpiresAt time.Time) error {
+	var issue model.SetupIssue
+	var issuedAt *int64
+	if p.SetupIssued != nil {
+		issue = *p.SetupIssued
+		issuedAt = millisPtr(&issue.At)
+	}
 	_, err := db.sql.ExecContext(ctx,
-		`INSERT INTO persons(id, username, display_name, status, supervisor, setup_code_hash, setup_expires_at, created_at, updated_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO persons(id, username, display_name, status, supervisor, setup_code_hash, setup_expires_at, created_at, updated_at,
+			setup_issued_by, setup_issued_by_name, setup_issued_kind, setup_issued_at)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Username, p.DisplayName, string(model.PersonPending), boolInt(p.Supervisor),
-		setupCodeHash, toMillis(setupExpiresAt), toMillis(p.CreatedAt), toMillis(p.UpdatedAt))
+		setupCodeHash, toMillis(setupExpiresAt), toMillis(p.CreatedAt), toMillis(p.UpdatedAt),
+		issue.ByID, issue.ByName, issue.Kind, issuedAt)
 	return mapErr(err)
 }
 
@@ -205,7 +220,8 @@ func (db *DB) explainAuthorityRefusal(ctx context.Context, tx *sql.Tx, id string
 // erasing the password, TOTP secret, lockout state and all sessions. With
 // guard set it refuses (ErrLastSupervisor) to reset the last active
 // supervisor; local recovery passes guard=false.
-func (db *DB) ResetPersonSetup(ctx context.Context, id, setupCodeHash string, setupExpiresAt, now time.Time, guard bool) error {
+// issue records who issued the new setup code.
+func (db *DB) ResetPersonSetup(ctx context.Context, id, setupCodeHash string, setupExpiresAt, now time.Time, guard bool, issue model.SetupIssue) error {
 	return db.withTx(ctx, func(tx *sql.Tx) error {
 		cond := ""
 		if guard {
@@ -214,9 +230,11 @@ func (db *DB) ResetPersonSetup(ctx context.Context, id, setupCodeHash string, se
 		res, err := tx.ExecContext(ctx,
 			`UPDATE persons SET status = 'pending', password_hash = '', totp_secret_enc = '', totp_last_step = -1,
 				approval_mode = 'read', approval_mode_expires_at = NULL,
-				setup_code_hash = ?, setup_expires_at = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
+				setup_code_hash = ?, setup_expires_at = ?, failed_logins = 0, locked_until = NULL, updated_at = ?,
+				setup_issued_by = ?, setup_issued_by_name = ?, setup_issued_kind = ?, setup_issued_at = ?
 			 WHERE id = ?`+cond,
-			setupCodeHash, toMillis(setupExpiresAt), toMillis(now), id)
+			setupCodeHash, toMillis(setupExpiresAt), toMillis(now),
+			issue.ByID, issue.ByName, issue.Kind, toMillis(now), id)
 		if err != nil {
 			return mapErr(err)
 		}

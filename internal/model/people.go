@@ -40,9 +40,15 @@ type Person struct {
 	ApprovalMode ApprovalMode `json:"approval_mode"`
 	// ApprovalModeExpiresAt, when set, is when the mode falls back to read.
 	ApprovalModeExpiresAt *time.Time `json:"approval_mode_expires_at,omitempty"`
-	LastLoginAt           *time.Time `json:"last_login_at,omitempty"`
-	CreatedAt             time.Time  `json:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at"`
+	// SetupIssued records who issued the setup code the person's current
+	// password and authenticator were set up with. Whoever holds a setup
+	// code can complete the setup, so this is what traces an account a
+	// supervisor might have set up themselves; the console shows it to the
+	// person. Nil for accounts set up before it was recorded.
+	SetupIssued *SetupIssue `json:"setup_issued,omitempty"`
+	LastLoginAt *time.Time  `json:"last_login_at,omitempty"`
+	CreatedAt   time.Time   `json:"created_at"`
+	UpdatedAt   time.Time   `json:"updated_at"`
 }
 
 // RoleBinding gives one person a role on one cloud account.
@@ -332,3 +338,21 @@ type PersonAccount struct {
 	MaxAutoLevel  ApprovalMode `json:"max_auto_level"`
 	AutomaticUpTo string       `json:"automatic_up_to"`
 }
+
+// SetupIssue says who issued a person's setup code, how and when.
+type SetupIssue struct {
+	// ByID is the supervisor's person ID, or "system" for csg commands.
+	ByID   string `json:"by_id"`
+	ByName string `json:"by_name"`
+	// Kind is created, reset, recovered or bootstrap.
+	Kind string    `json:"kind"`
+	At   time.Time `json:"at"`
+}
+
+// Kinds of setup issue.
+const (
+	SetupCreated   = "created"
+	SetupReset     = "reset"
+	SetupRecovered = "recovered"
+	SetupBootstrap = "bootstrap"
+)
