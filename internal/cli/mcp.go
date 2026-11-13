@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -144,34 +145,101 @@ and never returned to the model.
 	if a.Stdin == nil {
 		return usagef("mcp needs stdin")
 	}
-	scanner := bufio.NewScanner(a.Stdin)
-	scanner.Buffer(make([]byte, 64*1024), 4<<20)
+	a.sweepCredentialFiles(time.Now())
+	reader := bufio.NewReaderSize(a.Stdin, 64*1024)
 	enc := json.NewEncoder(a.Stdout)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	nullID := json.RawMessage("null")
+	for {
+		line, tooLong, err := readMCPLine(reader, maxMCPMessage)
+		if tooLong {
+			// One oversized message is refused; the session goes on.
+			if err := enc.Encode(mcpResponse{JSONRPC: "2.0", ID: nullID, Error: &mcpError{Code: -32600, Message: "message too large"}}); err != nil {
+				return err
+			}
+		} else if trimmed := strings.TrimSpace(string(line)); trimmed != "" {
+			if out := a.handleMCPLine(client, []byte(trimmed)); out != nil {
+				if err := enc.Encode(out); err != nil {
+					return err
+				}
+			}
 		}
-		var req mcpRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			_ = enc.Encode(mcpResponse{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: &mcpError{Code: -32700, Message: "parse error"}})
-			continue
-		}
-		resp, reply := a.handleMCP(client, req)
-		if !reply {
-			continue
-		}
-		if err := enc.Encode(resp); err != nil {
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			return err
 		}
 	}
-	return scanner.Err()
+}
+
+// maxMCPMessage bounds one JSON-RPC message.
+const maxMCPMessage = 1 << 20
+
+// readMCPLine reads one newline-terminated line. A line longer than max is
+// read to its end and discarded, and tooLong is set.
+func readMCPLine(r *bufio.Reader, max int) (line []byte, tooLong bool, err error) {
+	for {
+		chunk, isPrefix, err := r.ReadLine()
+		if !tooLong {
+			if len(line)+len(chunk) > max {
+				tooLong, line = true, nil
+			} else {
+				line = append(line, chunk...)
+			}
+		}
+		if err != nil || !isPrefix {
+			return line, tooLong, err
+		}
+	}
+}
+
+// handleMCPLine answers one message or one batch; nil means no reply.
+func (a *App) handleMCPLine(client *apiClient, line []byte) any {
+	nullID := json.RawMessage("null")
+	parseError := mcpResponse{JSONRPC: "2.0", ID: nullID, Error: &mcpError{Code: -32700, Message: "parse error"}}
+	if line[0] == '[' {
+		var batch []json.RawMessage
+		if err := json.Unmarshal(line, &batch); err != nil {
+			return parseError
+		}
+		if len(batch) == 0 {
+			return mcpResponse{JSONRPC: "2.0", ID: nullID, Error: &mcpError{Code: -32600, Message: "empty batch"}}
+		}
+		var out []mcpResponse
+		for _, raw := range batch {
+			var req mcpRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				out = append(out, mcpResponse{JSONRPC: "2.0", ID: nullID, Error: &mcpError{Code: -32600, Message: "invalid request"}})
+				continue
+			}
+			if resp, reply := a.handleMCP(client, req); reply {
+				out = append(out, resp)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	var req mcpRequest
+	if err := json.Unmarshal(line, &req); err != nil {
+		return parseError
+	}
+	if resp, reply := a.handleMCP(client, req); reply {
+		return resp
+	}
+	return nil
 }
 
 // handleMCP answers one message; reply is false for notifications.
 func (a *App) handleMCP(client *apiClient, req mcpRequest) (mcpResponse, bool) {
 	isNotification := len(req.ID) == 0 || string(req.ID) == "null"
 	resp := mcpResponse{JSONRPC: "2.0", ID: req.ID}
+	// A notification gets no answer, so it must not do anything either: a
+	// tools/call without an id would otherwise fetch or revoke unseen.
+	if isNotification {
+		return resp, false
+	}
 	switch req.Method {
 	case "initialize":
 		var p struct {
@@ -328,6 +396,7 @@ func (a *App) callMCPTool(client *apiClient, name string, raw json.RawMessage) (
 		if err := client.post(ctx, apiPrefix+"/agent/leases/"+pathEscape(id)+"/credential", nil, &envelope); err != nil {
 			return "", mcpErr(err)
 		}
+		a.sweepCredentialFiles(time.Now())
 		path, err := a.writeCredentialFile(id, &envelope, client.baseURL)
 		if err != nil {
 			return "", err
@@ -383,14 +452,11 @@ func (a *App) writeCredentialFile(id string, envelope *model.CredentialEnvelope,
 	}
 	_ = os.Chmod(filepath.Dir(path), 0o700)
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Cloud Safeguard credential for request %s, valid until %s\n", id, envelope.Credential.ExpiresAt.UTC().Format(time.RFC3339))
-	for _, pair := range buildCredentialEnv(envelope, server, "") {
-		name, value, _ := strings.Cut(pair, "=")
-		if name == "CSG_CAPABILITY" {
-			continue
-		}
-		fmt.Fprintf(&b, "export %s=%s\n", name, shellQuote(value))
+	fmt.Fprintf(&b, "%s%s\n", credentialFileHeader, envelope.Credential.ExpiresAt.UTC().Format(time.RFC3339))
+	for _, kv := range safeCredentialEnv(envelope) {
+		fmt.Fprintf(&b, "export %s=%s\n", kv.Name, shellQuote(kv.Value))
 	}
+	fmt.Fprintf(&b, "export CSG_LEASE_ID=%s\nexport CSG_SERVER=%s\n", shellQuote(id), shellQuote(server))
 	// Create with 0600 from the start; replace an older file atomically.
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
@@ -424,3 +490,42 @@ func (a *App) removeCredentialFile(id string) bool {
 
 // shellQuote single-quotes a value for POSIX shells.
 func shellQuote(s string) string { return "'" + shellSingleQuote(s) + "'" }
+
+// credentialFileHeader starts the first line of every credential file; the
+// expiry follows it.
+const credentialFileHeader = "# Cloud Safeguard credential, valid until "
+
+// sweepCredentialFiles deletes credential files whose credential has expired,
+// so secrets do not pile up on disk. Files it cannot read are left alone.
+func (a *App) sweepCredentialFiles(now time.Time) {
+	cfg, err := a.configPath()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(filepath.Dir(cfg), "credentials")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		id := strings.TrimSuffix(e.Name(), ".env")
+		if !e.Type().IsRegular() || !leaseIDRE.MatchString(id) || id+".env" != e.Name() {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		first, _ := bufio.NewReader(io.LimitReader(f, 256)).ReadString('\n')
+		f.Close()
+		stamp, ok := strings.CutPrefix(strings.TrimSpace(first), strings.TrimSpace(credentialFileHeader))
+		if !ok {
+			continue
+		}
+		expires, err := time.Parse(time.RFC3339, strings.TrimSpace(stamp))
+		if err == nil && !now.Before(expires) {
+			_ = os.Remove(path)
+		}
+	}
+}

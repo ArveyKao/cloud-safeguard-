@@ -962,7 +962,16 @@ It is a thin client of the agent API and holds only the agent token saved by `cs
 | `revoke` | Ends the request and deletes its credential file. |
 
 Request IDs are validated (`lea_` + 32 hex) before use, so a tool argument can never name another
-file.
+file. Expired credential files are deleted when the server starts and before each new one is
+written; `csg revoke` deletes the file too. A notification (a message without an id) never acts,
+batches are answered, and one message over 1 MiB is refused without ending the session.
+
+What the client takes from the server is checked: a credential may only set variables named
+`ALIBABA_CLOUD_*`, `AWS_*` or `CSG_*` (in the credential file, `--export` and `csg exec`), so a
+compromised server cannot inject shell code or variables such as `LD_PRELOAD`; text shown in the
+terminal is stripped of control characters; a sign-in link on another host than `--server` is
+called out; only an agent token (`csg_agt_`) is saved, written to a 0600 file that replaces the
+old one atomically. Sign-in requests never carry a saved token.
 
 Agent CLI, same flow from a terminal:
 
@@ -973,7 +982,10 @@ Agent CLI, same flow from a terminal:
 - `csg accounts`, `csg access request --account ID --resource R --permission P --ttl DUR
   [--name] [--reason] [--wait]`, `csg access status ID`.
 - `csg exec --account ID --resource R --permission P --ttl DUR -- CMD` asks for access, runs
-  CMD with the credential environment and revokes it when CMD exits (unless `--keep`).
+  CMD with the credential environment and revokes it when CMD exits (unless `--keep`). An
+  interrupt (Ctrl-C, SIGTERM, SIGHUP) is passed on to CMD and always revokes, `--keep` or not;
+  so does every way it gives up (approval timeout, credential fetch failure, CMD not starting).
+  CMD does not inherit `CSG_TOKEN`.
 - `csg credential --lease ID --export` and `csg revoke --lease ID` work with a request ID.
 
 ### 17.8 Implementation status

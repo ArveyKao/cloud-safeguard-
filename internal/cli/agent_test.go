@@ -243,7 +243,7 @@ func TestExecInjectsEnvAndRevokes(t *testing.T) {
 	if strings.Contains(ta.errOut(), "cgk1.mock-token-value") || strings.Contains(ta.errOut(), "c2VjcmV0") {
 		t.Fatalf("secret leaked to stderr summary: %q", ta.errOut())
 	}
-	if !strings.Contains(ta.errOut(), "csg exec: lease lea_test01") || !strings.Contains(ta.errOut(), "exit 3") {
+	if !strings.Contains(ta.errOut(), "csg exec: lea_test01") || !strings.Contains(ta.errOut(), "exit 3") {
 		t.Fatalf("summary stderr = %q", ta.errOut())
 	}
 	if ls.revokeCalls != 1 {

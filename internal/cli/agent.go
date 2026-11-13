@@ -2,11 +2,8 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -200,7 +197,7 @@ Fetches the short-lived credential for an active lease. Each fetch is audited.
 		return err
 	}
 	if *export {
-		for _, kv := range envelope.Env {
+		for _, kv := range safeCredentialEnv(&envelope) {
 			fmt.Fprintf(a.Stdout, "export %s='%s'\n", kv.Name, shellSingleQuote(kv.Value))
 		}
 		return nil
@@ -240,6 +237,8 @@ func (a *App) runRevoke(args []string) error {
 		model.RevokeLeaseInput{Reason: *reason}, &lease); err != nil {
 		return err
 	}
+	// The ID the user named, not one echoed by the server.
+	a.removeCredentialFile(strings.TrimSpace(*leaseID))
 	if *jsonOut {
 		return a.printJSON(lease)
 	}
@@ -343,6 +342,8 @@ in with csg login; the second is the older capability lease.
 		lease, err = a.waitForLease(ctx, client, lease, time.Duration(waitSeconds)*time.Second)
 		if err != nil {
 			printLeaseSummary(a.Stderr, lease)
+			// The command will not run: do not leave the request behind.
+			a.revokeAfterExec(client, lease.ID, "csg exec gave up waiting")
 			return err
 		}
 	}
@@ -350,48 +351,11 @@ in with csg login; the second is the older capability lease.
 		printLeaseSummary(a.Stderr, lease)
 		return operationf("lease %s is %s, so no credential is available", lease.ID, lease.Status)
 	}
-
-	var envelope model.CredentialEnvelope
-	if err := client.post(ctx, apiPrefix+"/agent/leases/"+pathEscape(lease.ID)+"/credential", nil, &envelope); err != nil {
-		return fmt.Errorf("cannot fetch credential for lease %s: %w", lease.ID, err)
+	envelope, err := a.fetchForExec(client, lease.ID)
+	if err != nil {
+		return err
 	}
-
-	envPairs := buildCredentialEnv(&envelope, client.baseURL, capabilityID)
-
-	child := exec.Command(cmdArgs[0], cmdArgs[1:]...) //nolint:gosec // user-requested command by design
-	child.Stdin = a.Stdin
-	child.Stdout = a.Stdout
-	child.Stderr = a.Stderr
-	child.Env = append(os.Environ(), envPairs...)
-
-	runErr := child.Run()
-	exitCode := 0
-	if runErr != nil {
-		var exitErrChild *exec.ExitError
-		if errors.As(runErr, &exitErrChild) {
-			exitCode = exitErrChild.ExitCode()
-		} else {
-			// The command could not be started: revoke the unused credential.
-			_, _ = a.revokeLease(ctx, client, lease.ID, "csg exec could not start the command")
-			return fmt.Errorf("cannot run command %q: %v", cmdArgs[0], runErr)
-		}
-	}
-
-	revokedNote := "kept"
-	if !*keep {
-		if _, revokeErr := a.revokeLease(ctx, client, lease.ID, "csg exec completed"); revokeErr != nil {
-			fmt.Fprintf(a.Stderr, "warning: could not revoke lease %s: %v\n", lease.ID, revokeErr)
-			revokedNote = "revoke failed"
-		} else {
-			revokedNote = "revoked"
-		}
-	}
-	fmt.Fprintf(a.Stderr, "csg exec: lease %s capability %s exit %d (lease %s)\n", lease.ID, capabilityID, exitCode, revokedNote)
-
-	if exitCode != 0 {
-		return &exitError{code: exitCode}
-	}
-	return nil
+	return a.runWithCredential(client, lease.ID, "capability "+capabilityID, envelope, *keep, cmdArgs)
 }
 
 // revokeLease revokes an agent-owned lease and returns the updated lease.
@@ -400,32 +364,4 @@ func (a *App) revokeLease(ctx context.Context, client *apiClient, leaseID, reaso
 	err := client.post(ctx, apiPrefix+"/agent/leases/"+pathEscape(leaseID)+"/revoke",
 		model.RevokeLeaseInput{Reason: reason}, &lease)
 	return lease, err
-}
-
-// buildCredentialEnv converts a CredentialEnvelope into NAME=value pairs for
-// the child process, falling back to the credential fields when the server did
-// not provide the ready-made env list.
-func buildCredentialEnv(envelope *model.CredentialEnvelope, server, capabilityID string) []string {
-	pairs := make([]string, 0, len(envelope.Env)+3)
-	seen := make(map[string]bool, len(envelope.Env)+3)
-	add := func(name, value string) {
-		if seen[name] {
-			return
-		}
-		seen[name] = true
-		pairs = append(pairs, name+"="+value)
-	}
-	for _, kv := range envelope.Env {
-		add(kv.Name, kv.Value)
-	}
-	if len(envelope.Env) == 0 {
-		cred := envelope.Credential
-		add("ALIBABA_CLOUD_ACCESS_KEY_ID", cred.AccessKeyID)
-		add("ALIBABA_CLOUD_ACCESS_KEY_SECRET", cred.AccessKeySecret)
-		add("ALIBABA_CLOUD_SECURITY_TOKEN", cred.SecurityToken)
-	}
-	add("CSG_LEASE_ID", envelope.Credential.LeaseID)
-	add("CSG_SERVER", server)
-	add("CSG_CAPABILITY", capabilityID)
-	return pairs
 }

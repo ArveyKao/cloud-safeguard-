@@ -2,15 +2,17 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
+	"github.com/arveykao/cloud-safeguard/internal/token"
 )
 
 // Agent-side commands for the §17 flow: sign-in, cloud accounts and access
@@ -53,6 +55,9 @@ func (a *App) agentSignIn(serverURL, name, description string, jsonOut bool) err
 	if !agentNameRE.MatchString(name) {
 		return usagef("--name must be 2-64 characters: letters, digits, dot, dash or underscore")
 	}
+	a.warnIfCleartext(serverURL)
+	// No token on this client: a sign-in must never send a saved token to
+	// whatever server --server names.
 	client := &apiClient{baseURL: serverURL, http: a.httpClient()}
 	ctx := context.Background()
 
@@ -61,16 +66,27 @@ func (a *App) agentSignIn(serverURL, name, description string, jsonOut bool) err
 		model.AgentSignInStartInput{AgentName: name, Description: strings.TrimSpace(description)}, &start); err != nil {
 		return err
 	}
-	// The device code is the agent's secret: it is never printed.
-	fmt.Fprintf(a.Stderr, "To sign in agent %q, open this link and approve the code:\n\n  %s\n\n  code: %s\n\n", name, start.VerificationURL, start.UserCode)
+	// The device code is the agent's secret: it is never printed. What the
+	// server sends for display is stripped of control characters, and a link
+	// that is not on the server the user named is called out.
+	link := displayString(start.VerificationURL)
+	fmt.Fprintf(a.Stderr, "To sign in agent %q, open this link and approve the code:\n\n  %s\n\n  code: %s\n\n", name, link, displayString(start.UserCode))
+	if !sameOriginURL(link, serverURL) {
+		fmt.Fprintf(a.Stderr, "note: this link is not on %s, the server you gave. Only open it if you expected that.\n", serverURL)
+	}
 	fmt.Fprintf(a.Stderr, "Waiting for approval (the code expires at %s)...\n", start.ExpiresAt.Local().Format("15:04"))
 	if a.afterSignInStart != nil {
 		a.afterSignInStart(start)
 	}
 
+	// The server suggests the poll interval; keep it between 1 s and 60 s so
+	// a server cannot stall the CLI past its own timeout.
 	interval := time.Duration(start.IntervalSeconds) * time.Second
-	if interval <= 0 {
-		interval = 5 * time.Second
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > time.Minute {
+		interval = time.Minute
 	}
 	deadline := time.Now().Add(signInTimeout)
 	for {
@@ -80,9 +96,10 @@ func (a *App) agentSignIn(serverURL, name, description string, jsonOut bool) err
 		}
 		switch res.Status {
 		case model.SignInApproved:
-			if res.Agent == nil || res.Token == "" {
-				return operationf("the server approved the sign-in but returned no token")
+			if res.Agent == nil || token.Kind(res.Token) != "agent" {
+				return operationf("the server approved the sign-in but returned no agent token")
 			}
+			a.noteReplacedConfig(serverURL)
 			path, err := a.saveFileConfig(fileConfig{Server: serverURL, Token: res.Token, Kind: "agent"})
 			if err != nil {
 				return err
@@ -98,10 +115,11 @@ func (a *App) agentSignIn(serverURL, name, description string, jsonOut bool) err
 		case model.SignInExpired:
 			return operationf("the sign-in code expired or was already used; run csg login again")
 		}
-		if !time.Now().Before(deadline) {
+		left := time.Until(deadline)
+		if left <= 0 {
 			return waitTimeoutf("timed out waiting for the sign-in to be approved")
 		}
-		pollSleep(interval)
+		pollSleep(min(interval, left))
 	}
 }
 
@@ -302,7 +320,10 @@ func (a *App) printAccess(req model.AccessRequest, jsonOut bool) {
 	case model.LeasePending:
 		fmt.Fprintln(a.Stdout, "next:       your owner approves it in the console; check with csg access status "+req.ID)
 	case model.LeaseActive:
-		fmt.Fprintln(a.Stdout, "next:       eval \"$(csg credential --lease "+req.ID+" --export)\"")
+		// Only a well-formed ID goes into a command the user is told to run.
+		if leaseIDRE.MatchString(req.ID) {
+			fmt.Fprintln(a.Stdout, "next:       eval \"$(csg credential --lease "+req.ID+" --export)\"")
+		}
 	case model.LeaseDenied:
 		fmt.Fprintf(a.Stdout, "reason:     %s\n", req.DeniedReason)
 	}
@@ -332,43 +353,62 @@ func (a *App) execWithAccess(client *apiClient, in model.AccessRequestInput, wai
 		fmt.Fprintf(a.Stderr, "csg exec: request %s waits for your owner's approval in the console\n", req.ID)
 		var err error
 		if req, err = a.waitForAccess(ctx, client, req, wait); err != nil {
+			// The command will not run: do not leave the request behind.
+			a.revokeAfterExec(client, req.ID, "csg exec gave up waiting")
 			return err
 		}
 	}
 	if req.Status != model.LeaseActive {
 		return operationf("request %s is %s: %s", req.ID, req.Status, req.DeniedReason)
 	}
-	var envelope model.CredentialEnvelope
-	if err := client.post(ctx, apiPrefix+"/agent/leases/"+pathEscape(req.ID)+"/credential", nil, &envelope); err != nil {
-		return fmt.Errorf("cannot fetch credential for request %s: %w", req.ID, err)
+	envelope, err := a.fetchForExec(client, req.ID)
+	if err != nil {
+		return err
 	}
-	envPairs := buildCredentialEnv(&envelope, client.baseURL, in.Resource+":"+in.Permission)
+	return a.runWithCredential(client, req.ID, in.Permission+" "+in.Resource, envelope, keep, cmdArgs)
+}
 
-	child := exec.Command(cmdArgs[0], cmdArgs[1:]...) //nolint:gosec // user-requested command by design
-	child.Stdin, child.Stdout, child.Stderr = a.Stdin, a.Stdout, a.Stderr
-	child.Env = append(os.Environ(), envPairs...)
-	runErr := child.Run()
-	exitCode := 0
-	if runErr != nil {
-		var exitErrChild *exec.ExitError
-		if !errors.As(runErr, &exitErrChild) {
-			_, _ = a.revokeLease(ctx, client, req.ID, "csg exec could not start the command")
-			return fmt.Errorf("cannot run command %q: %v", cmdArgs[0], runErr)
+// displayString removes control characters (ANSI and OSC escapes among
+// them) from a server-provided string before it is shown in a terminal.
+func displayString(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == utf8.RuneError {
+			continue
 		}
-		exitCode = exitErrChild.ExitCode()
+		b.WriteRune(r)
 	}
-	note := "kept"
-	if !keep {
-		if _, err := a.revokeLease(ctx, client, req.ID, "csg exec completed"); err != nil {
-			fmt.Fprintf(a.Stderr, "warning: could not revoke request %s: %v\n", req.ID, err)
-			note = "revoke failed"
-		} else {
-			note = "revoked"
-		}
+	return b.String()
+}
+
+// sameOriginURL reports whether link has the same scheme and host as server.
+func sameOriginURL(link, server string) bool {
+	l, err1 := url.Parse(link)
+	s, err2 := url.Parse(server)
+	return err1 == nil && err2 == nil && l.Scheme == s.Scheme && strings.EqualFold(l.Host, s.Host)
+}
+
+// warnIfCleartext warns when tokens would travel unencrypted to another host.
+func (a *App) warnIfCleartext(server string) {
+	u, err := url.Parse(server)
+	if err != nil || u.Scheme != "http" {
+		return
 	}
-	fmt.Fprintf(a.Stderr, "csg exec: request %s %s %s exit %d (%s)\n", req.ID, in.Permission, in.Resource, exitCode, note)
-	if exitCode != 0 {
-		return &exitError{code: exitCode}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); host == "localhost" || (ip != nil && ip.IsLoopback()) {
+		return
 	}
-	return nil
+	fmt.Fprintf(a.Stderr, "warning: %s is not https; the token and sign-in codes travel unencrypted\n", server)
+}
+
+// noteReplacedConfig says so when a sign-in replaces a saved token of
+// another kind or for another server.
+func (a *App) noteReplacedConfig(server string) {
+	old := a.loadFileConfig()
+	if old.Token == "" {
+		return
+	}
+	if kind := token.Kind(old.Token); kind != "agent" || normalizeServer(old.Server) != server {
+		fmt.Fprintf(a.Stderr, "note: replacing the saved %s token for %s\n", tokenKindLabel(kind), old.Server)
+	}
 }

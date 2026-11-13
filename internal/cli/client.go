@@ -86,11 +86,28 @@ func (a *App) saveFileConfig(cfg fileConfig) (string, error) {
 		return "", fmt.Errorf("cannot encode config: %v", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	// Write a 0600 temporary file and rename it over the config, so the token
+	// is never in a file with a looser mode, and a symlink at the config path
+	// is replaced rather than followed.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*")
+	if err != nil {
 		return "", fmt.Errorf("cannot write config: %v", err)
 	}
-	// Best effort: an existing file keeps its old mode through os.WriteFile.
-	_ = os.Chmod(path, 0o600)
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
 	return path, nil
 }
 

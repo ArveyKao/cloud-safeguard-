@@ -312,52 +312,45 @@ func TestShellSingleQuote(t *testing.T) {
 	}
 }
 
-func TestBuildCredentialEnv(t *testing.T) {
+func TestSafeCredentialEnv(t *testing.T) {
 	envelope := model.CredentialEnvelope{
-		Credential: model.Credential{
-			AccessKeyID:     "LTAI1234",
-			AccessKeySecret: "secret",
-			SecurityToken:   "token",
-			LeaseID:         "lea_test01",
-		},
+		Credential: model.Credential{AccessKeyID: "LTAI1234", AccessKeySecret: "secret", SecurityToken: "token"},
 		Env: []model.EnvVar{
 			{Name: "ALIBABA_CLOUD_ACCESS_KEY_ID", Value: "LTAI1234"},
 			{Name: "ALIBABA_CLOUD_SECURITY_TOKEN", Value: "token"},
+			{Name: "AWS_SESSION_TOKEN", Value: "aws"},
 			{Name: "CSG_LEASE_ID", Value: "lea_test01"},
+			// A compromised server must not be able to set any of these.
+			{Name: "X; touch /tmp/pwned; Y", Value: "v"},
+			{Name: "LD_PRELOAD", Value: "/tmp/evil.so"},
+			{Name: "PATH", Value: "/tmp"},
+			{Name: "BASH_ENV", Value: "/tmp/x"},
+			{Name: "alibaba_cloud_lower", Value: "v"},
+			{Name: "ALIBABA_CLOUD_$(id)", Value: "v"},
+			{Name: "ALIBABA_CLOUD_A\nB", Value: "v"},
 		},
 	}
-	pairs := buildCredentialEnv(&envelope, "http://127.0.0.1:8787", "aliyun.cloud.read")
-	joined := strings.Join(pairs, "\n")
-	for _, want := range []string{
-		"ALIBABA_CLOUD_ACCESS_KEY_ID=LTAI1234",
-		"ALIBABA_CLOUD_SECURITY_TOKEN=token",
-		"CSG_LEASE_ID=lea_test01",
-		"CSG_SERVER=http://127.0.0.1:8787",
-		"CSG_CAPABILITY=aliyun.cloud.read",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("env missing %q: %v", want, pairs)
-		}
+	got := map[string]string{}
+	for _, kv := range safeCredentialEnv(&envelope) {
+		got[kv.Name] = kv.Value
 	}
-	// No duplicate names.
-	seen := map[string]bool{}
-	for _, pair := range pairs {
-		name, _, _ := strings.Cut(pair, "=")
-		if seen[name] {
-			t.Fatalf("duplicate env var %q in %v", name, pairs)
+	want := map[string]string{"ALIBABA_CLOUD_ACCESS_KEY_ID": "LTAI1234", "ALIBABA_CLOUD_SECURITY_TOKEN": "token",
+		"AWS_SESSION_TOKEN": "aws", "CSG_LEASE_ID": "lea_test01"}
+	if len(got) != len(want) {
+		t.Fatalf("env = %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("env[%s] = %q", k, got[k])
 		}
-		seen[name] = true
 	}
 
 	// Fallback when the server sends no env list.
-	fallback := buildCredentialEnv(&model.CredentialEnvelope{Credential: model.Credential{
-		AccessKeyID: "AK", AccessKeySecret: "SK", SecurityToken: "ST", LeaseID: "lea_x",
-	}}, "http://s", "cap")
-	fallbackJoined := strings.Join(fallback, "\n")
-	for _, want := range []string{"ALIBABA_CLOUD_ACCESS_KEY_ID=AK", "ALIBABA_CLOUD_ACCESS_KEY_SECRET=SK", "ALIBABA_CLOUD_SECURITY_TOKEN=ST"} {
-		if !strings.Contains(fallbackJoined, want) {
-			t.Fatalf("fallback env missing %q: %v", want, fallback)
-		}
+	fallback := safeCredentialEnv(&model.CredentialEnvelope{Credential: model.Credential{
+		AccessKeyID: "AK", AccessKeySecret: "SK", SecurityToken: "ST",
+	}})
+	if len(fallback) != 3 || fallback[1].Name != "ALIBABA_CLOUD_ACCESS_KEY_SECRET" || fallback[1].Value != "SK" {
+		t.Fatalf("fallback = %v", fallback)
 	}
 }
 

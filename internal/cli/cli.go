@@ -82,6 +82,9 @@ type App struct {
 	// afterSignInStart runs once an agent sign-in has started (tests use it
 	// to approve the sign-in as a person).
 	afterSignInStart func(model.AgentSignInStart)
+	// afterChildStart runs once csg exec has started the command (tests use
+	// it to interrupt the run).
+	afterChildStart func()
 }
 
 // NewApp returns an App wired to the real process environment.
