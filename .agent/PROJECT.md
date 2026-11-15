@@ -83,6 +83,11 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   `csg access request|status`, `csg exec --account`, and `csg mcp` (five tools; credentials go
   to a 0600 file, never to the model). End-to-end tests against a real server. Verified
   locally; not yet committed or cross-family reviewed. Step 2 of the four-step plan is done.
+- **Console redesign (2026-11-14):** new React console in `web/src/app/` on the person login
+  (setup with QR, sign-in, Inbox, agent sign-in approval, Agents, Cloud accounts with the add
+  wizard, Activity, People, Settings); the old admin-token console and `web/devmock` are
+  removed. Checked in a browser against a real server. Step 3 of the four-step plan is done;
+  step 4 (remove the admin token and the §16 agent model) remains.
 - **Agreed next (owner, 2026-11-11):** remove the admin token and the §16 agent model once
   supervisors can manage cloud accounts, audit and settings, and the console and `csg` use the
   new login. Supervisors keep an emergency revoke/deny, never approve.

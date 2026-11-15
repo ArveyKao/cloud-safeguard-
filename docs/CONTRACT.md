@@ -437,13 +437,20 @@ logs the console URL + API URL, seeds nothing, starts sweeper, and serves until 
 ## 12. Web console requirements (`web/`)
 
 - Stack: Vite + React + TypeScript, plain CSS (no heavy UI kit; icons may be inline SVG).
-  Scripts: `npm run dev`, `npm run build` (outputs `dist/`, `base: "./"`),
-  `npm run typecheck`. Node ≥20.
-- Local dev may use a small mock API (`web/devmock/`) but the shipped app must talk to the
-  real API via same-origin `/api/v1` (Vite proxy to `http://127.0.0.1:8787`).
-- Auth: login screen accepts the admin token, validates via `POST /admin/login`, stores in
-  `localStorage` (`csg.adminToken`), attaches `Authorization: Bearer` to every call; 401 →
-  clear token + back to login; logout button.
+  Scripts: `npm run dev`, `npm run build` (outputs `dist/`, `base: "/"` because routes are
+  nested), `npm run typecheck`. Node ≥20. One runtime dependency besides React:
+  `qrcode-generator` (MIT) for the authenticator QR code.
+- The app talks to the real API via same-origin `/api/v1` (in development a Vite proxy to
+  a running `csg serve`).
+- Since the §17 redesign the console signs people in (password + authenticator code, §17.3)
+  and uses the session cookie and its CSRF token; it never stores a token in `localStorage`.
+  Screens: Inbox (requests waiting for the person, approve/deny/revoke), agent sign-in
+  approval (`/?signin=CODE`, the link `csg login` prints), Agents, Cloud accounts (everyone's
+  own roles; for supervisors also every account with people, roles, highest automatic level,
+  connection test, key replacement, disable, and a three-step add wizard), Activity (the
+  person's own requests; the audit log for supervisors), People (supervisors), Settings
+  (approval mode; platform limits for supervisors). The older admin-token console below is
+  removed; the remaining requirements in this section describe that older console.
 - Design: dark “security operations console”: near-black background, layered panels, hairline
   borders, one accent (emerald) for safe/active, amber pending, orange high, rose critical,
   monospace for IDs/credentials/fingerprints, generous whitespace, no external CDNs/fonts
@@ -1002,7 +1009,7 @@ Agent CLI, same flow from a terminal:
 | Removal of the admin token and the §16 agent model | not started; follows the CLI, MCP and console work |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
-| Console redesign | not started |
+| Console redesign (sign-in, Inbox, Agents, Cloud accounts, Activity, People, Settings) | implemented; the admin-token console is removed |
 
 Until the remaining parts ship, the §2 admin token and the §16 agent API keep working
 unchanged alongside the new endpoints:

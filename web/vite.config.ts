@@ -8,7 +8,9 @@ import react from '@vitejs/plugin-react'
 const apiTarget = process.env.CSG_API_PROXY ?? 'http://127.0.0.1:8787'
 
 export default defineConfig({
-  base: './',
+  // Absolute asset paths: the console has nested routes (/accounts/new), and
+  // the server answers any unknown path with index.html.
+  base: '/',
   plugins: [react()],
   server: {
     port: 18803,

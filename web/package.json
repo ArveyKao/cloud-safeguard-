@@ -3,18 +3,18 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Cloud Safeguard operator console — capabilities, not credentials.",
+  "description": "Cloud Safeguard console: approve your agents' access, manage cloud accounts and people.",
   "scripts": {
     "dev": "vite --port 18803 --strictPort",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --port 18803 --strictPort",
-    "typecheck": "tsc --noEmit",
-    "mock": "node devmock/server.mjs"
+    "typecheck": "tsc --noEmit"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "qrcode-generator": "2.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
