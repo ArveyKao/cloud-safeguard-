@@ -20,7 +20,9 @@ let onSignedOut: (() => void) | null = null
 export function setCsrf(token: string) { csrf = token }
 export function setSignedOutHandler(fn: (() => void) | null) { onSignedOut = fn }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+export interface TestResult { ok: boolean; message: string; tested_at: string }
+
+async function call<T>(method: string, path: string, body?: unknown, retried = false): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf
@@ -39,6 +41,18 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   if (!res.ok) {
     const err = (json as { error?: { code?: string; message?: string } } | null)?.error
     if (res.status === 401 && !path.startsWith('/auth/')) onSignedOut?.()
+    // Signing in again in another tab replaces the session and its CSRF
+    // token; fetch the current one once and repeat the change.
+    if (res.status === 403 && method !== 'GET' && !retried && /CSRF/i.test(err?.message ?? '')) {
+      try {
+        const me = await call<SessionInfo>('GET', '/auth/me')
+        csrf = me.csrf_token
+      } catch {
+        onSignedOut?.()
+        throw new ApiError(401, 'unauthorized', 'Please sign in again.')
+      }
+      return call<T>(method, path, body, true)
+    }
     throw new ApiError(res.status, err?.code ?? 'error', err?.message ?? `Request failed (${res.status})`)
   }
   return (json as { data: T }).data
@@ -87,7 +101,7 @@ export const api = {
   accounts: () => call<List<Provider>>('GET', '/supervisor/accounts'),
   createAccount: (input: Record<string, string>) => call<Provider>('POST', '/supervisor/accounts', input),
   updateAccount: (id: string, patch: Record<string, string>) => call<Provider>('PATCH', `/supervisor/accounts/${enc(id)}`, patch),
-  testAccount: (id: string) => call<Provider>('POST', `/supervisor/accounts/${enc(id)}/test`, {}),
+  testAccount: (id: string) => call<TestResult>('POST', `/supervisor/accounts/${enc(id)}/test`, {}),
   rotateAccount: (id: string, access_key_id: string, access_key_secret: string) =>
     call<Provider>('POST', `/supervisor/accounts/${enc(id)}/rotate`, { access_key_id, access_key_secret }),
   setAutoLevel: (id: string, max_auto_level: ApprovalMode) =>

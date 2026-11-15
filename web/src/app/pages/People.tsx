@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { Person, PersonWithSetupCode } from '../types'
-import { Badge, Button, Card, ErrorNote, Field, Modal, PageHead, Secret, ago, useAction, useLoad, useToast, when } from '../ui'
+import { Badge, Button, Card, ErrorNote, Field, Modal, PageHead, Secret, ago, useAction, useConfirm, useLoad, useToast, when } from '../ui'
 
 /** Supervisors create people, reset them, suspend them and grant the flag. */
 export function PeoplePage({ me }: { me: Person }) {
@@ -10,7 +10,10 @@ export function PeoplePage({ me }: { me: Person }) {
   const [issued, setIssued] = useState<PersonWithSetupCode | null>(null)
   const action = useAction()
   const toast = useToast()
-  const run = (fn: () => Promise<unknown>, done: string) => action.run(async () => { await fn(); toast(done); people.reload() })
+  const { confirm, element: confirmDialog } = useConfirm()
+  const ask = (title: string, body: string, confirmLabel: string, fn: () => Promise<unknown>, danger = true) =>
+    confirm({ title, body, confirmLabel, danger, run: async () => { await fn(); people.reload() } })
+  const label = (p: Person) => p.display_name || p.username
 
   return (
     <>
@@ -31,10 +34,21 @@ export function PeoplePage({ me }: { me: Person }) {
                 <td className="muted">{ago(p.last_login_at)}</td>
                 <td className="muted small">{p.setup_issued ? `code from ${p.setup_issued.by_name}, ${when(p.setup_issued.at)}` : '—'}</td>
                 <td className="right nowrap">
-                  {p.id !== me.id && p.status !== 'suspended' && <Button kind="link" onClick={() => run(() => api.updatePerson(p.id, { status: 'suspended' }), `${p.username} suspended`)}>Suspend</Button>}
-                  {p.status === 'suspended' && p.setup_issued && <Button kind="link" onClick={() => run(() => api.updatePerson(p.id, { status: 'active' }), `${p.username} active`)}>Activate</Button>}
-                  <Button kind="link" onClick={() => action.run(async () => { setIssued(await api.resetPerson(p.id)); people.reload() })}>Reset</Button>
-                  <Button kind="link" onClick={() => run(() => api.updatePerson(p.id, { supervisor: !p.supervisor }), p.supervisor ? 'Supervisor removed' : 'Now a supervisor')}>
+                  {p.id !== me.id && p.status !== 'suspended' && <Button kind="link" onClick={() => ask(`Suspend ${label(p)}?`,
+                    'They are signed out at once and cannot sign in. Their agents stop working and every credential they hold is revoked.',
+                    'Suspend', async () => { await api.updatePerson(p.id, { status: 'suspended' }); toast(`${p.username} suspended`) })}>Suspend</Button>}
+                  {p.status === 'suspended' && p.setup_issued && <Button kind="link" onClick={() => ask(`Activate ${label(p)}?`,
+                    'They can sign in again with their password and authenticator. Their agents work again, within their roles.',
+                    'Activate', async () => { await api.updatePerson(p.id, { status: 'active' }); toast(`${p.username} active`) }, false)}>Activate</Button>}
+                  <Button kind="link" onClick={() => ask(`Reset ${label(p)}?`,
+                    'Their password and authenticator are erased, they are signed out, their approval mode goes back to read and their agents\' credentials are revoked. You get a new setup code to give them.',
+                    'Reset', async () => { setIssued(await api.resetPerson(p.id)) })}>Reset</Button>
+                  <Button kind="link" onClick={() => ask(p.supervisor ? `Remove ${label(p)} as supervisor?` : `Make ${label(p)} a supervisor?`,
+                    p.supervisor
+                      ? 'They can no longer manage cloud accounts, people, roles or limits. Their own roles stay.'
+                      : 'They can add cloud accounts, add and suspend people, change everyone\'s roles and the platform limits. It gives no cloud access by itself.',
+                    p.supervisor ? 'Remove supervisor' : 'Make supervisor',
+                    async () => { await api.updatePerson(p.id, { supervisor: !p.supervisor }); toast(p.supervisor ? 'Supervisor removed' : 'Now a supervisor') }, !p.supervisor)}>
                     {p.supervisor ? 'Remove supervisor' : 'Make supervisor'}
                   </Button>
                 </td>
@@ -43,6 +57,7 @@ export function PeoplePage({ me }: { me: Person }) {
           </tbody>
         </table>
       </Card>
+      {confirmDialog}
       {creating && <CreatePerson onClose={() => setCreating(false)} onCreated={(c) => { setCreating(false); setIssued(c); people.reload() }} />}
       {issued && (
         <Modal title={`Setup code for ${issued.person.username}`} onClose={() => setIssued(null)} closable={false}>

@@ -59,7 +59,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// API paths must never fall back to the SPA shell.
-	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/healthz" {
+	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" || r.URL.Path == "/healthz" || r.URL.Path == "/healthz/" {
 		s.handleUnknownAPI(w, r)
 		return
 	}
@@ -76,6 +76,12 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
 		fileServer.ServeHTTP(w, r)
+		return
+	}
+	// A missing asset is a 404, not the app: otherwise a bad deploy shows up
+	// as a confusing MIME error instead of a missing file.
+	if strings.HasPrefix(rel, "assets/") {
+		http.NotFound(w, r)
 		return
 	}
 	s.serveIndexHTML(w, r, fsys)

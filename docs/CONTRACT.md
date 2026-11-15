@@ -451,6 +451,15 @@ logs the console URL + API URL, seeds nothing, starts sweeper, and serves until 
   person's own requests; the audit log for supervisors), People (supervisors), Settings
   (approval mode; platform limits for supervisors). The older admin-token console below is
   removed; the remaining requirements in this section describe that older console.
+- Every response carries `X-Frame-Options: DENY`, a `Content-Security-Policy` that allows only
+  the console's own files and `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: no-referrer`. Actions that change authority or cannot be undone (role
+  changes, removing a role, the automatic level, disabling an account, suspend, reset,
+  supervisor flag, revoking a credential, raising the approval mode) ask for confirmation and
+  say what will happen. Approving an agent sign-in needs the person to confirm the code matches
+  their terminal, and says when it replaces an agent of the same name. Saving the approval mode
+  keeps the end of a temporary mode unless the person picks another. Console tests:
+  `cd web && npm test`.
 - Design: dark “security operations console”: near-black background, layered panels, hairline
   borders, one accent (emerald) for safe/active, amber pending, orange high, rose critical,
   monospace for IDs/credentials/fingerprints, generous whitespace, no external CDNs/fonts

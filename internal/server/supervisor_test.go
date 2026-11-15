@@ -481,3 +481,24 @@ func TestSetupCodeIssuerIsTraced(t *testing.T) {
 		t.Fatalf("recovery issuer = %+v", got)
 	}
 }
+
+// Every response carries the browser protections; the console cannot be
+// framed. Unknown API-like paths and missing assets are not the app.
+func TestSecurityHeadersAndStaticFallback(t *testing.T) {
+	a := newAccessEnv(t, "")
+	for _, path := range []string{"/", "/inbox", "/accounts/new", "/api/v1/auth/me", "/healthz", "/mock-cloud/v1/ecs/instances"} {
+		rec := a.testEnv.request(http.MethodGet, path, nil, nil, nil)
+		h := rec.Header()
+		if h.Get("X-Frame-Options") != "DENY" || !strings.Contains(h.Get("Content-Security-Policy"), "frame-ancestors 'none'") ||
+			h.Get("X-Content-Type-Options") != "nosniff" || h.Get("Referrer-Policy") != "no-referrer" {
+			t.Errorf("%s headers: %v", path, h)
+		}
+	}
+	for path, wantHTML := range map[string]bool{"/accounts/new": true, "/api": false, "/healthz/": false, "/assets/missing.js": false} {
+		rec := a.testEnv.request(http.MethodGet, path, nil, nil, nil)
+		isHTML := strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html")
+		if isHTML != wantHTML || (!wantHTML && rec.Code != http.StatusNotFound) {
+			t.Errorf("%s: status %d, content type %q", path, rec.Code, rec.Header().Get("Content-Type"))
+		}
+	}
+}

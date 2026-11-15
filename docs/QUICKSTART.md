@@ -51,8 +51,9 @@ This creates `.demo/data` (mode 0700) with:
 - 5 built-in capabilities, the `demo-aliyun` mock provider, and two demo agents:
   `claude-code` and `hermes-researcher`.
 
-It prints the **admin token**, an admin token prefix, and **one-time agent tokens** for
-the demo agents. They are shown exactly once and are never retrievable again.
+It prints the **admin token** (for the API and the admin CLI), **one-time agent tokens** for
+the demo agents, and the first supervisor's **setup code** for the console. They are shown
+exactly once and are never retrievable again.
 
 > Save the tokens now, e.g. in a password manager or a 0600 file outside the repo.
 > If you lose an agent token, rotate it later with `csg agents rotate-token ID`.
@@ -72,11 +73,13 @@ but still contains the secrets, so redirect it somewhere private if you use it.
 The server binds loopback by default. It logs the console URL and API URL; the console is
 the same HTTP origin. Run it in the foreground and stop it with `Ctrl-C` when done.
 
-## 1.4 Log in to the console
+## 1.4 Set up your account in the console
 
-Open <http://127.0.0.1:8787>, paste the **admin token** (`csg_adm_...`), and log in.
-You should see the overview with the seeded provider and agents, and empty lease counts.
-The console polls the API every 4 seconds while a page is visible.
+Open <http://127.0.0.1:8787> and choose **Set up your account**. Enter the setup code
+`csg init` printed, choose a password, scan the QR code with an authenticator app and enter
+the 6-digit code it shows. After that you sign in with your username (`admin` by default),
+password and a fresh code. As a supervisor you can add people, give them roles on cloud
+accounts and set limits; the console never asks for the admin token.
 
 ## 1.5 Auto-approved read (no human involved)
 
@@ -163,9 +166,8 @@ eval "$(./bin/csg credential --lease lea_... --export)"
 # → 403: the DNS-scoped credential cannot touch ECS
 ```
 
-The same approval can be done from the console: **Overview → pending queue → Approve**
-(or **Leases → open the pending lease → Approve** with TTL + note). A console approval
-produces the same API call and audit trail as the CLI.
+These older capability leases are approved with the admin CLI. Access requests from agents
+signed in with `csg login` are approved by the agent's owner in the console **Inbox**.
 
 ## 1.8 Denial
 

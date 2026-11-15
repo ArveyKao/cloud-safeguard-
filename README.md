@@ -73,7 +73,7 @@ flowchart LR
     end
     CLOUD["Alibaba Cloud STS<br/>RAM role + resources"]
     OPERATOR --> CONSOLE
-    CONSOLE -->|admin token| API
+    CONSOLE -->|person sign-in| API
     AGENT -->|agent token| API
     API --> POLICY
     POLICY --> LEASE
@@ -106,7 +106,7 @@ details: [docs/CONTRACT.md](docs/CONTRACT.md). Product definition and acceptance
 | AES-256-GCM vault for broker credentials and lease credentials | ✅ v0.1 |
 | One-place provider credential rotation (console or CLI) | ✅ v0.1 |
 | Tamper-evident SHA-256 hash-chained audit log with verify endpoint/command | ✅ v0.1 |
-| Embedded React web console (login, overview, approvals, agents, capabilities, leases, providers/vault, audit, settings) | ✅ v0.1 |
+| Embedded web console: person sign-in with an authenticator, Inbox approvals, agents, cloud accounts, activity, people, settings | ✅ |
 | `csg` CLI for agents and operators | ✅ v0.1 |
 | Mock cloud + demo mode (full loop with no cloud account) | ✅ v0.1 |
 | Real Alibaba Cloud `sts` mode (in-tree RPC v1 signer, no SDK) | ✅ v0.1, unit-tested against a fake STS endpoint — not against a live account in this build |
@@ -128,12 +128,12 @@ make build
 
 # 2. Bootstrap a throwaway demo instance: mock cloud, admin token, two demo agents
 ./bin/csg init --demo --data-dir .demo/data
-#    Copies the printed admin token and agent tokens somewhere safe NOW.
-#    They are shown exactly once.
+#    It also prints the first supervisor's one-time setup code.
+#    Copy the printed tokens and the setup code somewhere safe NOW: they are shown once.
 
 # 3. Start the control plane (console + API on loopback)
 ./bin/csg serve --data-dir .demo/data
-#    Open http://127.0.0.1:8787 and log in with the admin token.
+#    Open http://127.0.0.1:8787, choose "Set up your account" and use the setup code.
 ```
 
 In a second terminal, act as the `claude-code` agent (use the `csg_agt_...` token that
@@ -271,7 +271,8 @@ cloud-safeguard/
 
 Honest v0.1 boundaries:
 
-- **Single-tenant, single admin token.** No user accounts, roles, MFA or SSO for humans.
+- **Single-tenant.** People sign in with a password and an authenticator app; there is no SSO yet.
+  The admin token still works for the API and the admin CLI until it is removed.
 - **Alibaba Cloud only**, and effectively one `aliyun` provider per instance is selected
   (the first created); avoid mixing `mock` and `sts` providers in one installation.
 - **STS credentials still reach the agent.** The stronger design is a credential-free

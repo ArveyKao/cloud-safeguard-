@@ -8,6 +8,8 @@ import { Button, Card, ErrorNote, PageHead, ago, roleLabel, useAction, useLoad }
 export function SignInApprovalPage({ code }: { code: string }) {
   const signIn = useLoad(() => api.signIn(code), [code])
   const accounts = useLoad(() => api.myAccounts(), [])
+  const agents = useLoad(() => api.myAgents(), [])
+  const [matched, setMatched] = useState(false)
   const [done, setDone] = useState<'approved' | 'denied' | null>(null)
   const action = useAction()
   const leave = () => navigate('/inbox')
@@ -65,10 +67,17 @@ export function SignInApprovalPage({ code }: { code: string }) {
             </table>
           )}
         <p className="muted small">What is issued without asking you is set by your approval mode in Settings.</p>
+        {(agents.data?.items ?? []).some((a) => a.name === s.agent_name && a.status !== 'revoked') && (
+          <p className="note note-info">You already have an agent named <b>{s.agent_name}</b>. Approving replaces it: the old one stops working and its credentials are revoked.</p>
+        )}
+        <label className="check">
+          <input type="checkbox" checked={matched} onChange={(e) => setMatched(e.target.checked)} />
+          I started this sign-in myself, and the code above matches the one in my terminal.
+        </label>
         <ErrorNote error={action.error} />
         <div className="row-actions">
           <Button busy={action.busy} onClick={() => action.run(async () => { await api.denySignIn(code); setDone('denied') })}>Deny</Button>
-          <Button kind="primary" busy={action.busy} onClick={() => action.run(async () => { await api.approveSignIn(code); setDone('approved') })}>Approve sign-in</Button>
+          <Button kind="primary" busy={action.busy} disabled={!matched} onClick={() => action.run(async () => { await api.approveSignIn(code); setDone('approved') })}>Approve sign-in</Button>
         </div>
       </Card>
     </>

@@ -3,7 +3,7 @@ import { api } from '../api'
 import type { AccessRequest, Person } from '../types'
 import { navigate } from '../router'
 import {
-  Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, ago, duration, permissionTone, useAction, useLoad, useToast, when,
+  Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, ago, duration, permissionTone, useAction, useConfirm, useLoad, useToast, when,
 } from '../ui'
 
 /** Requests from the person's own agents that wait for a decision. */
@@ -13,6 +13,7 @@ export function InboxPage({ person, onChange }: { person: Person; onChange: () =
   const [denying, setDenying] = useState<AccessRequest | null>(null)
   const toast = useToast()
   const action = useAction()
+  const { confirm, element: confirmDialog } = useConfirm()
 
   const refresh = () => { pending.reload(); recent.reload(); onChange() }
   const approve = (r: AccessRequest) => action.run(async () => {
@@ -78,7 +79,12 @@ export function InboxPage({ person, onChange }: { person: Person; onChange: () =
                   <td className="muted small">{ago(r.created_at)}</td>
                   <td className="right">
                     {r.status === 'active' && (
-                      <Button kind="link" onClick={() => action.run(async () => { await api.revokeRequest(r.id); toast('Revoked'); refresh() })}>Revoke</Button>
+                      <Button kind="link" onClick={() => confirm({
+                        title: `Revoke ${r.agent_name}'s ${r.permission} access?`,
+                        body: 'The credential stops being handed out at once. The agent can ask again.',
+                        confirmLabel: 'Revoke', danger: true,
+                        run: async () => { await api.revokeRequest(r.id); toast('Revoked'); refresh() },
+                      })}>Revoke</Button>
                     )}
                   </td>
                 </tr>
@@ -88,6 +94,7 @@ export function InboxPage({ person, onChange }: { person: Person; onChange: () =
         </Card>
       )}
 
+      {confirmDialog}
       {denying && <DenyDialog request={denying} onClose={() => setDenying(null)} onDone={() => { setDenying(null); refresh() }} />}
     </>
   )

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { Provider } from '../types'
+import type { TestResult } from '../api'
 import { navigate } from '../router'
 import { Button, Card, ErrorNote, Field, useAction } from '../ui'
 
@@ -15,6 +16,7 @@ export function AddAccountPage() {
   const [keyId, setKeyId] = useState('')
   const [secret, setSecret] = useState('')
   const [created, setCreated] = useState<Provider | null>(null)
+  const [test, setTest] = useState<TestResult | null>(null)
   const [copied, setCopied] = useState(false)
   const action = useAction()
   const validId = /^[0-9]{6,32}$/.test(accountId.trim())
@@ -34,7 +36,8 @@ export function AddAccountPage() {
         role_arn: `acs:ram::${accountId.trim()}:role/${ROLE_NAME}`, access_key_id: keyId.trim(), access_key_secret: secret,
       })
       setSecret('')
-      setCreated(await api.testAccount(p.id).catch(() => p))
+      setCreated(p)
+      setTest(await api.testAccount(p.id).catch((e) => ({ ok: false, message: String(e?.message ?? e), tested_at: '' })))
     })
   }
 
@@ -93,7 +96,8 @@ export function AddAccountPage() {
           <>
             <h1>{created.name} is connected</h1>
             <ul className="checklist">
-              <li data-ok={created.last_test_ok === true}>{created.last_test_ok ? 'The AccessKey works and can assume the role' : 'The connection test did not pass yet; check the role and key, then test again from Cloud accounts'}</li>
+              <li data-ok={test?.ok === true}>{test?.ok ? 'The AccessKey works and can assume the role'
+                : `The connection test did not pass yet${test?.message ? `: ${test.message}` : ''}. Check the role and key, then test again from Cloud accounts.`}</li>
               <li data-ok="true">The key is stored encrypted; only a masked ID is shown</li>
               <li data-ok="true">Nobody has a role on it yet; you decide who does</li>
             </ul>

@@ -51,13 +51,14 @@ reference: `docs/API.md` (v0.1) plus CONTRACT §16 and §17.8 for what changed s
   policy settings each revoke the leases that are no longer allowed, at once.
 - A credential cannot be fetched after its lease expired, was revoked or was denied.
 - The audit log records every step and `csg audit verify` passes afterwards.
-- Console: the role picker, role and access badges, the grants list and the demotion
-  confirmation behave as described in CONTRACT §16.7.
+- (The older console screens for agent roles were removed with the console redesign; test
+  agent roles through the admin API and CLI.)
 
 ### B. People, supervisors and sign-in (CONTRACT §17.1–§17.3, API only)
 
-There is no console screen for this yet; test with `curl` against the endpoints listed in
-CONTRACT §17.8. Setup and login need the header `Content-Type: application/json`.
+Test in the console (setup, sign-in, Inbox, Agents, Cloud accounts, People, Settings) and with
+`curl` against the endpoints in CONTRACT §17.8. Setup and login need the header
+`Content-Type: application/json`.
 
 - Setup with the code from `csg init`: weak passwords are refused; a correct authenticator
   code activates the account; the setup code cannot be used twice or after 72 hours.
@@ -86,10 +87,7 @@ resources exist.
 
 ## Out of scope (known, do not report)
 
-- Role bindings are not enforced on agent requests yet; agents still use the §16 role.
-- Agent ownership, agent-first sign-in, the five-field request (`read`/`write`/`full`), owner
-  approval and the MCP server are not built (CONTRACT §17.8).
-- The console still signs in with the admin token and has not been redesigned.
+- The admin token and the §16 agent model still exist alongside §17 until they are removed.
 - README, QUICKSTART, SECURITY, API and PRODUCT still describe v0.1.
 - AWS and GCP are not supported.
 - Two known low-severity items: an access-level change racing a new grant, and a retired

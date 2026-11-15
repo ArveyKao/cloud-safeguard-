@@ -157,6 +157,36 @@ export function QRCode({ text }: { text: string }) {
   return <div className="qr" aria-label="QR code for your authenticator app" dangerouslySetInnerHTML={{ __html: qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true }) }} />
 }
 
+// ---- confirmation ----
+
+export interface ConfirmRequest {
+  title: string
+  body: ReactNode
+  confirmLabel: string
+  danger?: boolean
+  run: () => Promise<unknown>
+}
+
+/** Asks before an action that changes authority or cannot be undone. The
+ *  action runs only after the person confirms. */
+export function useConfirm() {
+  const [ask, setAsk] = useState<ConfirmRequest | null>(null)
+  const action = useAction()
+  const confirm = useCallback((req: ConfirmRequest) => { action.setError(null); setAsk(req) }, [action])
+  const element = ask && (
+    <Modal title={ask.title} onClose={() => setAsk(null)}>
+      <div className="confirm-body">{ask.body}</div>
+      <ErrorNote error={action.error} />
+      <div className="row-actions">
+        <Button onClick={() => setAsk(null)}>Cancel</Button>
+        <Button kind={ask.danger ? 'danger' : 'primary'} busy={action.busy}
+          onClick={async () => { if (await action.run(ask.run)) setAsk(null) }}>{ask.confirmLabel}</Button>
+      </div>
+    </Modal>
+  )
+  return { confirm, element }
+}
+
 // ---- toasts ----
 
 type Toast = { id: number; text: string; tone: 'ok' | 'error' }

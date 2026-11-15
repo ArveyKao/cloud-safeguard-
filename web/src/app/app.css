@@ -178,3 +178,4 @@ pre { margin: 8px 0; padding: 12px 14px; border-radius: 8px; background: #0f172a
 .toasts { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
 .toast { background: #16181d; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 14px; max-width: 360px; }
 .toast-error { background: var(--red); }
+.confirm-body { color: var(--text-2); margin-bottom: 8px; }

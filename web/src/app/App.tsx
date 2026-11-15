@@ -4,7 +4,8 @@ import { api, setCsrf, setSignedOutHandler } from './api'
 import type { Person, SessionInfo } from './types'
 import { navigate, useLocation } from './router'
 import { Shell } from './Shell'
-import { useLoad } from './ui'
+import { useLoad, useToast } from './ui'
+import { ApiError } from './api'
 import { LoginPage } from './pages/Login'
 import { SetupPage } from './pages/Setup'
 import { InboxPage } from './pages/Inbox'
@@ -16,8 +17,25 @@ import { ActivityPage } from './pages/Activity'
 import { PeoplePage } from './pages/People'
 import { SettingsPage } from './pages/Settings'
 
-// A sign-in link (/?signin=CODE) survives the login screen.
+// A sign-in link (/?signin=CODE) survives the login screen, for as long as
+// the code lives at most, and is used once.
 const SIGNIN_KEY = 'csg.pendingSignIn'
+const SIGNIN_TTL_MS = 10 * 60 * 1000
+
+export function rememberSignIn(code: string) {
+  try { sessionStorage.setItem(SIGNIN_KEY, JSON.stringify({ code, at: Date.now() })) } catch { /* storage may be off */ }
+}
+
+export function takeSignIn(): string | null {
+  try {
+    const raw = sessionStorage.getItem(SIGNIN_KEY)
+    sessionStorage.removeItem(SIGNIN_KEY)
+    const v = raw ? JSON.parse(raw) as { code?: string; at?: number } : null
+    return v?.code && v.at && Date.now() - v.at < SIGNIN_TTL_MS ? v.code : null
+  } catch {
+    return null
+  }
+}
 
 export function App() {
   const { path, query } = useLocation()
@@ -27,17 +45,21 @@ export function App() {
   const signedIn = useCallback((s: SessionInfo) => {
     setCsrf(s.csrf_token)
     setSession(s)
-    const code = sessionStorage.getItem(SIGNIN_KEY)
-    sessionStorage.removeItem(SIGNIN_KEY)
+    const code = takeSignIn()
     navigate(code ? `/signin?code=${encodeURIComponent(code)}` : (path === '/login' || path === '/setup' || path === '/' ? '/inbox' : path))
   }, [path])
 
   useEffect(() => {
-    const code = query.get('signin')
-    if (code) sessionStorage.setItem(SIGNIN_KEY, code)
+    const linkCode = query.get('signin')
+    if (linkCode) rememberSignIn(linkCode)
     setSignedOutHandler(() => { setCsrf(''); setSession(null) })
     api.me()
-      .then((s) => { setCsrf(s.csrf_token); setSession(s); if (code) navigate(`/signin?code=${encodeURIComponent(code)}`) })
+      .then((s) => {
+        setCsrf(s.csrf_token)
+        setSession(s)
+        const code = takeSignIn()
+        if (code) navigate(`/signin?code=${encodeURIComponent(code)}`)
+      })
       .catch(() => setSession(null))
       .finally(() => setChecked(true))
     return () => setSignedOutHandler(null)
@@ -57,13 +79,23 @@ function SignedIn({ session, path, query, setSession }: {
   const person = session.person
   const pending = useLoad(() => api.myRequests('pending'), [], 10000)
   const setPerson = (p: Person) => setSession({ ...session, person: p })
+  const toast = useToast()
 
   useEffect(() => {
     if (path === '/' || path === '/login' || path === '/setup') navigate('/inbox')
   }, [path])
 
+  // The page only shows "signed out" once the server has ended the session
+  // (or says there is none); otherwise the cookie would still work.
   async function logout() {
-    try { await api.logout() } catch { /* the session may already be gone */ }
+    try {
+      await api.logout()
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 401)) {
+        toast('Sign out failed, so your session may still be active. Try again.', 'error')
+        return
+      }
+    }
     setCsrf('')
     setSession(null)
     navigate('/login')

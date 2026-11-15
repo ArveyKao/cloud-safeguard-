@@ -150,7 +150,7 @@ func (s *Server) buildHandler() http.Handler {
 	root.HandleFunc("/mock-cloud/", s.handleMockCloud)
 	root.HandleFunc("/", s.handleStatic)
 
-	return s.withAccessLog(s.recoverPanics(runToCompletion(root)))
+	return s.withAccessLog(securityHeaders(s.recoverPanics(runToCompletion(root))))
 }
 
 // ================= middleware =================
@@ -741,6 +741,25 @@ func runToCompletion(next http.Handler) http.Handler {
 		if !isSafeMethod(r.Method) {
 			r = r.WithContext(context.WithoutCancel(r.Context()))
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// contentSecurityPolicy allows only the console's own files: no inline
+// script, no other origins, and no framing by any page.
+const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+	"connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+// securityHeaders sets the browser protections on every response. Framing
+// is refused so no other page, same-site ones included, can overlay the
+// console and trick a click on Approve or Disable.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
 }

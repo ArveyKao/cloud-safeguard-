@@ -16,7 +16,8 @@ export default defineConfig({
     port: 18803,
     strictPort: true,
     proxy: {
-      '/api': { target: apiTarget, changeOrigin: true },
+      // Keep the browser's Host: the server checks Origin against it.
+      '/api': { target: apiTarget },
       '/mock-cloud': { target: apiTarget, changeOrigin: true },
       '/healthz': { target: apiTarget, changeOrigin: true },
     },
