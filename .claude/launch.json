@@ -1,6 +1,0 @@
-{
-  "version": "0.0.1",
-  "configurations": [
-    { "name": "csg-console", "runtimeExecutable": "/Users/arveykao/code/cloud-safeguard/build/csg", "runtimeArgs": ["serve", "--data-dir", "/private/tmp/claude-501/-Users-arveykao-code-cloud-safeguard/1ad559f6-3947-4336-986f-cfae12097612/scratchpad/console/data", "--addr", "127.0.0.1:18940"], "port": 18940 }
-  ]
-}
