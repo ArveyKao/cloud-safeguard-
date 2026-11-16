@@ -392,12 +392,6 @@ func (db *DB) DeleteSession(ctx context.Context, tokenHash string) error {
 	return mapErr(err)
 }
 
-// DeletePersonSessions removes every session of a person.
-func (db *DB) DeletePersonSessions(ctx context.Context, personID string) error {
-	_, err := db.sql.ExecContext(ctx, `DELETE FROM sessions WHERE person_id = ?`, personID)
-	return mapErr(err)
-}
-
 // DeleteStaleSessions removes sessions past their absolute expiry or idle
 // for longer than idle.
 func (db *DB) DeleteStaleSessions(ctx context.Context, now time.Time, idle time.Duration) error {

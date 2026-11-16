@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -12,156 +11,6 @@ import (
 
 // pollInterval is how often `--wait` and `csg exec` poll a pending lease.
 const pollInterval = time.Second
-
-// runRequest implements `csg request` (agent side).
-func (a *App) runRequest(args []string) error {
-	fs := a.newFlagSet("request", `Usage: csg request --capability ID [--param k=v]... [--ttl DUR] [--reason TEXT]
-                   [--break-glass] [--wait DUR] [--json]
-
-Requests a capability lease. Low-risk requests are auto-approved; higher-risk
-requests wait for an operator and can be polled with --wait.
-`)
-	cf := a.addClientFlags(fs)
-	capability := fs.String("capability", "", "capability ID (required)")
-	var params paramValues
-	fs.Var(&params, "param", "capability parameter key=value (repeatable)")
-	ttl := fs.String("ttl", "", "requested lease TTL (e.g. 10m); 0/omitted uses the capability default")
-	reason := fs.String("reason", "", "justification for the access")
-	breakGlass := fs.Bool("break-glass", false, "request break-glass access (required for critical capabilities)")
-	wait := fs.String("wait", "", "wait up to DUR for the lease to become active or terminal")
-	jsonOut := fs.Bool("json", false, "print JSON")
-	positionals, err := parseFlags(fs, args)
-	if err != nil {
-		return err
-	}
-	if len(positionals) != 0 {
-		return usagef("request takes no positional arguments")
-	}
-	if strings.TrimSpace(*capability) == "" {
-		return usagef("request requires --capability")
-	}
-	ttlSeconds, err := parseOptionalDurationSeconds(*ttl)
-	if err != nil {
-		return usagef("--ttl: %v", err)
-	}
-	waitTimeout, err := parseOptionalDurationSeconds(*wait)
-	if err != nil {
-		return usagef("--wait: %v", err)
-	}
-
-	client, err := a.agentClient(cf)
-	if err != nil {
-		return err
-	}
-	ctx := context.Background()
-	input := model.CreateLeaseInput{
-		CapabilityID: strings.TrimSpace(*capability),
-		Params:       params.mapValue(),
-		TTLSeconds:   ttlSeconds,
-		Reason:       strings.TrimSpace(*reason),
-		BreakGlass:   *breakGlass,
-	}
-	var lease model.Lease
-	if err := client.post(ctx, apiPrefix+"/agent/leases", input, &lease); err != nil {
-		return err
-	}
-	if waitTimeout > 0 {
-		lease, err = a.waitForLease(ctx, client, lease, time.Duration(waitTimeout)*time.Second)
-		if err != nil {
-			// Still show the last observed lease state before the timeout error.
-			if *jsonOut {
-				_ = a.printJSON(lease)
-			} else {
-				printLeaseSummary(a.Stdout, lease)
-			}
-			return err
-		}
-	}
-	return a.emitLease(lease, *jsonOut)
-}
-
-// waitForLease polls a pending lease until it is no longer pending or the
-// timeout expires. Polling is every second, as frozen by the contract.
-func (a *App) waitForLease(ctx context.Context, client *apiClient, lease model.Lease, timeout time.Duration) (model.Lease, error) {
-	deadline := time.Now().Add(timeout)
-	for lease.Status == model.LeasePending {
-		if !time.Now().Before(deadline) {
-			return lease, waitTimeoutf("timed out after %s waiting for lease %s (status %s)", timeout, lease.ID, lease.Status)
-		}
-		time.Sleep(pollInterval)
-		var updated model.Lease
-		if err := client.get(ctx, apiPrefix+"/agent/leases/"+pathEscape(lease.ID), &updated); err != nil {
-			return lease, err
-		}
-		lease = updated
-	}
-	return lease, nil
-}
-
-// emitLease prints a lease and maps denied/failed terminal states to exit 1.
-func (a *App) emitLease(lease model.Lease, jsonOut bool) error {
-	if jsonOut {
-		if err := a.printJSON(lease); err != nil {
-			return err
-		}
-	} else {
-		printLeaseSummary(a.Stdout, lease)
-	}
-	switch lease.Status {
-	case model.LeaseDenied:
-		return operationf("lease %s denied: %s", lease.ID, denialSummary(lease))
-	case model.LeaseFailed:
-		return operationf("lease %s failed: %s", lease.ID, lease.FailureReason)
-	}
-	return nil
-}
-
-// denialSummary condenses the deciding policy reasons of a denied lease.
-func denialSummary(lease model.Lease) string {
-	var parts []string
-	for _, reason := range lease.Decision.Reasons {
-		if reason.Outcome == "deny" {
-			parts = append(parts, reason.Rule+": "+reason.Detail)
-		}
-	}
-	if len(parts) == 0 {
-		if lease.DeniedReason != "" {
-			return lease.DeniedReason
-		}
-		return "denied by policy"
-	}
-	return strings.Join(parts, "; ")
-}
-
-// printLeaseSummary renders the compact agent-facing lease view.
-func printLeaseSummary(w io.Writer, lease model.Lease) {
-	next := ""
-	switch lease.Status {
-	case model.LeaseActive:
-		next = fmt.Sprintf("fetch the credential: csg credential --lease %s", lease.ID)
-	case model.LeasePending:
-		next = "waiting for operator approval (csg leases list --status pending)"
-	case model.LeaseDenied:
-		next = "no credential will be issued"
-	case model.LeaseFailed:
-		next = "no credential was issued"
-	case model.LeaseExpired, model.LeaseRevoked:
-		next = "no credential available"
-	}
-	fmt.Fprintf(w, "lease:     %s\n", lease.ID)
-	fmt.Fprintf(w, "status:    %s\n", lease.Status)
-	fmt.Fprintf(w, "decision:  %s\n", lease.Decision.Outcome)
-	fmt.Fprintf(w, "capability: %s\n", lease.CapabilityID)
-	fmt.Fprintf(w, "ttl:       %s\n", formatSeconds(lease.EffectiveTTLSeconds))
-	fmt.Fprintf(w, "expires:   %s\n", fmtTimePtr(lease.ExpiresAt))
-	if lease.DeniedReason != "" {
-		fmt.Fprintf(w, "reason:    %s\n", lease.DeniedReason)
-	}
-	if lease.FailureReason != "" {
-		fmt.Fprintf(w, "failure:   %s\n", lease.FailureReason)
-	}
-	fmt.Fprintf(w, "next:      %s\n", next)
-}
 
 // runCredential implements `csg credential` (agent side).
 func (a *App) runCredential(args []string) error {
@@ -257,7 +106,7 @@ func (a *App) runExec(args []string) error {
 		}
 	}
 	if separator < 0 {
-		return usagef("exec requires -- before the command: csg exec --capability ID [flags] -- CMD [ARGS...]")
+		return usagef("exec requires -- before the command: csg exec --account ID [flags] -- CMD [ARGS...]")
 	}
 	flagArgs := args[:separator]
 	cmdArgs := args[separator+1:]
@@ -267,22 +116,14 @@ func (a *App) runExec(args []string) error {
 
 	fs := a.newFlagSet("exec", `Usage: csg exec --account ID --resource R --permission P --ttl DUR [--name NAME]
                 [--reason TEXT] [--keep] [--wait DUR] -- CMD [ARGS...]
-       csg exec --capability ID [--param k=v]... [--ttl DUR] [--reason TEXT]
-                [--break-glass] [--keep] [--wait DUR] -- CMD [ARGS...]
 
 Asks for access, injects the Alibaba Cloud credential environment variables and
 runs CMD. The credential is revoked when CMD exits unless --keep is given. The
-child's exit code becomes csg's exit code. The first form is for agents signed
-in with csg login; the second is the older capability lease.
+child's exit code becomes csg's exit code.
 `)
 	cf := a.addClientFlags(fs)
 	af := addAccessFlags(fs)
-	capability := fs.String("capability", "", "capability ID (older capability leases)")
-	var params paramValues
-	fs.Var(&params, "param", "capability parameter key=value (repeatable)")
-	ttl, reason := af.ttl, af.reason
-	breakGlass := fs.Bool("break-glass", false, "request break-glass access")
-	keep := fs.Bool("keep", false, "keep the lease active after the command exits")
+	keep := fs.Bool("keep", false, "keep the credential after the command exits")
 	wait := fs.String("wait", "120s", "wait up to DUR for approval (default 2m)")
 	positionals, err := parseFlags(fs, flagArgs)
 	if err != nil {
@@ -291,71 +132,22 @@ in with csg login; the second is the older capability lease.
 	if len(positionals) != 0 {
 		return usagef("exec flags must come before --: unexpected arguments %v", positionals)
 	}
-	if strings.TrimSpace(*af.account) != "" {
-		if strings.TrimSpace(*capability) != "" {
-			return usagef("use either --account or --capability, not both")
-		}
-		in, err := af.input()
-		if err != nil {
-			return err
-		}
-		waitSeconds, err := parseDurationSeconds(*wait)
-		if err != nil {
-			return usagef("--wait: %v", err)
-		}
-		client, err := a.agentClient(cf)
-		if err != nil {
-			return err
-		}
-		return a.execWithAccess(client, in, time.Duration(waitSeconds)*time.Second, *keep, cmdArgs)
+	if strings.TrimSpace(*af.account) == "" {
+		return usagef("exec requires --account")
 	}
-	if strings.TrimSpace(*capability) == "" {
-		return usagef("exec requires --account (or --capability)")
-	}
-	ttlSeconds, err := parseOptionalDurationSeconds(*ttl)
+	in, err := af.input()
 	if err != nil {
-		return usagef("--ttl: %v", err)
+		return err
 	}
 	waitSeconds, err := parseDurationSeconds(*wait)
 	if err != nil {
 		return usagef("--wait: %v", err)
 	}
-
 	client, err := a.agentClient(cf)
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	capabilityID := strings.TrimSpace(*capability)
-
-	var lease model.Lease
-	if err := client.post(ctx, apiPrefix+"/agent/leases", model.CreateLeaseInput{
-		CapabilityID: capabilityID,
-		Params:       params.mapValue(),
-		TTLSeconds:   ttlSeconds,
-		Reason:       strings.TrimSpace(*reason),
-		BreakGlass:   *breakGlass,
-	}, &lease); err != nil {
-		return err
-	}
-	if lease.Status == model.LeasePending {
-		lease, err = a.waitForLease(ctx, client, lease, time.Duration(waitSeconds)*time.Second)
-		if err != nil {
-			printLeaseSummary(a.Stderr, lease)
-			// The command will not run: do not leave the request behind.
-			a.revokeAfterExec(client, lease.ID, "csg exec gave up waiting")
-			return err
-		}
-	}
-	if lease.Status != model.LeaseActive {
-		printLeaseSummary(a.Stderr, lease)
-		return operationf("lease %s is %s, so no credential is available", lease.ID, lease.Status)
-	}
-	envelope, err := a.fetchForExec(client, lease.ID)
-	if err != nil {
-		return err
-	}
-	return a.runWithCredential(client, lease.ID, "capability "+capabilityID, envelope, *keep, cmdArgs)
+	return a.execWithAccess(client, in, time.Duration(waitSeconds)*time.Second, *keep, cmdArgs)
 }
 
 // revokeLease revokes an agent-owned lease and returns the updated lease.

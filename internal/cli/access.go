@@ -401,14 +401,14 @@ func (a *App) warnIfCleartext(server string) {
 	fmt.Fprintf(a.Stderr, "warning: %s is not https; the token and sign-in codes travel unencrypted\n", server)
 }
 
-// noteReplacedConfig says so when a sign-in replaces a saved token of
-// another kind or for another server.
+// noteReplacedConfig says so when a sign-in replaces a saved token that is
+// not an agent token or is for another server.
 func (a *App) noteReplacedConfig(server string) {
 	old := a.loadFileConfig()
 	if old.Token == "" {
 		return
 	}
-	if kind := token.Kind(old.Token); kind != "agent" || normalizeServer(old.Server) != server {
-		fmt.Fprintf(a.Stderr, "note: replacing the saved %s token for %s\n", tokenKindLabel(kind), old.Server)
+	if token.Kind(old.Token) != "agent" || normalizeServer(old.Server) != server {
+		fmt.Fprintf(a.Stderr, "note: replacing the token saved for %s\n", old.Server)
 	}
 }

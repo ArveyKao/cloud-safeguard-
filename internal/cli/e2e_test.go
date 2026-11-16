@@ -48,16 +48,29 @@ func newE2E(t *testing.T) *e2e {
 	jar, _ := cookiejar.New(nil)
 	e := &e2e{t: t, url: hs.URL, provider: res.ProviderIDs[0], person: &http.Client{Jar: jar}}
 
-	// The bootstrap supervisor sets up, then takes a member role on the demo
-	// account, so their agents can ask for read and write.
+	// The bootstrap supervisor sets up, creates mei and makes her a member of
+	// the demo account. The rest of the test runs in mei's session, so her
+	// agents can ask for read and write. (The supervisor would be
+	// Administrator there.)
+	e.setup(res.Supervisor.SetupCode)
+	var mei model.PersonWithSetupCode
+	e.call(http.MethodPost, "/api/v1/supervisor/people", model.CreatePersonInput{Username: "mei"}, &mei, http.StatusCreated)
+	e.call(http.MethodPut, "/api/v1/supervisor/accounts/"+e.provider+"/people/"+mei.Person.ID, model.PutBindingInput{Role: model.RoleMember}, nil, http.StatusOK)
+	jar, _ = cookiejar.New(nil)
+	e.person, e.csrf = &http.Client{Jar: jar}, ""
+	e.setup(mei.SetupCode)
+	return e
+}
+
+// setup completes a person's setup and leaves e in their console session.
+func (e *e2e) setup(setupCode string) {
+	e.t.Helper()
 	var begin model.SetupBeginResult
-	e.call(http.MethodPost, "/api/v1/auth/setup/begin", model.SetupBeginInput{SetupCode: res.Supervisor.SetupCode, Password: "an e2e test passphrase"}, &begin, http.StatusOK)
+	e.call(http.MethodPost, "/api/v1/auth/setup/begin", model.SetupBeginInput{SetupCode: setupCode, Password: "an e2e test passphrase"}, &begin, http.StatusOK)
 	code, _ := authn.TOTPCode(begin.TOTPSecret, authn.TOTPStep(time.Now()))
 	var info model.SessionInfo
-	e.call(http.MethodPost, "/api/v1/auth/setup/finish", model.SetupFinishInput{SetupCode: res.Supervisor.SetupCode, TOTPCode: code}, &info, http.StatusOK)
+	e.call(http.MethodPost, "/api/v1/auth/setup/finish", model.SetupFinishInput{SetupCode: setupCode, TOTPCode: code}, &info, http.StatusOK)
 	e.csrf, e.personID = info.CSRFToken, info.Person.ID
-	e.call(http.MethodPut, "/api/v1/supervisor/accounts/"+e.provider+"/people/"+e.personID, model.PutBindingInput{Role: model.RoleMember}, nil, http.StatusOK)
-	return e
 }
 
 // call is a request in the person's console session.

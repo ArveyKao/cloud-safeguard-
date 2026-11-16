@@ -112,21 +112,3 @@ func TestListenAndServeReportsBindErrors(t *testing.T) {
 		t.Fatal("ListenAndServe accepted an invalid listen address")
 	}
 }
-
-func TestInitResultAdminTokenPrefixIsNonSecret(t *testing.T) {
-	dir := t.TempDir()
-	result, err := Init(context.Background(), InitOptions{DataDir: dir})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	// The stored/displayed prefix must be a short hint, not the token.
-	if result.AdminTokenPrefix == result.AdminToken {
-		t.Fatal("admin token prefix equals the full admin token")
-	}
-	if len(result.AdminTokenPrefix) > 16 {
-		t.Fatalf("admin token prefix length = %d, want a short hint", len(result.AdminTokenPrefix))
-	}
-	if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err == nil {
-		t.Fatal("re-init without --force succeeded")
-	}
-}

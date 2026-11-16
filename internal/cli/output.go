@@ -67,14 +67,6 @@ func formatSeconds(secs int) string {
 	return (time.Duration(secs) * time.Second).String()
 }
 
-// joinOrDash joins a string slice for table display.
-func joinOrDash(values []string) string {
-	if len(values) == 0 {
-		return "-"
-	}
-	return strings.Join(values, ",")
-}
-
 // yesNo renders a boolean for human output.
 func yesNo(v bool) string {
 	if v {

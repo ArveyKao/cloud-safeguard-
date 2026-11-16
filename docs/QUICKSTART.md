@@ -2,26 +2,24 @@
 
 Two paths:
 
-- **Part 1 — Demo (5 minutes, no cloud account):** build the binary, bootstrap a throwaway
-  instance with the built-in mock cloud, and walk through auto-approve, least privilege,
-  human approval, denial, break-glass revocation and audit verification.
-- **Part 2 — Real Alibaba Cloud `sts` mode:** wire a RAM user + RAM role into the platform
-  and mint real short-lived STS credentials.
+- **Part 1 — Demo (10 minutes, no cloud account):** build the binary, start a throwaway
+  instance with the built-in mock cloud, sign in to the console, sign an agent in, and walk
+  through automatic read access, least privilege, approval, revocation and the audit log.
+- **Part 2 — Real Alibaba Cloud:** connect an account through a RAM user and a RAM role and
+  issue real short-lived STS credentials.
 
-Part 1 commands are the supported demo/verification path. Part 2 commands require a real
-Alibaba Cloud account and are **not exercised by this build's automated checks** (the
-`sts` signer is unit-tested against a fake STS endpoint); verify them in your account
-before relying on them.
+Part 1 is covered by the automated checks (`make demo`). Part 2 needs a real Alibaba Cloud
+account and **has not been run against a live account yet**; the STS signer is unit-tested
+against a fake endpoint. Verify it in your account before relying on it.
 
 ---
 
 ## Prerequisites
 
 - Go 1.24+ (`go version`)
-- Node.js ≥ 20 and npm (needed by `make build` for the embedded console)
-- macOS or Linux, a free loopback port (`8787` for the default address, `18787` for the
-  scripted demo)
-- No cloud account, no credentials, for Part 1
+- Node.js ≥ 20 and npm (needed by `make build` for the console)
+- macOS or Linux, a free loopback port (`8787` by default, `18787` for the scripted demo)
+- An authenticator app (any TOTP app) for the console sign-in
 
 ---
 
@@ -30,299 +28,231 @@ before relying on them.
 ## 1.1 Build
 
 ```bash
-cd /path/to/cloud-safeguard
 make build
-# → bin/csg (single binary with the web console embedded)
 ```
 
-`make build` installs web dependencies, builds the React console into `web/dist`, then
-builds `bin/csg`. `make test` runs the Go suite; `make vet` runs `go vet`.
+This builds the console and one binary, `build/csg`.
 
-## 1.2 Bootstrap a throwaway instance
+## 1.2 Create a throwaway instance
 
 ```bash
-./bin/csg init --demo --data-dir .demo/data
+./build/csg init --demo --data-dir .demo/data
 ```
 
-This creates `.demo/data` (mode 0700) with:
+It creates the master key, the database, a mock cloud account (`demo-aliyun`, cloud account
+ID `1234567890123456`) and the first supervisor, `admin`. It prints one secret: the
+supervisor's **setup code**, shown once and valid for 72 hours. There is no admin token and
+no agent token.
 
-- `master.key` (0600) — protects the vault;
-- `csg.db` — SQLite store (no plaintext secrets);
-- 5 built-in capabilities, the `demo-aliyun` mock provider, and two demo agents:
-  `claude-code` and `hermes-researcher`.
-
-It prints the **admin token** (for the API and the admin CLI), **one-time agent tokens** for
-the demo agents, and the first supervisor's **setup code** for the console. They are shown
-exactly once and are never retrievable again.
-
-> Save the tokens now, e.g. in a password manager or a 0600 file outside the repo.
-> If you lose an agent token, rotate it later with `csg agents rotate-token ID`.
-> If you lose the admin token, `csg init --force --data-dir <dir>` rotates it (data is
-> kept) and prints the new one.
-
-`--json` emits the whole bootstrap result as `{"data": ...}`; that is useful for scripting
-but still contains the secrets, so redirect it somewhere private if you use it.
+`csg init` never touches a directory that is already initialized. If the setup code is lost
+or expires, run `./build/csg supervisor recover --username admin --data-dir .demo/data` on the
+same machine to get a new one.
 
 ## 1.3 Start the control plane
 
 ```bash
-./bin/csg serve --data-dir .demo/data
-# console + API: http://127.0.0.1:8787
+./build/csg serve --data-dir .demo/data
 ```
 
-The server binds loopback by default. It logs the console URL and API URL; the console is
-the same HTTP origin. Run it in the foreground and stop it with `Ctrl-C` when done.
+The console and the API are at `http://127.0.0.1:8787`. Leave it running.
 
-## 1.4 Set up your account in the console
+## 1.4 Set up the supervisor in the console
 
-Open <http://127.0.0.1:8787> and choose **Set up your account**. Enter the setup code
-`csg init` printed, choose a password, scan the QR code with an authenticator app and enter
-the 6-digit code it shows. After that you sign in with your username (`admin` by default),
-password and a fresh code. As a supervisor you can add people, give them roles on cloud
-accounts and set limits; the console never asks for the admin token.
+1. Open `http://127.0.0.1:8787` and choose **Set up your account**.
+2. Enter the setup code and choose a password.
+3. Scan the QR code with your authenticator app and enter the six-digit code.
 
-## 1.5 Auto-approved read (no human involved)
+You are signed in as a supervisor. A supervisor manages the platform (cloud accounts, people,
+roles, limits) and is **Administrator on every cloud account**.
 
-In a second terminal, act as the `claude-code` agent. Use the `csg_agt_...` token that
-`init` printed for `claude-code`:
+## 1.5 Add a person and give them a role
+
+For the demo you can use the supervisor for everything. To see how roles work, add a second
+person:
+
+1. **People → + Add person**, username `mei`. Copy the setup code you are shown.
+2. **Cloud accounts → demo-aliyun → People and roles**: add `mei` as **Guest**.
+3. Open the console in a private window, choose **Set up your account** and finish mei's
+   setup with her code.
+
+| Role | The person's agents can get |
+| --- | --- |
+| Guest | read |
+| Member | read and write (change existing resources) |
+| Administrator | read, write and full (create and delete) |
+
+Nobody, at any role, can get permission to manage RAM users, roles or policies.
+
+## 1.6 Sign an agent in
+
+In a second terminal:
 
 ```bash
-export CSG_SERVER=http://127.0.0.1:8787
-export CSG_TOKEN='csg_agt_...'          # claude-code agent token
-
-./bin/csg request --capability aliyun.cloud.read \
-  --reason "collect inventory for weekly report" \
-  --wait 30s
+./build/csg login --server http://127.0.0.1:8787 --name my-agent
 ```
 
-Expected: the policy engine returns `auto_approve` with rule reasons, the lease becomes
-`active`, and the command prints the lease id (`lea_...`). No human action was needed.
-
-Fetch the short-lived credential and use it against the mock cloud:
+It prints a link and a short code, then waits. Open the link in the console (as mei), check
+that the code matches, and approve. The agent now belongs to mei and inherits her role on
+each cloud account. No token is copied by hand; it is saved to
+`~/.config/cloud-safeguard/config.json` with mode 0600.
 
 ```bash
-eval "$(./bin/csg credential --lease lea_... --export)"
-./bin/csg mock request GET /v1/ecs/instances
-# → 200, {"RequestId":...,"RegionId":"cn-hangzhou","Instances":[...]}
+./build/csg whoami
+./build/csg accounts          # the cloud accounts this agent may ask for, and up to what
 ```
 
-`.demo/data` is gitignored; never commit tokens.
-
-## 1.6 Least privilege is in the credential
-
-The same read credential cannot restart an instance:
+## 1.7 Read access: issued at once
 
 ```bash
-./bin/csg mock request POST /v1/ecs/instances/i-2ze0demo001/restart
-# → HTTP 403 {"Code":"Forbidden.RAM",...}
+./build/csg exec --account 1234567890123456 --resource ecs --permission read --ttl 10m \
+  -- ./build/csg mock request GET /v1/ecs/instances
 ```
 
-The read policy only allows `Describe*`/`List*` actions, so the demo cloud rejects the
-write even though the request is validly authenticated. Note the CLI exits `1` on HTTP
-≥ 400.
+`csg exec` asks for access, runs the command with the credential in its environment, and
+gives the credential back when the command ends. Every request names five things: the cloud
+account, the resource type (`ecs`, `dns` or `oss`), the permission (`read`, `write` or
+`full`), a validity period, and optionally one resource name. A reason is required above
+read.
 
-One-shot alternative (requests, waits, injects the credential env, runs the child,
-revokes the lease on exit):
+To hold a credential yourself:
 
 ```bash
-./bin/csg exec --capability aliyun.cloud.read \
-  --reason "one-shot inventory" \
-  -- ./bin/csg mock request GET /v1/ecs/instances
+./build/csg access request --account 1234567890123456 --resource ecs --permission read --ttl 10m
+# → request lea_..., status active
+eval "$(./build/csg credential --lease lea_... --export)"
+./build/csg mock request GET /v1/ecs/instances                      # works
+./build/csg mock request POST /v1/ecs/instances/i-2ze0demo001/restart
+# → 403 Forbidden.RAM: a read credential cannot restart an instance
+./build/csg revoke --lease lea_...                                  # give it back early
 ```
 
-## 1.7 One-click approval for a risky change
+Least privilege is in the credential itself: the policy attached to it allows only what was
+asked for.
 
-In the agent terminal, request DNS management for one domain (this stays pending until a
-human decides; `--wait 2m` polls every second):
+## 1.8 Write access: the owner approves
+
+A guest's agent cannot get write access at all:
 
 ```bash
-./bin/csg request --capability aliyun.dns.manage \
-  --param domain=arveykao.com \
-  --ttl 10m \
-  --reason "add ACME DNS-01 TXT record for arveykao.com" \
-  --wait 2m
+./build/csg access request --account 1234567890123456 --resource ecs --permission write \
+  --ttl 10m --reason "restart after a config change"
+# → status denied: the owner's role guest does not permit write access
 ```
 
-In a third terminal, act as the operator:
+As the supervisor, change mei's role to **Member**, then ask again and wait:
 
 ```bash
-export CSG_SERVER=http://127.0.0.1:8787
-export CSG_TOKEN='csg_adm_...'          # admin token from init
-
-./bin/csg leases list --status pending
-./bin/csg leases approve lea_... --ttl 10m --note "ACME renewal for arveykao.com"
+./build/csg access request --account 1234567890123456 --resource ecs --permission write \
+  --name i-2ze0demo001 --ttl 10m --reason "restart after a config change" --wait 5m
 ```
 
-The waiting agent request returns `active`. Back in the agent terminal, fetch the
-credential and exercise exactly the approved scope:
+The request appears in mei's **Inbox**. Only mei can approve it; a supervisor can deny or
+revoke any request but never approve one. After she approves, the command returns and the
+credential can restart that one instance and nothing else.
 
-```bash
-eval "$(./bin/csg credential --lease lea_... --export)"
-./bin/csg mock request GET /v1/dns/zones/arveykao.com/records
-./bin/csg mock request POST /v1/dns/zones/arveykao.com/records \
-  '{"name":"_acme-challenge","type":"TXT","value":"demo-challenge-abc","ttl":600}'
-# → 200, record created
-./bin/csg mock request POST /v1/ecs/instances/i-2ze0demo001/restart
-# → 403: the DNS-scoped credential cannot touch ECS
+## 1.9 Approval modes
+
+In **Settings**, each person picks how much their agents get without asking: **Read** (the
+default), **Write** or **Full**, optionally for a limited time. A supervisor sets the highest
+automatic level per cloud account (default read). What is issued without approval is the
+lowest of the person's role, their mode and the account's level.
+
+## 1.10 Revocation
+
+- Lower mei's role back to **Guest**: the write credential is revoked at once, and the mock
+  cloud refuses it with `InvalidSecurityToken`.
+- The owner can take back one credential in the **Inbox**. A supervisor can stop any
+  credential through the API (`POST /api/v1/supervisor/leases/{id}/revoke`); the console
+  does not have a button for that yet.
+- Suspending a person, or revoking an agent on the **Agents** page, revokes everything that
+  agent holds.
+- Every credential also ends at its deadline.
+
+## 1.11 Audit
+
+**Activity** (as a supervisor) shows every sign-in, request, decision, credential fetch,
+revocation and mock cloud call, with who caused it, and whether the hash chain verifies.
+
+## 1.12 Use it from Claude, Cursor or another agent (MCP)
+
+`csg mcp` is an MCP server over stdio with five tools: `list_accounts`, `request_access`,
+`check_status`, `get_credential` and `revoke`. After `csg login`, add it to the agent's MCP
+configuration:
+
+```json
+{ "mcpServers": { "cloud-safeguard": { "command": "/absolute/path/to/build/csg", "args": ["mcp"] } } }
 ```
 
-These older capability leases are approved with the admin CLI. Access requests from agents
-signed in with `csg login` are approved by the agent's owner in the console **Inbox**.
+`get_credential` never returns the secret to the model. It writes a file readable only by
+you under `~/.config/cloud-safeguard/credentials/` and returns its path, to be sourced by the
+command that needs it.
 
-## 1.8 Denial
-
-Request another DNS lease, then have the operator deny it:
-
-```bash
-# agent terminal
-./bin/csg request --capability aliyun.dns.manage --param domain=guanlanstudio.com \
-  --ttl 10m --reason "add a record" --wait 2m
-# → pending; leave it waiting
-
-# admin terminal
-./bin/csg leases list --status pending
-./bin/csg leases deny lea_... --reason "change window not approved"
-```
-
-The agent command returns `denied` (exit code `1`), there is no credential for the lease,
-and the audit log holds both `lease.requested` and `lease.denied`.
-
-A policy-level denial is immediate: `hermes-researcher` has only `aliyun.cloud.read`, so
-requesting an ECS capability with its token is denied with rule `capability_not_granted`
-and no lease credential is ever possible.
-
-## 1.9 Break-glass and revocation
-
-Break-glass is the `critical` capability and always requires explicit intent plus a human:
-
-```bash
-# agent terminal (claude-code)
-./bin/csg request --capability aliyun.iam.break_glass \
-  --reason "incident 42: recover DNS" --wait 2m
-# → denied: rule break_glass_required
-
-./bin/csg request --capability aliyun.iam.break_glass --break-glass \
-  --reason "incident 42: recover DNS" --wait 2m
-# → pending
-```
-
-Approve it as operator, then verify the audit severity and the immediate revocation:
-
-```bash
-# admin terminal
-./bin/csg leases approve lea_... --ttl 5m --note "incident 42, approved by on-call"
-./bin/csg audit list --severity critical --limit 20
-
-# agent terminal: use the credential once
-eval "$(./bin/csg credential --lease lea_... --export)"
-./bin/csg mock request GET /v1/ecs/instances          # 200: break-glass allows it
-
-# admin terminal: revoke
-./bin/csg leases revoke lea_... --reason "incident resolved"
-
-# agent terminal: the previously working credential is dead immediately
-./bin/csg mock request GET /v1/ecs/instances
-# → HTTP 401 {"Code":"InvalidSecurityToken.Revoked",...}
-```
-
-In mock mode revocation is instant because the mock cloud re-checks the lease on every
-call. In real `sts` mode the control plane stops renewal and scrubs its copy, but an
-already-issued cloud session lives until its expiry — see
-[SECURITY.md](SECURITY.md) §9.
-
-## 1.10 Audit
-
-```bash
-# admin terminal
-./bin/csg audit list --limit 20
-./bin/csg audit list --severity critical
-./bin/csg audit verify
-# → ok=true, events=N
-```
-
-Every request, decision, issuance, fetch, revoke and mock cloud API call is in the
-hash-chained log. The console **Audit** page shows the same data with a *Verify chain*
-button.
-
-## 1.11 One-command demo
-
-The full S1–S8 scenario is scripted (clean data dir, mock cloud, port `18787`, PASS/FAIL
-lines, exit 0 only if everything passes, server cleaned up):
+## 1.13 The scripted demo
 
 ```bash
 make demo
 ```
 
-## 1.12 Clean up
+It starts its own instance on port 18787 and runs nine scenarios end to end (setup, agent
+sign-in, automatic read, least privilege, denial, approval, revocation on a role change,
+the supervisor's emergency stop, audit and a secret-leak check), then prints
+`all S1-S9 scenarios passed`.
+
+## 1.14 Clean up
+
+Stop the server with Ctrl-C, then:
 
 ```bash
-# stop the server with Ctrl-C, then remove the throwaway instance:
 rm -rf .demo
+rm -f ~/.config/cloud-safeguard/config.json
 ```
 
 ---
 
-# Part 2 — Real Alibaba Cloud `sts` mode
+# Part 2 — Real Alibaba Cloud
 
-This section requires: an Alibaba Cloud account, its **account ID** (the numeric UID), and
-RAM permissions to create users/roles/policies. Credentials are never printed; paste secret
-material into 0600 files or stdin.
+You need an Alibaba Cloud account, its numeric **account ID**, and permission to create RAM
+users, roles and policies.
 
-> ⚠️ Not exercised against a live account in this build. The platform's STS signer is
-> implemented and unit-tested against a fake STS endpoint; treat this as a setup guide to
-> verify (`csg providers test`, then a read lease) before production use.
-> References: [AssumeRole API](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-assumerole)
-> (inline policy intersects the role policy; `DurationSeconds` minimum 900 s),
+> ⚠️ Not yet run against a live account. Start with the connection test and a read request.
+> References: [AssumeRole](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-assumerole)
+> (the session policy intersects the role's policy; `DurationSeconds` is at least 900 s),
 > [RAM role trust policy](https://www.alibabacloud.com/help/en/ram/user-guide/edit-the-trust-policy-of-a-ram-role).
 
 ## 2.1 Create the broker RAM user
 
-1. In **RAM → Identities → Users**, create a user `csg-broker` with **programmatic access**
-   and save its AccessKey ID + Secret once.
-2. Create and attach a custom policy that only allows assuming the platform role. Replace
+1. In **RAM → Identities → Users**, create a user `csg-broker` with an AccessKey, and save
+   the AccessKey ID and secret once.
+2. Attach a custom policy that only allows assuming the platform's role. Replace
    `<account-id>`:
 
 ```json
 {
   "Version": "1",
   "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["sts:AssumeRole"],
-      "Resource": ["acs:ram::<account-id>:role/csg-agent"]
-    }
+    { "Effect": "Allow", "Action": ["sts:AssumeRole"], "Resource": ["acs:ram::<account-id>:role/csg-agent"] }
   ]
 }
 ```
 
-This long-lived key is the one value Cloud Safeguard vaults. It has no cloud permissions of
-its own — only the right to assume the role (whose attached policy becomes the outer bound,
-see 2.9).
+This long-lived key is the one value Cloud Safeguard stores, encrypted. It has no cloud
+permissions of its own.
 
 ## 2.2 Create the RAM role
 
-1. In **RAM → Identities → Roles**, create `csg-agent` trusted by the RAM user
-   `csg-broker`. Trust policy:
+1. In **RAM → Identities → Roles**, create `csg-agent`, trusted by the RAM user `csg-broker`:
 
 ```json
 {
   "Version": "1",
   "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "sts:AssumeRole",
-      "Principal": {
-        "RAM": ["acs:ram::<account-id>:user/csg-broker"]
-      }
-    }
+    { "Effect": "Allow", "Action": "sts:AssumeRole", "Principal": { "RAM": ["acs:ram::<account-id>:user/csg-broker"] } }
   ]
 }
 ```
 
-2. Attach a permission policy to the role matching the capabilities you will grant.
-   **There is no need to attach `AdministratorAccess`.** The per-lease inline policy can
-   only narrow permissions, never expand them (Alibaba Cloud computes the intersection), so
-   attach the union of what your capability catalog may need. For the five built-ins:
+2. Attach a permission policy to the role. It is the outer limit: each credential's own
+   policy can only narrow it. For everything the built-in templates can ask for:
 
 ```json
 {
@@ -331,16 +261,13 @@ see 2.9).
     {
       "Effect": "Allow",
       "Action": [
-        "ecs:Describe*",
-        "ecs:StartInstance",
-        "ecs:StopInstance",
-        "ecs:RebootInstance",
-        "alidns:Describe*",
-        "alidns:AddDomainRecord",
-        "alidns:UpdateDomainRecord",
-        "alidns:DeleteDomainRecord",
-        "alidns:SetDomainRecordStatus",
-        "oss:List*",
+        "ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance",
+        "ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance",
+        "alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
+        "alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus",
+        "alidns:AddDomain", "alidns:DeleteDomain",
+        "oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload",
+        "oss:PutBucket", "oss:DeleteBucket",
         "sts:GetCallerIdentity"
       ],
       "Resource": ["*"]
@@ -349,180 +276,90 @@ see 2.9).
 }
 ```
 
-> Trade-off: `aliyun.iam.break_glass` is still bounded by this role policy unless you
-> attach a broader policy to the role. Start narrow; widen only with a documented reason.
-> The role's session duration (`MaxSessionDuration`) must be ≥ 3600 s if you want the
-> platform's global 3600 s TTL ceiling.
+Leave out what you never want an agent to do; a request for it then fails in the cloud. Do
+not attach `AdministratorAccess`, and do not allow any `ram:` action. The role's maximum
+session duration must be at least 3600 s if you keep the default one-hour limit.
 
-## 2.3 Initialize a non-demo instance
+## 2.3 Start a real instance
 
-Do **not** use `--demo` for real cloud use: demo seeds a mock provider, and mock mode is
-not a security boundary.
-
-```bash
-./bin/csg init --data-dir ./data
-# prints the admin token once — store it in a password manager
-./bin/csg serve --data-dir ./data
-```
-
-The data dir contains the SQLite DB and `master.key` (0600). For production, inject the
-master key instead of keeping it next to the DB: set `CSG_MASTER_KEY` to a base64-encoded
-32-byte key (e.g. from a secret manager via a 0600 `EnvironmentFile`). See
-[SECURITY.md](SECURITY.md) §7.
-
-## 2.4 Add and test the provider (one terminal, operator)
+Do not use `--demo` for real use: it adds a mock account, and mock mode is not a security
+boundary.
 
 ```bash
-export CSG_SERVER=http://127.0.0.1:8787
-export CSG_TOKEN='csg_adm_...'
-
-# Put the broker secret in a private file; never pass it on the command line.
-install -m 600 /dev/null /tmp/csg-broker.secret
-# write the AccessKey secret into /tmp/csg-broker.secret with your secret tooling, then:
-
-./bin/csg providers add \
-  --name aliyun-prod \
-  --mode sts \
-  --region cn-hangzhou \
-  --role-arn 'acs:ram::<account-id>:role/csg-agent' \
-  --access-key-id 'LTAI...' \
-  --access-key-secret-file /tmp/csg-broker.secret
-# → provider id prv_...
-
-rm -f /tmp/csg-broker.secret
-
-./bin/csg providers test prv_...
-# → test passes (signed sts:GetCallerIdentity)
+./build/csg init --data-dir /var/lib/csg
+./build/csg serve --data-dir /var/lib/csg
 ```
 
-(`--access-key-secret-stdin` is also supported if piping from a secret manager.)
+`init` prints the first supervisor's setup code once. The server listens on `127.0.0.1` only.
+To reach it from other machines, put a TLS reverse proxy in front and start it with
+`--public-url https://csg.example.com` (and `--trusted-proxy` for the proxy's address). Back
+up `master.key` separately from the database: without it the stored AccessKey cannot be
+decrypted.
 
-## 2.5 Create an agent, grant capabilities, request a lease
+## 2.4 Add the cloud account (console only)
 
-```bash
-./bin/csg agents create \
-  --name ops-agent \
-  --description "Manages DNS and ECS for the web stack" \
-  --capability aliyun.cloud.read,aliyun.dns.manage,aliyun.ecs.instance.ops \
-  --max-ttl 30m \
-  --max-concurrent 2
-# → prints the agent id (agt_...) and a one-time token csg_agt_...
+Adding a cloud account is done in the console by a supervisor, never from the command line
+and never by an agent.
 
-# Agent side: request a read lease and export the STS credential.
-```
+1. **Cloud accounts → + Add cloud account**.
+2. **Account**: the numeric account ID, a name and the region.
+3. **Role**: the page shows the trust policy from 2.2 with your account ID filled in.
+4. **Connect**: the role ARN (`acs:ram::<account-id>:role/csg-agent`) and the broker's
+   AccessKey ID and secret. The secret is encrypted on arrival and never shown again.
+5. **Test connection** signs one `sts:GetCallerIdentity` call.
 
-Now run as the agent in its own environment (use the one-time `csg_agt_...` token printed
-by `agents create`):
+Then give people their roles on the account, and decide its highest automatic level.
 
-```bash
-export CSG_SERVER=http://127.0.0.1:8787
-export CSG_TOKEN='csg_agt_...'       # ops-agent's one-time token
+## 2.5 Sign agents in and ask for access
 
-./bin/csg request --capability aliyun.cloud.read \
-  --reason "inventory before change" --wait 30s
-eval "$(./bin/csg credential --lease lea_... --export)"
-```
+Exactly as in Part 1: `csg login`, then `csg accounts`, `csg access request`, `csg exec` or
+the MCP server. On a real account the shortest validity is 15 minutes.
 
 ## 2.6 Use the credential with the Alibaba Cloud CLI
 
-The exported variables are exactly what the Alibaba Cloud CLI/SDKs read:
-`ALIBABA_CLOUD_ACCESS_KEY_ID`, `ALIBABA_CLOUD_ACCESS_KEY_SECRET`,
-`ALIBABA_CLOUD_SECURITY_TOKEN`.
+The credential arrives as `ALIBABA_CLOUD_ACCESS_KEY_ID`, `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
+and `ALIBABA_CLOUD_SECURITY_TOKEN`, which the Alibaba Cloud CLI and SDKs read.
 
-> **Careful:** the Alibaba Cloud CLI resolves **config file > environment variables**
-> (command-line flags first, then `~/.aliyun/config.json`, then env vars). If an old
-> profile with a long-lived AccessKey still exists in `~/.aliyun/config.json`, it will
-> silently win over the lease credential. Set `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` and
-> remove the stale profile when retiring old copies.
+> **Careful:** the Alibaba Cloud CLI prefers `~/.aliyun/config.json` over environment
+> variables. An old profile with a long-lived AccessKey silently wins. Set
+> `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` and remove the old profile.
 
 ```bash
 export ALIBABA_CLOUD_IGNORE_PROFILE=TRUE
-aliyun sts GetCallerIdentity
-aliyun ecs DescribeInstances --RegionId cn-hangzhou
-```
-
-Or let the platform set up the environment for exactly one child process and revoke the
-lease afterwards:
-
-```bash
-./bin/csg exec --capability aliyun.cloud.read --reason "inventory" \
+./build/csg exec --account <account-id> --resource ecs --permission read --ttl 15m \
   -- aliyun ecs DescribeInstances --RegionId cn-hangzhou
 ```
 
-A write operation outside the requested capability fails with a RAM `Forbidden` error,
-because the session inline policy only carries the lease's actions/resources.
+## 2.7 Rotate the broker AccessKey
 
-## 2.7 Approve a risky lease
+Create a new AccessKey for `csg-broker` in the Alibaba Cloud console, then in **Cloud
+accounts → the account → Replace AccessKey** enter the new pair and run **Test connection**. Delete
+the old AccessKey in Alibaba Cloud afterwards. Credentials already issued keep working until
+their deadline; no agent or script changes.
 
-```bash
-# agent terminal
-./bin/csg request --capability aliyun.dns.manage \
-  --param domain=arveykao.com --ttl 15m \
-  --reason "add ACME DNS-01 TXT record" --wait 5m
+## 2.8 Notes and limits
 
-# admin terminal
-./bin/csg leases list --status pending
-./bin/csg leases approve lea_... --ttl 15m --note "ACME renewal for arveykao.com"
-```
-
-In real mode request **at least 900 s** for any lease: Alibaba Cloud STS
-`DurationSeconds` minimum is 15 minutes. The built-in `aliyun.cert.dns01` defaults to
-600 s (designed for the mock demo), so pass `--ttl 15m` for it in `sts` mode.
-
-## 2.8 Rotate the broker credential
-
-```bash
-# Create a new AccessKey for the csg-broker RAM user in the Alibaba Cloud console first.
-install -m 600 /dev/null /tmp/csg-broker-new.secret
-# write the new secret into that file, then:
-./bin/csg providers rotate prv_... \
-  --access-key-id 'LTAI...new' \
-  --access-key-secret-file /tmp/csg-broker-new.secret
-rm -f /tmp/csg-broker-new.secret
-./bin/csg providers test prv_...
-```
-
-Existing leases keep working; the next lease mints with the new broker credential; no
-agent, server script or cron entry changes. Then disable/delete the old AccessKey in RAM.
-See the full runbook in [SECURITY.md](SECURITY.md) §6.
-
-## 2.9 Real-mode notes and limits
-
-- **Session policy intersects the role policy.** The inline policy can only narrow the
-  role's attached permissions. If an action is denied in the cloud even though the
-  capability template allows it, check the role's attached policy first.
-- **`DurationSeconds` 900–3600 s.** STS also caps it at the role's `MaxSessionDuration`.
-  Requests below 900 s fail minting with a provider error (`InvalidParameter.DurationSeconds`),
-  leaving the lease `failed`.
-- **Inline policy size is limited** (2,048 characters for the AssumeRole `Policy`
-  parameter). Keep custom capability templates compact.
-- **No instant single-session revocation** in real STS mode: revoke the lease to stop
-  renewal, and tighten the RAM role policy if an issued credential may be leaked
-  ([SECURITY.md](SECURITY.md) §9).
-- **`RoleSessionName` is `csg-<agentID>-<leaseID>`** — filter Alibaba Cloud ActionTrail by
-  it to correlate cloud actions to a platform lease.
-- **Not live-tested in this build**: start with `providers test` and a read lease.
-  Placeholder credentials still reach Alibaba Cloud and return a provider error (for
-  example `InvalidAccessKeyId.NotFound`); that confirms the request path, but only a real
-  account produces success.
+- **The session policy intersects the role's policy.** If the cloud denies an action a
+  request should allow, check the policy attached to the role first.
+- **Validity is 900–3600 s** on a real account, and never longer than the role's maximum
+  session duration.
+- **A real STS credential cannot be cancelled in the cloud.** Revoking it here stops the
+  agent from fetching it again and removes the stored copy, but a copy the agent already
+  has works until its deadline. Keep validity periods short; if one may have leaked,
+  tighten the role's policy ([SECURITY.md](SECURITY.md)).
+- **The session name is `csg-<agent id>-<request id>`.** Filter ActionTrail by it to match
+  cloud actions to a request.
 
 ---
 
 # Part 3 — Verify the build
 
 ```bash
-go test ./...                 # Go unit/integration suite
-go vet ./...                  # static checks
-cd web && npm run typecheck && npm run build && cd ..
-make build                    # single binary with embedded console
-make demo                     # scripted S1–S8 end-to-end demo
-```
-
-For a CLI smoke check that needs no data dir:
-
-```bash
-./bin/csg version
-./bin/csg --help
+go vet ./...
+go test ./...
+cd web && npx tsc --noEmit && npm test && npm run build && cd ..
+make build
+make demo
 ```
 
 ---
@@ -531,35 +368,31 @@ For a CLI smoke check that needs no data dir:
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| `csg: command not found` | Use `./bin/csg` from the repo root (or add `bin/` to `PATH`). |
-| `make build` fails while building the console | Node.js < 20 or missing npm; install Node 20+ and re-run. |
-| `csg serve` fails with "not initialized" | Wrong `--data-dir` or you skipped `csg init`; run `init` for that dir (or point at `.demo/data`). |
-| `address already in use` | Another server uses the port. Find it (`lsof -nP -iTCP:8787 -sTCP:LISTEN`) or use `--addr 127.0.0.1:8788`. |
-| Lost admin token | `./bin/csg init --force --data-dir <dir>` rotates the admin token, keeps data and prints the new one once. |
-| Lost agent token | `./bin/csg agents rotate-token agt_...` prints a new one-time token; the old token stops working immediately. |
-| `401 unauthorized` on CLI | Wrong token kind for the command (agent commands need `csg_agt_`, admin commands `csg_adm_`), token rotated, or stale env/config; check `csg whoami`, `CSG_TOKEN`, `~/.config/cloud-safeguard/config.json`. |
-| `403 forbidden` for an agent | Agent is `suspended`/`revoked`; reactivate or issue a new identity. |
-| `400 invalid_request` on lease request | Missing/invalid capability param (e.g. no `domain` for `aliyun.dns.manage`), unknown capability param, or malformed duration/JSON. |
-| `404 not_found` on `/mock-cloud/` calls | No mock provider exists (you initialized without `--demo`); the mock cloud is only mounted when a mock provider is present. |
-| `409 lease_not_active` fetching a credential | Lease is still `pending` (approve it first), or it is already revoked/expired/failed. |
-| `410 credential_unavailable` | The credential was scrubbed (revoked/expired); request a new lease. |
-| `csg request --wait` times out (exit 4) | No human approved in time (pending timeout is 600 s by default) or the request is still pending; `csg leases mine` / console to check. |
-| Lease `denied` immediately | Policy denial; read the printed rule reasons (e.g. `capability_not_granted`, `break_glass_required`, TTL/concurrency/rate limits). |
-| Lease `failed` with a provider error | Minting failed: wrong/disabled broker AccessKey, role trust or `sts:AssumeRole` permission missing, `RoleArn` typo, TTL below STS 900 s, or inline policy syntax/size. Run `csg providers test`, then retry. |
-| `provider test` fails in `sts` mode | Role trust policy must name the broker RAM user; broker user needs `sts:AssumeRole` on that role ARN; AccessKey must be active; endpoint/region/network reachable. |
-| Cloud calls denied despite the capability looking right (real mode) | The RAM role's attached policy is the outer bound (session policy intersects it). Add the action to the role policy — narrowest scope that works. |
-| Alibaba Cloud CLI uses the wrong (old long-lived) key | CLI priority is `~/.aliyun/config.json` > env; set `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` and remove the stale profile. |
-| Cannot decrypt provider credential after changing `CSG_MASTER_KEY` | Vault needs the original key. Restore it; if truly lost, re-rotate the provider credential (data encrypted with the old key is unrecoverable) and expire old leases. |
-| `csg mock request` 400/401 in the demo | Missing/expired credential env or not initialized from a mock provider; re-fetch the credential with `eval "$(csg credential --lease ... --export)"`. |
-| `data dir` permission warning | `init` creates 0700 / 0600 best effort; fix with `chmod 700 <dataDir>`, `chmod 600 <dataDir>/master.key <dataDir>/csg.db`. |
+| `csg: command not found` | Use `./build/csg` from the repository root. |
+| `make build` fails while building the console | Node.js older than 20, or npm missing. |
+| `csg serve` says the directory is not initialized | Wrong `--data-dir`, or `csg init` was never run for it. |
+| `csg init` refuses the directory | It already holds an instance. `csg serve` upgrades it; `csg supervisor recover` issues a new setup code. |
+| `address already in use` | Another server uses the port. Use `--addr 127.0.0.1:8788`. |
+| Setup code lost or expired; supervisor locked out | On the server host: `csg supervisor recover --username NAME --data-dir DIR`. |
+| Someone else's setup code lost | A supervisor resets that person on the **People** page. |
+| Sign-in fails with a correct password | The authenticator code was already used, the clock is off, or the account is locked for 15 minutes after five failures. |
+| `agent token required` | Not signed in on this machine. Run `csg login --server URL`. |
+| `403` for an agent | The agent was revoked, or its owner is suspended or has not finished setup. Sign in again. |
+| `your owner has no role on cloud account …` | A supervisor has not given the owner a role there, or the account ID is wrong. |
+| Request `denied` at once | The owner's role does not allow that permission, or the agent is at its limit of credentials or requests per minute. |
+| Request stays `pending` | It waits for the owner in the console's Inbox. It expires after 10 minutes by default. |
+| `409 lease_not_active` fetching a credential | The request is still pending, or was denied, revoked or expired. |
+| Request `failed` with a cloud error | Wrong or disabled broker AccessKey, the role does not trust the broker user, a typo in the role ARN, or a validity below 900 s. Run **Test connection**. |
+| `404` on `/mock-cloud/` | No mock account exists (the instance was created without `--demo`). |
+| The Alibaba Cloud CLI uses an old key | Set `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` and remove the old profile. |
+| The server refuses to start after `CSG_MASTER_KEY` changed | The key does not match the data directory. Restore the original key. |
+| Commands such as `csg providers` or `csg request` are unknown | They were removed with the admin token. Cloud accounts, people and limits are managed in the console; agents use `csg access`. |
 
 ---
 
 # Where to go next
 
-- [SECURITY.md](SECURITY.md) — threat model, residual risks, rotation runbook, hardening,
-  incident response (read this before putting real credentials in).
-- [ARCHITECTURE.md](ARCHITECTURE.md) — components, lease flows, policy engine, audit chain,
-  failure modes.
-- [API.md](API.md) — REST endpoints and curl examples.
-- [CONTRACT.md](CONTRACT.md) — normative contract for every behavior above.
+- [CONTRACT.md](CONTRACT.md) §17 — the rules for people, roles, requests and approval.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — components and flows.
+- [SECURITY.md](SECURITY.md), [API.md](API.md) — written for v0.1 and being rewritten; the
+  parts about the vault, the audit chain and incident response still apply.

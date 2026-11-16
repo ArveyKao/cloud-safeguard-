@@ -24,17 +24,16 @@ func (a *App) defaultDataDir() string {
 
 // runInit implements `csg init`.
 func (a *App) runInit(args []string) error {
-	fs := a.newFlagSet("init", `Usage: csg init [--data-dir DIR] [--demo] [--force] [--supervisor NAME] [--admin-token-file PATH] [--json]
+	fs := a.newFlagSet("init", `Usage: csg init [--data-dir DIR] [--demo] [--supervisor NAME] [--json]
 
-Bootstraps a data directory: master key, SQLite database, admin token, the
-built-in capability catalog and the first supervisor (with a one-time setup
-code for choosing a password and enrolling an authenticator app). --demo also seeds the mock provider and two demo
-agents and prints their one-time tokens.
+Bootstraps a new data directory: master key, SQLite database and the first
+supervisor, with a one-time setup code for choosing a password and enrolling
+an authenticator app. --demo also adds a mock cloud account. An existing data
+directory is never touched: csg serve upgrades it, and csg supervisor recover
+issues a new setup code.
 `)
 	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
-	demo := fs.Bool("demo", false, "seed the mock provider and demo agents")
-	force := fs.Bool("force", false, "re-initialize an existing data directory (rotates the admin token)")
-	adminTokenFile := fs.String("admin-token-file", "", "also write the admin token to this 0600 file")
+	demo := fs.Bool("demo", false, "add a mock cloud account")
 	supervisor := fs.String("supervisor", server.DefaultSupervisorUsername, "username of the first supervisor")
 	jsonOut := fs.Bool("json", false, "print the InitResult as JSON")
 	positionals, err := parseFlags(fs, args)
@@ -51,18 +50,11 @@ agents and prints their one-time tokens.
 	res, err := server.Init(context.Background(), server.InitOptions{
 		DataDir: *dataDir,
 		Demo:    *demo,
-		Force:   *force,
 
 		SupervisorUsername: *supervisor,
 	})
 	if err != nil {
 		return fmt.Errorf("cannot initialize data directory %s: %v", *dataDir, err)
-	}
-
-	if tokenFile := strings.TrimSpace(*adminTokenFile); tokenFile != "" {
-		if err := os.WriteFile(tokenFile, []byte(res.AdminToken+"\n"), 0o600); err != nil {
-			return fmt.Errorf("cannot write admin token file: %v", err)
-		}
 	}
 
 	if *jsonOut {
@@ -76,23 +68,13 @@ agents and prints their one-time tokens.
 		}
 	}
 	fmt.Fprintln(a.Stdout)
-	fmt.Fprintf(a.Stdout, "Admin token (shown once, store securely): %s\n", res.AdminToken)
-	fmt.Fprintf(a.Stdout, "Admin token prefix: %s\n", res.AdminTokenPrefix)
 	if len(res.ProviderIDs) > 0 {
-		fmt.Fprintf(a.Stdout, "Providers: %s\n", strings.Join(res.ProviderIDs, ", "))
-	}
-	fmt.Fprintf(a.Stdout, "Capabilities: %s\n", strings.Join(res.CapabilityIDs, ", "))
-	if len(res.Agents) > 0 {
-		fmt.Fprintln(a.Stdout, "Demo agents (tokens shown once):")
-		for _, agent := range res.Agents {
-			fmt.Fprintf(a.Stdout, "  %-20s %-12s %s\n", agent.Name, agent.ID, agent.Token)
-		}
+		fmt.Fprintln(a.Stdout, "Demo cloud account added (mock cloud).")
 	}
 	if res.Supervisor != nil {
 		a.printSetupCode("First supervisor", *res.Supervisor)
 	}
 	fmt.Fprintln(a.Stdout)
-	fmt.Fprintln(a.Stdout, "Store these tokens now: they cannot be retrieved later.")
 	fmt.Fprintf(a.Stdout, "Next: csg serve --data-dir %s\n", res.DataDir)
 	return nil
 }

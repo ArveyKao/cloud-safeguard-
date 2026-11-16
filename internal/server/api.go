@@ -31,13 +31,11 @@ func agentFromContext(ctx context.Context) (model.Agent, bool) {
 	return ag, ok
 }
 
-// buildHandler assembles the complete HTTP surface: health, agent API, admin
-// API, mock cloud, and the embedded SPA.
+// buildHandler assembles the complete HTTP surface: health, sign-in, the
+// person, supervisor and agent APIs, the mock cloud and the embedded console.
 func (s *Server) buildHandler() http.Handler {
 	agentMux := http.NewServeMux()
 	agentMux.HandleFunc("GET /api/v1/agent/me", s.handleAgentMe)
-	agentMux.HandleFunc("GET /api/v1/agent/capabilities", s.handleAgentCapabilities)
-	agentMux.HandleFunc("POST /api/v1/agent/leases", s.handleAgentCreateLease)
 	agentMux.HandleFunc("GET /api/v1/agent/leases", s.handleAgentListLeases)
 	agentMux.HandleFunc("GET /api/v1/agent/leases/{id}", s.handleAgentGetLease)
 	agentMux.HandleFunc("POST /api/v1/agent/leases/{id}/credential", s.handleAgentFetchCredential)
@@ -49,36 +47,6 @@ func (s *Server) buildHandler() http.Handler {
 	agentMux.HandleFunc("POST /api/v1/agent/access-requests", s.handleAgentCreateAccessRequest)
 	agentMux.HandleFunc("GET /api/v1/agent/access-requests/{id}", s.handleAgentGetAccessRequest)
 	agentMux.HandleFunc("/", s.handleUnknownAPI)
-
-	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("POST /api/v1/admin/login", s.handleAdminLogin)
-	adminMux.HandleFunc("GET /api/v1/admin/overview", s.handleAdminOverview)
-	adminMux.HandleFunc("GET /api/v1/admin/providers", s.handleAdminListProviders)
-	adminMux.HandleFunc("POST /api/v1/admin/providers", s.handleAdminCreateProvider)
-	adminMux.HandleFunc("GET /api/v1/admin/providers/{id}", s.handleAdminGetProvider)
-	adminMux.HandleFunc("PATCH /api/v1/admin/providers/{id}", s.handleAdminUpdateProvider)
-	adminMux.HandleFunc("POST /api/v1/admin/providers/{id}/rotate", s.handleAdminRotateProvider)
-	adminMux.HandleFunc("POST /api/v1/admin/providers/{id}/test", s.handleAdminTestProvider)
-	adminMux.HandleFunc("GET /api/v1/admin/capabilities", s.handleAdminListCapabilities)
-	adminMux.HandleFunc("POST /api/v1/admin/capabilities", s.handleAdminCreateCapability)
-	adminMux.HandleFunc("PATCH /api/v1/admin/capabilities/{id}", s.handleAdminUpdateCapability)
-	adminMux.HandleFunc("GET /api/v1/admin/agents", s.handleAdminListAgents)
-	adminMux.HandleFunc("POST /api/v1/admin/agents", s.handleAdminCreateAgent)
-	adminMux.HandleFunc("GET /api/v1/admin/agents/{id}", s.handleAdminGetAgent)
-	adminMux.HandleFunc("PATCH /api/v1/admin/agents/{id}", s.handleAdminUpdateAgent)
-	adminMux.HandleFunc("POST /api/v1/admin/agents/{id}/suspend", s.handleAdminSuspendAgent)
-	adminMux.HandleFunc("POST /api/v1/admin/agents/{id}/activate", s.handleAdminActivateAgent)
-	adminMux.HandleFunc("POST /api/v1/admin/agents/{id}/token/rotate", s.handleAdminRotateAgentToken)
-	adminMux.HandleFunc("GET /api/v1/admin/leases", s.handleAdminListLeases)
-	adminMux.HandleFunc("GET /api/v1/admin/leases/{id}", s.handleAdminGetLease)
-	adminMux.HandleFunc("POST /api/v1/admin/leases/{id}/approve", s.handleAdminApproveLease)
-	adminMux.HandleFunc("POST /api/v1/admin/leases/{id}/deny", s.handleAdminDenyLease)
-	adminMux.HandleFunc("POST /api/v1/admin/leases/{id}/revoke", s.handleAdminRevokeLease)
-	adminMux.HandleFunc("GET /api/v1/admin/audit", s.handleAdminListAudit)
-	adminMux.HandleFunc("GET /api/v1/admin/audit/verify", s.handleAdminVerifyAudit)
-	adminMux.HandleFunc("GET /api/v1/admin/policy", s.handleAdminGetPolicy)
-	adminMux.HandleFunc("PUT /api/v1/admin/policy", s.handleAdminPutPolicy)
-	adminMux.HandleFunc("/", s.handleUnknownAPI)
 
 	// Human sign-in (CONTRACT §17.3). Setup and login are unauthenticated.
 	authMux := http.NewServeMux()
@@ -123,20 +91,20 @@ func (s *Server) buildHandler() http.Handler {
 	// They reuse the operator's handlers; actions are attributed to the
 	// signed-in supervisor. There is deliberately no approve route: a
 	// supervisor can stop any request or credential but never grant one.
-	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts", s.handleAdminListProviders)
-	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts", s.handleAdminCreateProvider)
-	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts/{id}", s.handleAdminGetProvider)
-	supervisorMux.HandleFunc("PATCH /api/v1/supervisor/accounts/{id}", s.handleAdminUpdateProvider)
-	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/rotate", s.handleAdminRotateProvider)
-	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/test", s.handleAdminTestProvider)
-	supervisorMux.HandleFunc("GET /api/v1/supervisor/settings", s.handleAdminGetPolicy)
-	supervisorMux.HandleFunc("PUT /api/v1/supervisor/settings", s.handleAdminPutPolicy)
-	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit", s.handleAdminListAudit)
-	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit/verify", s.handleAdminVerifyAudit)
-	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases", s.handleAdminListLeases)
-	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases/{id}", s.handleAdminGetLease)
-	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/deny", s.handleAdminDenyLease)
-	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/revoke", s.handleAdminRevokeLease)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts", s.handleListAccounts)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts", s.handleCreateAccount)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts/{id}", s.handleGetAccount)
+	supervisorMux.HandleFunc("PATCH /api/v1/supervisor/accounts/{id}", s.handleUpdateAccount)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/rotate", s.handleRotateAccount)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/test", s.handleTestAccount)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/settings", s.handleGetSettings)
+	supervisorMux.HandleFunc("PUT /api/v1/supervisor/settings", s.handlePutSettings)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit", s.handleListAudit)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit/verify", s.handleVerifyAudit)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases", s.handleListLeases)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases/{id}", s.handleGetLease)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/deny", s.handleDenyLease)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/revoke", s.handleRevokeLease)
 	supervisorMux.HandleFunc("/", s.handleUnknownAPI)
 
 	root := http.NewServeMux()
@@ -146,7 +114,6 @@ func (s *Server) buildHandler() http.Handler {
 	root.Handle("/api/v1/me/", s.requireSession(meMux))
 	root.Handle("/api/v1/supervisor/", s.requireSession(s.requireSupervisor(supervisorMux)))
 	root.Handle("/api/v1/agent/", s.requireAgent(agentMux))
-	root.Handle("/api/v1/admin/", s.requireAdmin(adminMux))
 	root.HandleFunc("/mock-cloud/", s.handleMockCloud)
 	root.HandleFunc("/", s.handleStatic)
 
@@ -211,35 +178,6 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), agentContextKey{}, ag)
 		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// requireAdmin authenticates the single admin bearer token.
-func (s *Server) requireAdmin(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		plain, ok := bearerToken(r)
-		if !ok {
-			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "missing or malformed bearer token")
-			return
-		}
-		if token.Kind(plain) != "admin" {
-			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "admin token required")
-			return
-		}
-		stored, err := s.db.GetMeta(r.Context(), store.MetaAdminTokenHash)
-		if err != nil {
-			s.logf("admin auth: read token hash: %v", err)
-			s.writeError(w, http.StatusInternalServerError, model.ErrCodeInternal, "authentication is not configured")
-			return
-		}
-		if !token.HashEqual(token.Hash(plain), stored) {
-			s.systemAudit(r.Context(), "auth.admin_auth_failed", "denied", "warning", "admin", "admin", map[string]any{
-				"remote_addr": s.clientAddr(r),
-			})
-			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "invalid admin token")
-			return
-		}
-		next.ServeHTTP(w, r)
 	})
 }
 
@@ -655,27 +593,15 @@ func (s *Server) agentAudit(ctx context.Context, ag model.Agent, action, status,
 	})
 }
 
-// adminAudit appends an audit event attributed to the operator.
-//
-// The same handlers serve the operator token and supervisors (CONTRACT §17.8).
-// When the request runs in a person's console session, the event names that
-// person; only the operator token is recorded as "operator".
-func (s *Server) adminAudit(ctx context.Context, action, status, severity, targetType, targetID string, metadata map[string]any) {
+// actorAudit appends an audit event attributed to the person whose console
+// session the request runs in. Without a session (a sweep, a startup check)
+// the event is the control plane's own.
+func (s *Server) actorAudit(ctx context.Context, action, status, severity, targetType, targetID string, metadata map[string]any) {
 	if sc, ok := sessionFromContext(ctx); ok {
 		s.personAudit(ctx, sc.person, action, status, severity, targetType, targetID, metadata)
 		return
 	}
-	s.appendAudit(ctx, model.AuditEvent{
-		ActorType:  "admin",
-		ActorID:    "admin",
-		ActorName:  "operator",
-		Action:     action,
-		Status:     status,
-		Severity:   severity,
-		TargetType: targetType,
-		TargetID:   targetID,
-		Metadata:   metadata,
-	})
+	s.systemAudit(ctx, action, status, severity, targetType, targetID, metadata)
 }
 
 // systemAudit appends an audit event attributed to the control plane itself.

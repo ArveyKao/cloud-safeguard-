@@ -59,13 +59,6 @@ func (r RiskTier) Rank() int {
 	return 0
 }
 
-// ParseRiskTier parses a risk tier string. It accepts the canonical lowercase
-// values only; callers should normalize user input first.
-func ParseRiskTier(s string) (RiskTier, bool) {
-	r := RiskTier(s)
-	return r, r.Valid()
-}
-
 // AgentRole is the coarse-grained role of an agent identity (CONTRACT §16.1).
 // Roles apply to agents only: the operator/admin token is not a role.
 //
@@ -112,13 +105,6 @@ func (r AgentRole) Permits(access AccessLevel) bool {
 		return false
 	}
 	return r.Rank() >= access.Rank()
-}
-
-// ParseAgentRole parses a role string. It accepts the canonical lowercase
-// values only; callers should normalize user input first.
-func ParseAgentRole(s string) (AgentRole, bool) {
-	r := AgentRole(s)
-	return r, r.Valid()
 }
 
 // AgentRoles returns the known roles in ascending order of privilege.
@@ -175,13 +161,6 @@ func (a AccessLevel) Rank() int {
 		return 3
 	}
 	return 0
-}
-
-// ParseAccessLevel parses an access level string. It accepts the canonical
-// lowercase values only; callers should normalize user input first.
-func ParseAccessLevel(s string) (AccessLevel, bool) {
-	a := AccessLevel(s)
-	return a, a.Valid()
 }
 
 // ProviderType is the cloud vendor family of a provider.
@@ -361,40 +340,6 @@ type Agent struct {
 	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
-}
-
-// CreateAgentInput is the admin request body for POST /admin/agents.
-type CreateAgentInput struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	// Role is optional and defaults to guest.
-	Role AgentRole `json:"role,omitempty"`
-	// Grants is optional: omitted or empty means "every enabled capability the
-	// role permits at creation time".
-	Grants              []string `json:"grants"`
-	MaxTTLSeconds       int      `json:"max_ttl_seconds"`
-	MaxConcurrentLeases int      `json:"max_concurrent_leases"`
-}
-
-// UpdateAgentInput is the admin request body for PATCH /admin/agents/{id}.
-type UpdateAgentInput struct {
-	Name        *string `json:"name,omitempty"`
-	Description *string `json:"description,omitempty"`
-	// Role changes the agent's role. Without grants, a role change resets the
-	// grants to every enabled capability the new role permits, and revokes the
-	// agent's pending/active leases the new role no longer permits.
-	Role                *AgentRole   `json:"role,omitempty"`
-	Grants              *[]string    `json:"grants,omitempty"`
-	MaxTTLSeconds       *int         `json:"max_ttl_seconds,omitempty"`
-	MaxConcurrentLeases *int         `json:"max_concurrent_leases,omitempty"`
-	Status              *AgentStatus `json:"status,omitempty"`
-}
-
-// AgentWithToken is returned exactly once when an agent is created or its
-// token is rotated.
-type AgentWithToken struct {
-	Agent Agent  `json:"agent"`
-	Token string `json:"token"`
 }
 
 // LeaseStatus is the lifecycle state of a lease request.
@@ -580,55 +525,35 @@ type AuditVerifyResult struct {
 	Message         string `json:"message"`
 }
 
-// PolicySettings are the global guardrails that drive auto-approval. They are
-// editable from the console.
+// PolicySettings are the platform-wide limits a supervisor can change. What
+// needs approval is not here: that is each person's approval mode and each
+// cloud account's highest automatic level (CONTRACT §17.5).
 type PolicySettings struct {
-	// AutoApproveMaxRisk: requests whose capability risk is <= this tier and
-	// whose TTL is <= AutoApproveMaxTTLSeconds are granted automatically.
-	AutoApproveMaxRisk RiskTier `json:"auto_approve_max_risk"`
-	// AutoApproveMaxTTLSeconds caps the TTL of an automatically granted lease.
-	AutoApproveMaxTTLSeconds int `json:"auto_approve_max_ttl_seconds"`
-	// MaxLeaseTTLSeconds is the absolute TTL ceiling for any lease.
+	// MaxLeaseTTLSeconds is the longest validity period of any credential.
 	MaxLeaseTTLSeconds int `json:"max_lease_ttl_seconds"`
-	// PendingTimeoutSeconds is how long a pending request survives before it
-	// expires without a decision.
+	// PendingTimeoutSeconds is how long a request waits for approval before
+	// it expires.
 	PendingTimeoutSeconds int `json:"pending_timeout_seconds"`
-	// MaxConcurrentLeasesPerAgent caps simultaneously active leases.
+	// MaxConcurrentLeasesPerAgent caps the credentials an agent holds at once.
 	MaxConcurrentLeasesPerAgent int `json:"max_concurrent_leases_per_agent"`
-	// LeasesPerMinutePerAgent rate-limits lease creation per agent.
+	// LeasesPerMinutePerAgent rate-limits requests per agent.
 	LeasesPerMinutePerAgent int `json:"leases_per_minute_per_agent"`
-	// RequireReasonForRisk requires a non-empty reason at or above this tier.
-	RequireReasonForRisk RiskTier `json:"require_reason_for_risk"`
 }
 
-// DefaultPolicySettings returns the shipped guardrails: read-only requests are
-// auto-approved for up to 15 minutes; everything else needs a human; the hard
-// ceiling is one hour.
+// DefaultPolicySettings returns the shipped limits.
 func DefaultPolicySettings() PolicySettings {
 	return PolicySettings{
-		AutoApproveMaxRisk:          RiskLow,
-		AutoApproveMaxTTLSeconds:    900,
 		MaxLeaseTTLSeconds:          3600,
 		PendingTimeoutSeconds:       600,
 		MaxConcurrentLeasesPerAgent: 3,
 		LeasesPerMinutePerAgent:     6,
-		RequireReasonForRisk:        RiskMedium,
 	}
 }
 
-// Validate checks the policy settings for obviously invalid combinations.
+// Validate checks the settings for obviously invalid values.
 func (p PolicySettings) Validate() error {
-	if !p.AutoApproveMaxRisk.Valid() {
-		return fmt.Errorf("auto_approve_max_risk: unknown risk tier %q", p.AutoApproveMaxRisk)
-	}
-	if !p.RequireReasonForRisk.Valid() {
-		return fmt.Errorf("require_reason_for_risk: unknown risk tier %q", p.RequireReasonForRisk)
-	}
-	if p.AutoApproveMaxTTLSeconds <= 0 {
-		return fmt.Errorf("auto_approve_max_ttl_seconds must be positive")
-	}
-	if p.MaxLeaseTTLSeconds < p.AutoApproveMaxTTLSeconds {
-		return fmt.Errorf("max_lease_ttl_seconds must be >= auto_approve_max_ttl_seconds")
+	if p.MaxLeaseTTLSeconds <= 0 {
+		return fmt.Errorf("max_lease_ttl_seconds must be positive")
 	}
 	if p.PendingTimeoutSeconds <= 0 {
 		return fmt.Errorf("pending_timeout_seconds must be positive")
@@ -640,55 +565,6 @@ func (p PolicySettings) Validate() error {
 		return fmt.Errorf("leases_per_minute_per_agent must be positive")
 	}
 	return nil
-}
-
-// OverviewCounts are the headline numbers on the console dashboard.
-type OverviewCounts struct {
-	Agents          int `json:"agents"`
-	ActiveAgents    int `json:"active_agents"`
-	Capabilities    int `json:"capabilities"`
-	Providers       int `json:"providers"`
-	ActiveLeases    int `json:"active_leases"`
-	PendingLeases   int `json:"pending_leases"`
-	Events24h       int `json:"events_24h"`
-	DeniedLeases24h int `json:"denied_leases_24h"`
-}
-
-// RiskBreakdown counts active+pending leases by risk tier.
-type RiskBreakdown struct {
-	Low      int `json:"low"`
-	Medium   int `json:"medium"`
-	High     int `json:"high"`
-	Critical int `json:"critical"`
-}
-
-// VaultStatus is a non-secret view of the credential vault.
-type VaultStatus struct {
-	Configured     bool   `json:"configured"`
-	KeyFingerprint string `json:"key_fingerprint"`
-	SecretsStored  int    `json:"secrets_stored"`
-}
-
-// Overview is returned by GET /admin/overview for the dashboard.
-type Overview struct {
-	Counts        OverviewCounts `json:"counts"`
-	RiskBreakdown RiskBreakdown  `json:"risk_breakdown"`
-	Policy        PolicySettings `json:"policy"`
-	Vault         VaultStatus    `json:"vault"`
-	PendingLeases []Lease        `json:"pending_leases"`
-	ActiveLeases  []Lease        `json:"active_leases"`
-	RecentEvents  []AuditEvent   `json:"recent_events"`
-	Providers     []Provider     `json:"providers"`
-	Version       string         `json:"version"`
-	UptimeSeconds int64          `json:"uptime_seconds"`
-	ServerTime    time.Time      `json:"server_time"`
-}
-
-// LoginResult is returned by POST /admin/login.
-type LoginResult struct {
-	OK      bool   `json:"ok"`
-	Role    string `json:"role"` // "admin"
-	Version string `json:"version"`
 }
 
 // Health is returned by GET /healthz.

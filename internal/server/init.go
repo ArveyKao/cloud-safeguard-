@@ -15,10 +15,8 @@ import (
 	"time"
 
 	"github.com/arveykao/cloud-safeguard/internal/authn"
-	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/store"
-	"github.com/arveykao/cloud-safeguard/internal/token"
 	"github.com/arveykao/cloud-safeguard/internal/vaultcrypto"
 )
 
@@ -26,12 +24,9 @@ import (
 type InitOptions struct {
 	// DataDir is created if missing.
 	DataDir string
-	// Demo seeds the mock cloud provider, demo agents and built-in
-	// capabilities, making the product immediately demoable.
+	// Demo seeds the mock cloud account, making the product immediately
+	// demoable.
 	Demo bool
-	// Force allows re-initializing an existing data directory (rotates the
-	// admin token). Off by default: Init refuses to touch an existing install.
-	Force bool
 	// MasterKey optionally supplies the master key instead of generating one.
 	MasterKey []byte
 	// SupervisorUsername names the first supervisor (default "admin"). It is
@@ -39,22 +34,11 @@ type InitOptions struct {
 	SupervisorUsername string
 }
 
-// InitAgent is one demo agent created by Init with its one-time token.
-type InitAgent struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Token string `json:"token"`
-}
-
-// InitResult summarizes a bootstrap. AdminToken and agent Tokens are shown
-// exactly once and are never retrievable again.
+// InitResult summarizes a bootstrap. The setup code is shown exactly once
+// and is never retrievable again.
 type InitResult struct {
-	DataDir          string      `json:"data_dir"`
-	AdminToken       string      `json:"admin_token"`
-	AdminTokenPrefix string      `json:"admin_token_prefix"`
-	ProviderIDs      []string    `json:"provider_ids"`
-	CapabilityIDs    []string    `json:"capability_ids"`
-	Agents           []InitAgent `json:"agents"`
+	DataDir     string   `json:"data_dir"`
+	ProviderIDs []string `json:"provider_ids"`
 	// Supervisor is the first supervisor with a one-time setup code, or nil
 	// when a supervisor already existed (CONTRACT §17.1).
 	Supervisor *model.PersonWithSetupCode `json:"supervisor,omitempty"`
@@ -66,12 +50,13 @@ const (
 	demoProviderRegion    = "cn-hangzhou"
 	demoProviderRoleARN   = "acs:ram::1234567890123456:role/csg-demo"
 	demoBrokerAccessKeyID = "LTAI5tDemoMockBroker"
-	demoAgentClaudeCode   = "claude-code"
-	demoAgentHermes       = "hermes-researcher"
 )
 
-// Init bootstraps a new data directory: master key, database, admin token,
-// built-in capabilities, and (with Demo) the mock provider plus demo agents.
+// Init bootstraps a new data directory: master key, database, default
+// guardrails, the first supervisor's setup code and (with Demo) the mock
+// cloud account. It never touches an existing install: upgrades happen when
+// `csg serve` opens the database, and a locked-out supervisor is recovered
+// with RecoverSupervisor.
 func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 	if opts.DataDir == "" {
 		return InitResult{}, errors.New("server: data dir is required")
@@ -82,16 +67,9 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 
 	keyPresent := fileExists(keyPath)
 	dbPresent := fileExists(dbPath)
-	if (keyPresent || dbPresent) && !opts.Force {
+	if keyPresent || dbPresent {
 		return InitResult{}, fmt.Errorf(
-			"data directory %q is already initialized; refusing to overwrite it (use --force to rotate the admin token)",
-			dir)
-	}
-	// A database without a master key would be re-keyed with a fresh random key,
-	// silently orphaning every encrypted credential. Refuse instead.
-	if dbPresent && !keyPresent && len(opts.MasterKey) == 0 && strings.TrimSpace(os.Getenv("CSG_MASTER_KEY")) == "" {
-		return InitResult{}, fmt.Errorf(
-			"data directory %q contains a database but no master.key; refusing to initialize (restore master.key or set CSG_MASTER_KEY)",
+			"data directory %q is already initialized; refusing to touch it (`csg serve` upgrades it, and `csg supervisor recover` issues a new setup code)",
 			dir)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -119,11 +97,6 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 	if err := ensureVaultKeyCheck(ctx, db, v); err != nil {
 		return InitResult{}, err
 	}
-	// `csg init --force` on an older data dir performs the schema upgrade, so it
-	// must record it too; a later `csg serve` would see no migration to report.
-	if err := auditMigrationReport(ctx, db); err != nil {
-		return InitResult{}, err
-	}
 
 	now := time.Now().UTC()
 	// ---- meta ----
@@ -139,41 +112,12 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 	} else if err != nil {
 		return InitResult{}, err
 	}
-	// The admin token is generated exactly once per init run; --force rotates it.
-	adminToken, adminHash, err := token.Generate(token.AdminPrefix)
-	if err != nil {
-		return InitResult{}, err
-	}
-	adminPrefix := token.DisplayPrefix(adminToken)
 	for key, value := range map[string]string{
-		store.MetaAdminTokenHash:   adminHash,
-		store.MetaAdminTokenPrefix: adminPrefix,
-		store.MetaBootstrapTime:    now.Format(time.RFC3339Nano),
-		store.MetaDemoMode:         strconv.FormatBool(opts.Demo),
-		store.MetaSchemaVersion:    strconv.Itoa(store.CurrentSchemaVersion),
+		store.MetaBootstrapTime: now.Format(time.RFC3339Nano),
+		store.MetaDemoMode:      strconv.FormatBool(opts.Demo),
+		store.MetaSchemaVersion: strconv.Itoa(store.CurrentSchemaVersion),
 	} {
 		if err := db.SetMeta(ctx, key, value); err != nil {
-			return InitResult{}, err
-		}
-	}
-
-	// ---- built-in capabilities (missing only, never overwrite existing rows) ----
-	capabilityIDs := make([]string, 0, 8)
-	for _, capability := range capcatalog.Builtin() {
-		capabilityIDs = append(capabilityIDs, capability.ID)
-		if _, err := db.GetCapability(ctx, capability.ID); err == nil {
-			continue
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return InitResult{}, err
-		}
-		capability.Builtin = true
-		if capability.CreatedAt.IsZero() {
-			capability.CreatedAt = now
-		}
-		if capability.UpdatedAt.IsZero() {
-			capability.UpdatedAt = now
-		}
-		if err := db.CreateCapability(ctx, capability); err != nil {
 			return InitResult{}, err
 		}
 	}
@@ -192,15 +136,7 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		return InitResult{}, err
 	}
 
-	result := InitResult{
-		Supervisor:       supervisor,
-		DataDir:          dir,
-		AdminToken:       adminToken,
-		AdminTokenPrefix: adminPrefix,
-		ProviderIDs:      []string{},
-		CapabilityIDs:    capabilityIDs,
-		Agents:           []InitAgent{},
-	}
+	result := InitResult{Supervisor: supervisor, DataDir: dir, ProviderIDs: []string{}}
 
 	if opts.Demo {
 		providerID, err := seedDemoProvider(ctx, db, v, now)
@@ -210,11 +146,6 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		if providerID != "" {
 			result.ProviderIDs = append(result.ProviderIDs, providerID)
 		}
-		agents, err := seedDemoAgents(ctx, db, capabilityIDs, now)
-		if err != nil {
-			return InitResult{}, err
-		}
-		result.Agents = agents
 	}
 
 	return result, nil
@@ -314,93 +245,6 @@ func seedDemoProvider(ctx context.Context, db *store.DB, v *vault.Vault, now tim
 		return "", err
 	}
 	return provider.ID, nil
-}
-
-// demoAgentSpec is one seeded demo agent definition (CONTRACT §11, §16.7).
-type demoAgentSpec struct {
-	name          string
-	description   string
-	role          model.AgentRole
-	grants        []string
-	maxTTLSeconds int
-	maxConcurrent int
-}
-
-// seedDemoAgents creates the demo agents when missing and returns the one-time
-// tokens of the agents it created. Existing agents are left untouched.
-func seedDemoAgents(ctx context.Context, db *store.DB, capabilityIDs []string, now time.Time) ([]InitAgent, error) {
-	// claude-code is an administrator and holds the whole catalog;
-	// hermes-researcher is a guest, so it may only hold read capabilities
-	// (CONTRACT §16.7). Never widen a guest's grants to make the seed
-	// non-empty: an out-of-role grant would be rejected everywhere else.
-	claudeGrants := append([]string(nil), capabilityIDs...)
-	hermesGrants := make([]string, 0, 1)
-	for _, id := range capabilityIDs {
-		if id == capcatalog.IDCloudRead {
-			hermesGrants = append(hermesGrants, id)
-			break
-		}
-	}
-	specs := []demoAgentSpec{
-		{
-			name:          demoAgentClaudeCode,
-			description:   "Primary coding agent (Claude Code compatible)",
-			role:          model.RoleAdministrator,
-			grants:        claudeGrants,
-			maxTTLSeconds: 3600,
-			maxConcurrent: 3,
-		},
-		{
-			name:          demoAgentHermes,
-			description:   "Read-only research agent",
-			role:          model.RoleGuest,
-			grants:        hermesGrants,
-			maxTTLSeconds: 900,
-			maxConcurrent: 1,
-		},
-	}
-
-	agents, err := db.ListAgents(ctx)
-	if err != nil {
-		return nil, err
-	}
-	existing := make(map[string]model.Agent, len(agents))
-	for _, a := range agents {
-		existing[a.Name] = a
-	}
-
-	created := make([]InitAgent, 0, len(specs))
-	for _, spec := range specs {
-		if _, ok := existing[spec.name]; ok {
-			continue // data intact on --force; tokens are never re-recoverable
-		}
-		id, err := newID("agt_")
-		if err != nil {
-			return nil, err
-		}
-		plainToken, tokenHash, err := token.Generate(token.AgentPrefix)
-		if err != nil {
-			return nil, err
-		}
-		agent := model.Agent{
-			ID:                  id,
-			Name:                spec.name,
-			Description:         spec.description,
-			Status:              model.AgentActive,
-			Role:                spec.role,
-			Grants:              spec.grants,
-			MaxTTLSeconds:       spec.maxTTLSeconds,
-			MaxConcurrentLeases: spec.maxConcurrent,
-			TokenPrefix:         token.DisplayPrefix(plainToken),
-			CreatedAt:           now,
-			UpdatedAt:           now,
-		}
-		if err := db.CreateAgent(ctx, agent, tokenHash); err != nil {
-			return nil, err
-		}
-		created = append(created, InitAgent{ID: agent.ID, Name: agent.Name, Token: plainToken})
-	}
-	return created, nil
 }
 
 // fileExists reports whether path exists and is a regular file.

@@ -118,16 +118,13 @@ func (m *fakeMinter) requestCount() int {
 
 // testEnv is a fully bootstrapped control plane served through httptest.
 type testEnv struct {
-	t           *testing.T
-	srv         *Server
-	dir         string
-	adminToken  string
-	clock       *fakeClock
-	minter      *fakeMinter
-	logs        *bytes.Buffer
-	agentTokens map[string]string
-	agentIDs    map[string]string
-	providerID  string
+	t          *testing.T
+	srv        *Server
+	dir        string
+	clock      *fakeClock
+	minter     *fakeMinter
+	logs       *bytes.Buffer
+	providerID string
 	// supervisor is the bootstrap supervisor with its one-time setup code.
 	supervisor *model.PersonWithSetupCode
 }
@@ -164,22 +161,7 @@ func newTestEnv(t *testing.T, demo bool) *testEnv {
 		}
 	})
 
-	env := &testEnv{
-		t:           t,
-		srv:         srv,
-		dir:         dir,
-		adminToken:  initRes.AdminToken,
-		clock:       clock,
-		minter:      minter,
-		logs:        logs,
-		agentTokens: map[string]string{},
-		agentIDs:    map[string]string{},
-		supervisor:  initRes.Supervisor,
-	}
-	for _, agent := range initRes.Agents {
-		env.agentTokens[agent.Name] = agent.Token
-		env.agentIDs[agent.Name] = agent.ID
-	}
+	env := &testEnv{t: t, srv: srv, dir: dir, clock: clock, minter: minter, logs: logs, supervisor: initRes.Supervisor}
 	if len(initRes.ProviderIDs) > 0 {
 		env.providerID = initRes.ProviderIDs[0]
 	}
@@ -214,21 +196,6 @@ func (e *testEnv) do(method, path, token string, body any) *httptest.ResponseRec
 	rec := httptest.NewRecorder()
 	e.srv.Handler().ServeHTTP(rec, req)
 	return rec
-}
-
-// admin performs an admin-authenticated request.
-func (e *testEnv) admin(method, path string, body any) *httptest.ResponseRecorder {
-	return e.do(method, path, e.adminToken, body)
-}
-
-// agent performs an agent-authenticated request.
-func (e *testEnv) agent(agentName, method, path string, body any) *httptest.ResponseRecorder {
-	e.t.Helper()
-	token, ok := e.agentTokens[agentName]
-	if !ok {
-		e.t.Fatalf("no token for agent %q", agentName)
-	}
-	return e.do(method, path, token, body)
 }
 
 // decodeEnvelope decodes the standard {"data": ...} envelope.
@@ -271,26 +238,21 @@ func requireErrorCode(t *testing.T, rec *httptest.ResponseRecorder, wantStatus i
 	}
 }
 
-// createLease is a helper that POSTs a lease request for an agent.
-func (e *testEnv) createLease(agentName string, in model.CreateLeaseInput) (model.Lease, *httptest.ResponseRecorder) {
+// fetchCredential POSTs the credential endpoint for a lease as an agent.
+func (e *testEnv) fetchCredential(token, leaseID string) (model.CredentialEnvelope, *httptest.ResponseRecorder) {
 	e.t.Helper()
-	rec := e.agent(agentName, http.MethodPost, "/api/v1/agent/leases", in)
-	return decodeEnvelope[model.Lease](e.t, rec), rec
-}
-
-// fetchCredential POSTs the credential endpoint for a lease.
-func (e *testEnv) fetchCredential(agentName, leaseID string) (model.CredentialEnvelope, *httptest.ResponseRecorder) {
-	e.t.Helper()
-	rec := e.agent(agentName, http.MethodPost, "/api/v1/agent/leases/"+leaseID+"/credential", nil)
+	rec := e.do(http.MethodPost, "/api/v1/agent/leases/"+leaseID+"/credential", token, nil)
 	return decodeEnvelope[model.CredentialEnvelope](e.t, rec), rec
 }
 
-// getLease returns an admin view of one lease.
+// getLease returns one lease as stored.
 func (e *testEnv) getLease(id string) model.Lease {
 	e.t.Helper()
-	rec := e.admin(http.MethodGet, "/api/v1/admin/leases/"+id, nil)
-	requireStatus(e.t, rec, http.StatusOK)
-	return decodeEnvelope[model.Lease](e.t, rec)
+	lease, err := e.srv.db.GetLease(context.Background(), id)
+	if err != nil {
+		e.t.Fatalf("GetLease(%s): %v", id, err)
+	}
+	return lease
 }
 
 // listAudit returns audit events filtered by action (newest first).
@@ -303,12 +265,13 @@ func (e *testEnv) listAudit(action string) []model.AuditEvent {
 	return items
 }
 
-// verifyAudit calls the audit verify endpoint and returns the result.
+// verifyAudit checks the audit hash chain and returns the result.
 func (e *testEnv) verifyAudit() model.AuditVerifyResult {
 	e.t.Helper()
-	rec := e.admin(http.MethodGet, "/api/v1/admin/audit/verify", nil)
-	requireStatus(e.t, rec, http.StatusOK)
-	result := decodeEnvelope[model.AuditVerifyResult](e.t, rec)
+	result, err := e.srv.db.VerifyAudit(context.Background())
+	if err != nil {
+		e.t.Fatalf("VerifyAudit: %v", err)
+	}
 	if !result.OK {
 		e.t.Fatalf("audit chain did not verify: %+v", result)
 	}

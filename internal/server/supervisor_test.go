@@ -59,8 +59,8 @@ func TestOnlySupervisorsReachTheSupervisorRoutes(t *testing.T) {
 		if code := a.do(r.method, r.path, a.token, nil).Code; code != http.StatusUnauthorized {
 			t.Errorf("agent token %s %s = %d, want 401", r.method, r.path, code)
 		}
-		if code := a.do(r.method, r.path, a.adminToken, nil).Code; code != http.StatusUnauthorized {
-			t.Errorf("operator token %s %s = %d, want 401", r.method, r.path, code)
+		if code := a.do(r.method, r.path, "csg_adm_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", nil).Code; code != http.StatusUnauthorized {
+			t.Errorf("old admin token %s %s = %d, want 401", r.method, r.path, code)
 		}
 	}
 	if a.status(pending.ID) != model.LeasePending {
@@ -189,16 +189,6 @@ func TestSupervisorSettingsAndAudit(t *testing.T) {
 	}
 }
 
-// The operator token keeps working, recorded as the operator, until it is
-// removed.
-func TestOperatorTokenIsStillRecordedAsOperator(t *testing.T) {
-	a := newAccessEnv(t, "")
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/providers", newMockAccount("ops", "6543210987654321")), http.StatusCreated)
-	if ev := a.lastEvent("provider.created"); ev.ActorType != "admin" || ev.ActorName != "operator" {
-		t.Fatalf("operator action attributed to %s %s", ev.ActorType, ev.ActorName)
-	}
-}
-
 // Each person sees only their own accounts, with what their agents get there.
 func TestMyAccounts(t *testing.T) {
 	a := newAccessEnv(t, model.RoleMember)
@@ -224,10 +214,16 @@ func TestMyAccounts(t *testing.T) {
 		t.Fatalf("after raising = %+v", acct)
 	}
 
-	// A supervisor without a role sees no accounts here.
+	// A supervisor is Administrator on every account, without a binding.
 	rec = a.sup.do(http.MethodGet, "/api/v1/me/accounts", nil)
-	if n := decodeEnvelope[listData[model.PersonAccount]](t, rec).Total; n != 0 {
-		t.Fatalf("supervisor without a role sees %d accounts", n)
+	sup := decodeEnvelope[listData[model.PersonAccount]](t, rec)
+	if sup.Total != 2 {
+		t.Fatalf("supervisor sees %d accounts", sup.Total)
+	}
+	for _, acct := range sup.Items {
+		if acct.Role != model.RoleAdministrator || acct.HighestPermission != "full" {
+			t.Fatalf("supervisor account = %+v", acct)
+		}
 	}
 	requireStatus(t, a.do(http.MethodGet, "/api/v1/me/accounts", a.token, nil), http.StatusUnauthorized)
 }
@@ -303,7 +299,6 @@ func TestStopEventsNameAgentOwnerAndSupervisor(t *testing.T) {
 	// in the supervisor's name.
 	again := a.request(accessInput("oss", "read"))
 	settings, _ := a.srv.db.GetPolicySettings(context.Background())
-	settings.AutoApproveMaxTTLSeconds = 300
 	settings.MaxLeaseTTLSeconds = 300
 	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
 	if a.status(again.ID) != model.LeaseRevoked {
@@ -501,4 +496,42 @@ func TestSecurityHeadersAndStaticFallback(t *testing.T) {
 			t.Errorf("%s: status %d, content type %q", path, rec.Code, rec.Header().Get("Content-Type"))
 		}
 	}
+}
+
+// Supervisors are Administrator on every cloud account (§17): their agents
+// may ask for full access without a role binding, and losing the flag
+// revokes what the agents hold beyond the person's own bindings.
+func TestSupervisorIsAdministratorEverywhere(t *testing.T) {
+	a := newAccessEnv(t, "")
+	ana := a.addPerson(a.sup, "ana", true)
+	_, token := a.signInAgent(ana, "ana-agent")
+
+	rec := a.do(http.MethodGet, "/api/v1/agent/accounts", token, nil)
+	requireStatus(t, rec, http.StatusOK)
+	accounts := decodeEnvelope[listData[model.AgentAccount]](t, rec)
+	if accounts.Total != 1 || accounts.Items[0].Role != model.RoleAdministrator || accounts.Items[0].HighestPermission != "full" {
+		t.Fatalf("supervisor's agent sees %+v", accounts.Items)
+	}
+
+	rec = a.requestRaw(token, model.AccessRequestInput{CloudAccountID: demoAccountID, Resource: "ecs",
+		Permission: "full", TTLSeconds: 600, Reason: "rebuild the test instance"})
+	requireStatus(t, rec, http.StatusCreated)
+	req := decodeEnvelope[model.AccessRequest](t, rec)
+	if req.Status != model.LeasePending {
+		t.Fatalf("full request is %s, want pending under the read mode", req.Status)
+	}
+	requireStatus(t, a.approve(ana, req.ID), http.StatusOK)
+	if got := a.status(req.ID); got != model.LeaseActive {
+		t.Fatalf("approved request is %s", got)
+	}
+
+	notSupervisor := false
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+ana.person.ID,
+		model.UpdatePersonInput{Supervisor: &notSupervisor}), http.StatusOK)
+	if got := a.status(req.ID); got != model.LeaseRevoked {
+		t.Fatalf("after losing the flag the lease is %s", got)
+	}
+	rec = a.requestRaw(token, model.AccessRequestInput{CloudAccountID: demoAccountID, Resource: "ecs",
+		Permission: "read", TTLSeconds: 600})
+	requireStatus(t, rec, http.StatusForbidden)
 }

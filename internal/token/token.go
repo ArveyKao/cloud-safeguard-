@@ -6,7 +6,6 @@ package token
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -43,11 +42,6 @@ func Generate(prefix string) (plain string, hash string, err error) {
 func Hash(plain string) string {
 	sum := sha256.Sum256([]byte(plain))
 	return hex.EncodeToString(sum[:])
-}
-
-// HashEqual compares two token hashes in constant time.
-func HashEqual(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // Kind classifies a plaintext token by its prefix: "agent", "admin" or "".

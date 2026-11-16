@@ -45,10 +45,8 @@ func (f *fakeAgentAPI) handler(t *testing.T) http.Handler {
 			writeEnvelope(w, http.StatusCreated, f.signIn)
 		case r.URL.Path == "/api/v1/agent-signin/token":
 			writeEnvelope(w, http.StatusOK, f.signInResult)
-		case r.URL.Path == "/api/v1/agent/leases" && r.Method == http.MethodPost:
-			lease := testLease(model.LeaseActive)
-			lease.ID = reviewLeaseID
-			writeEnvelope(w, http.StatusCreated, lease)
+		case r.URL.Path == "/api/v1/agent/access-requests" && r.Method == http.MethodPost:
+			writeEnvelope(w, http.StatusCreated, model.AccessRequest{ID: reviewLeaseID, Status: model.LeaseActive})
 		case strings.HasSuffix(r.URL.Path, "/credential"):
 			f.credCalls++
 			if f.credentialErr {
@@ -127,7 +125,7 @@ func TestCredentialNamesFromTheServerAreFiltered(t *testing.T) {
 	// The command run by csg exec sees neither, nor the CLI's own token.
 	t.Setenv("CSG_TOKEN", agentTokenA)
 	ta.stdout.Reset()
-	code := ta.run("exec", "--capability", "aliyun.cloud.read", "--", "sh", "-c", `printf '[%s][%s][%s]' "$LD_PRELOAD" "$BASH_ENV" "$CSG_TOKEN"`)
+	code := ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--", "sh", "-c", `printf '[%s][%s][%s]' "$LD_PRELOAD" "$BASH_ENV" "$CSG_TOKEN"`)
 	if code != ExitOK || ta.out() != "[][][]" {
 		t.Fatalf("child env exit %d: %q", code, ta.out())
 	}
@@ -144,7 +142,7 @@ func TestExecRevokesWhenInterrupted(t *testing.T) {
 	ta.app.afterChildStart = func() { sigs <- syscall.SIGINT }
 
 	start := time.Now()
-	code := ta.run("exec", "--capability", "aliyun.cloud.read", "--keep", "--", "sleep", "20")
+	code := ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--keep", "--", "sleep", "20")
 	if code != 130 {
 		t.Fatalf("exit = %d, want 130: %s", code, ta.errOut())
 	}
@@ -160,7 +158,7 @@ func TestExecRevokesWhenInterrupted(t *testing.T) {
 func TestExecRevokesOnEveryFailure(t *testing.T) {
 	f := &fakeAgentAPI{envelope: maliciousEnvelope(), revokeErr: true}
 	ta, _ := newFakeApp(t, f)
-	if code := ta.run("exec", "--capability", "aliyun.cloud.read", "--", "/no/such/command"); code == ExitOK {
+	if code := ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--", "/no/such/command"); code == ExitOK {
 		t.Fatal("a missing command succeeded")
 	}
 	if f.revokeCalls != 1 || !strings.Contains(ta.errOut(), "warning: could not revoke") {
@@ -169,7 +167,7 @@ func TestExecRevokesOnEveryFailure(t *testing.T) {
 
 	f2 := &fakeAgentAPI{credentialErr: true}
 	ta2, _ := newFakeApp(t, f2)
-	if code := ta2.run("exec", "--capability", "aliyun.cloud.read", "--", "true"); code == ExitOK {
+	if code := ta2.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--", "true"); code == ExitOK {
 		t.Fatal("a failed credential fetch succeeded")
 	}
 	if f2.revokeCalls != 1 || f2.revokeReasons[0] != "csg exec could not fetch the credential" {
@@ -259,9 +257,9 @@ func TestSignInHardening(t *testing.T) {
 	srv := httptest.NewServer(f.handler(t))
 	t.Cleanup(srv.Close)
 	ta := newTestApp(t)
-	// A saved admin token for this server must not be sent, and must be
-	// noted when replaced.
-	if _, err := ta.app.saveFileConfig(fileConfig{Server: srv.URL, Token: adminTokenA, Kind: "admin"}); err != nil {
+	// A saved token that is not an agent token (the removed admin token) must
+	// not be sent, and must be noted when replaced.
+	if _, err := ta.app.saveFileConfig(fileConfig{Server: srv.URL, Token: oldAdminToken, Kind: "admin"}); err != nil {
 		t.Fatal(err)
 	}
 	cfgPath, _ := ta.app.configPath()
@@ -297,7 +295,7 @@ func TestSignInHardening(t *testing.T) {
 	if !strings.Contains(shown, "is not on "+srv.URL) {
 		t.Fatalf("no warning about the link: %q", shown)
 	}
-	if cfg := ta.app.loadFileConfig(); cfg.Token != adminTokenA {
+	if cfg := ta.app.loadFileConfig(); cfg.Token != oldAdminToken {
 		t.Fatal("a refused sign-in replaced the saved token")
 	}
 
@@ -311,8 +309,8 @@ func TestSignInHardening(t *testing.T) {
 	if st, _ := os.Stat(cfgPath); st.Mode().Perm() != 0o600 {
 		t.Fatalf("config mode = %v", st.Mode().Perm())
 	}
-	if !strings.Contains(ta.errOut(), "replacing the saved an admin token") {
-		t.Fatalf("no note about replacing the admin token: %q", ta.errOut())
+	if !strings.Contains(ta.errOut(), "replacing the token saved for "+srv.URL) {
+		t.Fatalf("no note about replacing the saved token: %q", ta.errOut())
 	}
 }
 

@@ -1,5 +1,12 @@
 # Cloud Safeguard — Architecture (v0.1)
 
+> **Out of date since 2026-11-15.** This page describes v0.1. The admin token, the admin API,
+> agent grants, stored capabilities, break-glass and the risk-tier policy engine were removed;
+> people now sign in to the console, agents sign in with `csg login` and ask for access per
+> cloud account. The running behaviour is [CONTRACT.md](CONTRACT.md) §17. The vault, the audit
+> hash chain, the lease states and the mock cloud described here still apply. A rewrite of
+> this page is pending.
+
 Status: describes the v0.1 implementation architecture. Normative behavior is frozen in
 [CONTRACT.md](CONTRACT.md) (§3–§13); product scope and acceptance in [SPEC.md](SPEC.md).
 Shared Go types are `internal/model/model.go`, whose JSON tags are the wire contract.

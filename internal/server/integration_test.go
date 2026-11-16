@@ -1,52 +1,54 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/arveykao/cloud-safeguard/internal/authn"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/store"
 )
 
 // TestRealMockProviderEndToEnd exercises the cross-package demo path with the
-// real provider minters (no fake): auto-approve -> real mock STS token ->
-// mock-cloud read allowed -> out-of-policy write denied -> revoke -> immediate
-// 401. It is the server-side equivalent of demo scenarios S1/S2.
+// real provider minters (no fake): a person's agent signs in and asks for
+// read access -> real mock STS token -> mock-cloud read allowed ->
+// out-of-policy write denied -> revoke -> immediate 401.
 func TestRealMockProviderEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	initRes, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	srv, err := New(Config{DataDir: dir}) // real provider.New(mock)
+	// The real clock: the mock cloud checks token deadlines against it.
+	clock := newFakeClock(time.Now())
+	srv, err := New(Config{DataDir: dir, Now: clock.Now, // real provider.New(mock)
+		PasswordParams: &authn.Params{MemoryKiB: 64, Time: 1, Threads: 1, SaltLen: 16, KeyLen: 32}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer srv.Close()
 	handler := srv.Handler()
+	env := &testEnv{t: t, srv: srv, dir: dir, clock: clock, logs: &bytes.Buffer{}, supervisor: initRes.Supervisor,
+		providerID: initRes.ProviderIDs[0]}
+	sup := env.supervisorClient()
+	mei := env.addPerson(sup, "mei", false)
+	requireStatus(t, sup.do(http.MethodPut, "/api/v1/supervisor/accounts/"+env.providerID+"/people/"+mei.person.ID,
+		model.PutBindingInput{Role: model.RoleGuest}), http.StatusOK)
+	_, agentToken := env.signInAgent(mei, "claude-code")
 
-	agentToken := ""
-	for _, agent := range initRes.Agents {
-		if agent.Name == "claude-code" {
-			agentToken = agent.Token
-		}
-	}
-	if agentToken == "" {
-		t.Fatal("demo init did not create claude-code")
-	}
-
-	// Auto-approved lease.
-	createRec := rawRequest(t, handler, http.MethodPost, "/api/v1/agent/leases", agentToken, model.CreateLeaseInput{
-		CapabilityID: "aliyun.cloud.read",
-		Reason:       "integration: read inventory",
+	// Read access is issued at once.
+	createRec := rawRequest(t, handler, http.MethodPost, "/api/v1/agent/access-requests", agentToken, model.AccessRequestInput{
+		CloudAccountID: demoAccountID, Resource: "ecs", Permission: "read", TTLSeconds: 600,
 	})
 	requireStatus(t, createRec, http.StatusCreated)
-	lease := decodeEnvelope[model.Lease](t, createRec)
-	if lease.Status != model.LeaseActive || lease.ProviderMode != model.ModeMock {
-		t.Fatalf("lease = %+v, want active mock lease", lease)
+	lease := decodeEnvelope[model.AccessRequest](t, createRec)
+	if lease.Status != model.LeaseActive {
+		t.Fatalf("request = %+v, want active", lease)
 	}
 
 	// Fetch the real mock credential.
@@ -117,8 +119,7 @@ func TestRealMockProviderEndToEnd(t *testing.T) {
 	}
 
 	// The real mock provider passes its configuration test (signing key present).
-	providerTest := rawRequest(t, handler, http.MethodPost,
-		"/api/v1/admin/providers/"+initRes.ProviderIDs[0]+"/test", initRes.AdminToken, nil)
+	providerTest := sup.do(http.MethodPost, "/api/v1/supervisor/accounts/"+initRes.ProviderIDs[0]+"/test", nil)
 	if providerTest.Code != http.StatusOK {
 		t.Fatalf("provider test status = %d (body %.300s)", providerTest.Code, providerTest.Body.String())
 	}

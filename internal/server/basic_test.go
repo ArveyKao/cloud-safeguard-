@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,16 +73,19 @@ func TestStaticSPAServing(t *testing.T) {
 }
 
 func TestUnknownAPIEndpointsReturnJSON404(t *testing.T) {
-	env := newTestEnv(t, true)
+	a := newAccessEnv(t, model.RoleMember)
 	// Unprefixed API paths are unknown regardless of auth.
-	rec := env.admin(http.MethodGet, "/api/v1/nope", nil)
-	requireErrorCode(t, rec, http.StatusNotFound, model.ErrCodeNotFound)
-
-	// Authenticated requests to unknown sub-paths get JSON 404s.
-	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/nope", nil)
-	requireErrorCode(t, rec, http.StatusNotFound, model.ErrCodeNotFound)
-	rec = env.admin(http.MethodGet, "/api/v1/admin/nope", nil)
-	requireErrorCode(t, rec, http.StatusNotFound, model.ErrCodeNotFound)
+	for _, rec := range []*httptest.ResponseRecorder{
+		a.do(http.MethodGet, "/api/v1/nope", "", nil),
+		a.do(http.MethodGet, "/api/v1/nope", a.token, nil),
+		a.sup.do(http.MethodGet, "/api/v1/nope", nil),
+		// Authenticated requests to unknown sub-paths get JSON 404s.
+		a.do(http.MethodGet, "/api/v1/agent/nope", a.token, nil),
+		a.mei.do(http.MethodGet, "/api/v1/me/nope", nil),
+		a.sup.do(http.MethodGet, "/api/v1/supervisor/nope", nil),
+	} {
+		requireErrorCode(t, rec, http.StatusNotFound, model.ErrCodeNotFound)
+	}
 }
 
 func TestMockCloudMountOnlyWithMockProvider(t *testing.T) {
@@ -100,30 +104,31 @@ func TestMockCloudMountOnlyWithMockProvider(t *testing.T) {
 }
 
 func TestAuthBoundaries(t *testing.T) {
-	env := newTestEnv(t, true)
+	a := newAccessEnv(t, model.RoleMember)
+	env := a.testEnv
 
 	// No token.
 	rec := env.do(http.MethodGet, "/api/v1/agent/me", "", nil)
 	requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
 
-	// Malformed / non-bearer credentials.
-	for _, bogus := range []string{"not-a-token", "Bearer", ""} {
-		rec := env.do(http.MethodGet, "/api/v1/agent/me", bogus, nil)
-		requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
+	// Malformed / non-bearer credentials, and the prefix of the removed
+	// admin token.
+	for _, bogus := range []string{"not-a-token", "Bearer", token.AdminPrefix + strings.Repeat("B", 43)} {
+		for _, path := range []string{"/api/v1/agent/me", "/api/v1/agent/accounts", "/api/v1/agent/leases"} {
+			rec := env.do(http.MethodGet, path, bogus, nil)
+			requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
+		}
 	}
 
-	// Admin token on agent routes.
-	rec = env.do(http.MethodGet, "/api/v1/agent/me", env.adminToken, nil)
-	requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
-	rec = env.do(http.MethodPost, "/api/v1/agent/leases", env.adminToken, model.CreateLeaseInput{CapabilityID: "aliyun.cloud.read"})
-	requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
-
-	// Agent token on admin routes.
-	agentToken := env.agentTokens["claude-code"]
-	rec = env.do(http.MethodGet, "/api/v1/admin/overview", agentToken, nil)
-	requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
-	rec = env.do(http.MethodGet, "/api/v1/admin/audit/verify", agentToken, nil)
-	requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
+	// An agent token is not a console session.
+	for _, path := range []string{"/api/v1/me/requests", "/api/v1/supervisor/accounts", "/api/v1/supervisor/audit/verify", "/api/v1/auth/me"} {
+		rec = env.do(http.MethodGet, path, a.token, nil)
+		requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
+	}
+	// A console session is not an agent token, and a person who is not a
+	// supervisor does not reach the supervisor routes.
+	requireErrorCode(t, a.mei.do(http.MethodGet, "/api/v1/agent/me", nil), http.StatusUnauthorized, model.ErrCodeUnauthorized)
+	requireErrorCode(t, a.mei.do(http.MethodGet, "/api/v1/supervisor/accounts", nil), http.StatusForbidden, model.ErrCodeForbidden)
 
 	// Unknown / forged agent token.
 	forged := token.AgentPrefix + strings.Repeat("A", 43)
@@ -133,120 +138,73 @@ func TestAuthBoundaries(t *testing.T) {
 		t.Fatal("forged agent token did not record auth.agent_auth_failed audit event")
 	}
 
-	// Invalid admin token.
-	rec = env.do(http.MethodPost, "/api/v1/admin/login", token.AdminPrefix+strings.Repeat("B", 43), nil)
-	requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
-	if !env.hasAction("auth.admin_auth_failed") {
-		t.Fatal("invalid admin token did not record auth.admin_auth_failed audit event")
-	}
-
-	// Valid tokens reach their routes.
-	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/me", nil)
-	requireStatus(t, rec, http.StatusOK)
-	rec = env.admin(http.MethodGet, "/api/v1/admin/overview", nil)
-	requireStatus(t, rec, http.StatusOK)
+	// Valid credentials reach their routes.
+	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", a.token, nil), http.StatusOK)
+	requireStatus(t, a.mei.do(http.MethodGet, "/api/v1/me/requests", nil), http.StatusOK)
+	requireStatus(t, a.sup.do(http.MethodGet, "/api/v1/supervisor/accounts", nil), http.StatusOK)
 
 	// Audit chain is still intact after all auth failures.
 	env.verifyAudit()
 }
 
-func TestSuspendedAgentIsForbidden(t *testing.T) {
-	env := newTestEnv(t, true)
-	agentID := env.agentIDs["claude-code"]
-	rec := env.admin(http.MethodPost, "/api/v1/admin/agents/"+agentID+"/suspend", nil)
-	requireStatus(t, rec, http.StatusOK)
-	suspended := decodeEnvelope[model.Agent](t, rec)
-	if suspended.Status != model.AgentSuspended {
-		t.Fatalf("agent status = %q, want suspended", suspended.Status)
+// An agent that is suspended or revoked is refused on every agent endpoint.
+func TestInactiveAgentIsForbidden(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	paths := []string{"/api/v1/agent/me", "/api/v1/agent/accounts", "/api/v1/agent/leases"}
+	if _, err := a.srv.db.SQL().Exec(`UPDATE agents SET status = 'suspended' WHERE id = ?`, a.agent.ID); err != nil {
+		t.Fatal(err)
 	}
+	for _, path := range paths {
+		requireErrorCode(t, a.do(http.MethodGet, path, a.token, nil), http.StatusForbidden, model.ErrCodeForbidden)
+	}
+	requireStatus(t, a.requestRaw(a.token, accessInput("ecs", "read")), http.StatusForbidden)
+	if _, err := a.srv.db.SQL().Exec(`UPDATE agents SET status = 'active' WHERE id = ?`, a.agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	requireStatus(t, a.do(http.MethodGet, "/api/v1/agent/me", a.token, nil), http.StatusOK)
 
-	// Every agent endpoint must reject the suspended agent with 403.
-	for _, path := range []string{"/api/v1/agent/me", "/api/v1/agent/capabilities", "/api/v1/agent/leases"} {
-		rec = env.agent("claude-code", http.MethodGet, path, nil)
-		requireErrorCode(t, rec, http.StatusForbidden, model.ErrCodeForbidden)
+	// The owner revokes the agent in the console: it is refused for good.
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/agents/"+a.agent.ID+"/revoke", nil), http.StatusOK)
+	for _, path := range paths {
+		requireErrorCode(t, a.do(http.MethodGet, path, a.token, nil), http.StatusForbidden, model.ErrCodeForbidden)
 	}
-	if !env.hasAction("agent.suspended") {
-		t.Fatal("agent.suspended audit event missing")
+	requireStatus(t, a.requestRaw(a.token, accessInput("ecs", "read")), http.StatusForbidden)
+	if a.leaseCount() != 0 {
+		t.Fatal("an inactive agent created a request")
 	}
-
-	// Re-activating restores access.
-	rec = env.admin(http.MethodPost, "/api/v1/admin/agents/"+agentID+"/activate", nil)
-	requireStatus(t, rec, http.StatusOK)
-	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/me", nil)
-	requireStatus(t, rec, http.StatusOK)
 }
 
-func TestAgentMeAndCapabilities(t *testing.T) {
-	env := newTestEnv(t, true)
+func TestAgentMeAndHeartbeat(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	active := a.request(accessInput("ecs", "read"))
 
-	rec := env.agent("claude-code", http.MethodGet, "/api/v1/agent/me", nil)
+	rec := a.do(http.MethodGet, "/api/v1/agent/me", a.token, nil)
 	requireStatus(t, rec, http.StatusOK)
 	me := decodeEnvelope[struct {
 		Agent        model.Agent `json:"agent"`
 		ActiveLeases int         `json:"active_leases"`
 		ServerTime   time.Time   `json:"server_time"`
 	}](t, rec)
-	if me.Agent.Name != "claude-code" || me.Agent.Status != model.AgentActive {
+	if me.Agent.ID != a.agent.ID || me.Agent.Name != "mei-agent" || me.Agent.Status != model.AgentActive || me.Agent.OwnerID != a.mei.person.ID {
 		t.Fatalf("agent = %+v", me.Agent)
 	}
-	if me.ActiveLeases != 0 {
-		t.Fatalf("active_leases = %d, want 0", me.ActiveLeases)
+	if me.ActiveLeases != 1 || active.Status != model.LeaseActive {
+		t.Fatalf("active_leases = %d, want 1", me.ActiveLeases)
 	}
-	if !me.ServerTime.Equal(fixedTestTime) {
-		t.Fatalf("server_time = %v, want %v", me.ServerTime, fixedTestTime)
+	if !me.ServerTime.Equal(a.clock.Now()) {
+		t.Fatalf("server_time = %v, want %v", me.ServerTime, a.clock.Now())
 	}
-	if len(me.Agent.Grants) != 5 {
-		t.Fatalf("claude-code grants = %v, want all 5 builtins", me.Agent.Grants)
+	// An agent has no role or grants of its own: it inherits its owner's role.
+	if len(me.Agent.Grants) != 0 {
+		t.Fatalf("agent has grants of its own: %v", me.Agent.Grants)
 	}
-	if me.Agent.Role != model.RoleAdministrator {
-		t.Fatalf("claude-code role = %q, want administrator", me.Agent.Role)
-	}
-
-	// Claude-code sees exactly its granted + enabled capabilities, and the
-	// response carries the agent's role and every capability's access level
-	// (CONTRACT §16.5).
-	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/capabilities", nil)
-	requireStatus(t, rec, http.StatusOK)
-	claudeCaps := decodeEnvelope[agentCapabilitiesResponse](t, rec)
-	if claudeCaps.Total != 5 || len(claudeCaps.Items) != 5 {
-		t.Fatalf("claude-code capabilities total=%d len=%d, want 5/5", claudeCaps.Total, len(claudeCaps.Items))
-	}
-	if claudeCaps.Role != model.RoleAdministrator {
-		t.Fatalf("capabilities response role = %q, want administrator", claudeCaps.Role)
-	}
-	wantAccess := map[string]model.AccessLevel{
-		"aliyun.cloud.read":       model.AccessRead,
-		"aliyun.dns.manage":       model.AccessWrite,
-		"aliyun.cert.dns01":       model.AccessWrite,
-		"aliyun.ecs.instance.ops": model.AccessWrite,
-		"aliyun.account.admin":    model.AccessAdmin,
-	}
-	for _, c := range claudeCaps.Items {
-		want, ok := wantAccess[c.ID]
-		if !ok {
-			t.Fatalf("unexpected capability %s in the agent list", c.ID)
-		}
-		if c.Access != want {
-			t.Fatalf("%s access = %q, want %q", c.ID, c.Access, want)
-		}
+	if strings.Contains(rec.Body.String(), a.token) {
+		t.Fatal("agent/me returned the token")
 	}
 
-	// Hermes is a guest and only sees its one granted read capability.
-	rec = env.agent("hermes-researcher", http.MethodGet, "/api/v1/agent/capabilities", nil)
+	rec = a.do(http.MethodPost, "/api/v1/agent/heartbeat", a.token, nil)
 	requireStatus(t, rec, http.StatusOK)
-	hermesCaps := decodeEnvelope[agentCapabilitiesResponse](t, rec)
-	if hermesCaps.Total != 1 || len(hermesCaps.Items) != 1 || hermesCaps.Items[0].ID != "aliyun.cloud.read" {
-		t.Fatalf("hermes capabilities = %+v, want only aliyun.cloud.read", hermesCaps)
-	}
-	if hermesCaps.Role != model.RoleGuest {
-		t.Fatalf("hermes capabilities role = %q, want guest", hermesCaps.Role)
-	}
-
-	// Heartbeat works.
-	rec = env.agent("claude-code", http.MethodPost, "/api/v1/agent/heartbeat", nil)
-	requireStatus(t, rec, http.StatusOK)
-	heartbeat := decodeEnvelope[map[string]any](t, rec)
-	if heartbeat["ok"] != true {
+	if heartbeat := decodeEnvelope[map[string]any](t, rec); heartbeat["ok"] != true {
 		t.Fatalf("heartbeat = %+v", heartbeat)
 	}
 }
@@ -274,6 +232,21 @@ func TestUninitializedServerFailsWithInitHint(t *testing.T) {
 	if _, err := New(Config{DataDir: partial}); !errors.Is(err, ErrNotInitialized) {
 		t.Fatalf("New(partial dir) error = %v, want ErrNotInitialized", err)
 	}
+
+	// A database that was created but never bootstrapped (no supervisor, no
+	// settings) is uninitialized too, even though its schema is current.
+	bare := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bare, "master.key"), make([]byte, 32), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	db, err := store.Open(context.Background(), bare)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	db.Close()
+	if _, err := New(Config{DataDir: bare}); !errors.Is(err, ErrNotInitialized) {
+		t.Fatalf("New(bare database) error = %v, want ErrNotInitialized", err)
+	}
 }
 
 func TestInitBootstrapArtifacts(t *testing.T) {
@@ -282,25 +255,18 @@ func TestInitBootstrapArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if !strings.HasPrefix(result.AdminToken, token.AdminPrefix) {
-		t.Fatalf("admin token %q has wrong prefix", result.AdminToken)
-	}
-	if result.AdminTokenPrefix != token.DisplayPrefix(result.AdminToken) {
-		t.Fatalf("admin token prefix = %q", result.AdminTokenPrefix)
-	}
-	if len(result.Agents) != 2 {
-		t.Fatalf("demo Init created %d agents, want 2", len(result.Agents))
-	}
-	for _, agent := range result.Agents {
-		if !strings.HasPrefix(agent.Token, token.AgentPrefix) {
-			t.Fatalf("agent %s token %q has wrong prefix", agent.Name, agent.Token)
-		}
+	if result.Supervisor == nil || result.Supervisor.SetupCode == "" || !result.Supervisor.Person.Supervisor {
+		t.Fatalf("Init did not issue the first supervisor's setup code: %+v", result.Supervisor)
 	}
 	if len(result.ProviderIDs) != 1 {
-		t.Fatalf("demo Init created %d providers, want 1", len(result.ProviderIDs))
+		t.Fatalf("demo Init created %d cloud accounts, want 1", len(result.ProviderIDs))
 	}
-	if len(result.CapabilityIDs) != 5 {
-		t.Fatalf("demo Init seeded %d capabilities, want 5", len(result.CapabilityIDs))
+	// Init hands out no token of any kind: the setup code is the only secret.
+	raw, _ := json.Marshal(result)
+	for _, prefix := range []string{token.AdminPrefix, token.AgentPrefix} {
+		if strings.Contains(string(raw), prefix) {
+			t.Fatalf("InitResult carries a %s token: %s", prefix, raw)
+		}
 	}
 
 	// File permissions and layout.
@@ -333,20 +299,16 @@ func TestInitBootstrapArtifacts(t *testing.T) {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	for metaKey, wantPrefix := range map[string]string{
-		store.MetaInstanceID:     "csg_",
-		store.MetaAdminTokenHash: "",
-	} {
-		value, err := db.GetMeta(ctx, metaKey)
-		if err != nil {
-			t.Fatalf("meta %s: %v", metaKey, err)
-		}
-		if wantPrefix != "" && !strings.HasPrefix(value, wantPrefix) {
-			t.Errorf("meta %s = %q, want prefix %q", metaKey, value, wantPrefix)
-		}
+	if id, err := db.GetMeta(ctx, store.MetaInstanceID); err != nil || !strings.HasPrefix(id, "csg_") {
+		t.Errorf("instance id = %q, %v", id, err)
 	}
-	if hash, _ := db.GetMeta(ctx, store.MetaAdminTokenHash); hash != token.Hash(result.AdminToken) {
-		t.Error("stored admin token hash does not match the returned admin token")
+	if _, err := db.GetMeta(ctx, store.MetaBootstrapTime); err != nil {
+		t.Errorf("bootstrap time: %v", err)
+	}
+	for _, key := range []string{"admin_token_hash", "admin_token_prefix"} {
+		if _, err := db.GetMeta(ctx, key); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("meta %s exists (err %v); no admin token may be created", key, err)
+		}
 	}
 	if mode, _ := db.GetMeta(ctx, store.MetaDemoMode); mode != "true" {
 		t.Errorf("demo_mode = %q, want true", mode)
@@ -355,34 +317,28 @@ func TestInitBootstrapArtifacts(t *testing.T) {
 	if version, _ := db.GetMeta(ctx, store.MetaSchemaVersion); version != wantSchema {
 		t.Errorf("schema_version = %q, want %s", version, wantSchema)
 	}
-	caps, err := db.ListCapabilities(ctx)
-	if err != nil || len(caps) != 5 {
-		t.Fatalf("seeded capabilities = %d, %v", len(caps), err)
+	// No stored capabilities and no agents: access templates live in code,
+	// and agents exist only after a person approves their sign-in.
+	if caps, err := db.ListCapabilities(ctx); err != nil || len(caps) != 0 {
+		t.Fatalf("seeded capabilities = %d, %v; want none", len(caps), err)
 	}
-	for _, c := range caps {
-		if !c.Builtin || !c.Enabled {
-			t.Errorf("capability %s builtin=%v enabled=%v, want true/true", c.ID, c.Builtin, c.Enabled)
-		}
+	if agents, err := db.ListAgents(ctx); err != nil || len(agents) != 0 {
+		t.Fatalf("seeded agents = %d, %v; want none", len(agents), err)
 	}
 	providers, err := db.ListProviders(ctx)
 	if err != nil || len(providers) != 1 {
 		t.Fatalf("seeded providers = %d, %v", len(providers), err)
 	}
-	if providers[0].Name != "demo-aliyun" || providers[0].Mode != model.ModeMock || providers[0].Status != model.ProviderActive {
+	if providers[0].Name != "demo-aliyun" || providers[0].Mode != model.ModeMock || providers[0].Status != model.ProviderActive ||
+		providers[0].CloudAccountID != demoAccountID || providers[0].MaxAutoLevel != model.ModeRead {
 		t.Fatalf("demo provider = %+v", providers[0])
 	}
-	agents, err := db.ListAgents(ctx)
-	if err != nil || len(agents) != 2 {
-		t.Fatalf("seeded agents = %d, %v", len(agents), err)
-	}
-	// Agent token hashes resolve; raw tokens are not stored.
-	for _, agent := range result.Agents {
-		if _, err := db.GetAgentByTokenHash(ctx, token.Hash(agent.Token)); err != nil {
-			t.Errorf("agent token for %s does not resolve: %v", agent.Name, err)
-		}
+	people, err := db.ListPersons(ctx)
+	if err != nil || len(people) != 1 || !people[0].Supervisor || people[0].Status != model.PersonPending {
+		t.Fatalf("bootstrap people = %+v, %v", people, err)
 	}
 
-	// Init is refused on an initialized dir.
+	// Init never touches an initialized dir, and there is no way to force it.
 	if _, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true}); err == nil {
 		t.Fatal("Init on an initialized dir succeeded, want refusal")
 	} else if !strings.Contains(err.Error(), "already initialized") {
@@ -400,22 +356,27 @@ func TestInitBootstrapArtifacts(t *testing.T) {
 }
 
 func TestAgentLastSeenThrottled(t *testing.T) {
-	env := newTestEnv(t, true)
+	a := newAccessEnv(t, model.RoleMember)
+	env := a.testEnv
 	ctx := context.Background()
+	start := env.clock.Now()
+	if _, err := env.srv.db.SQL().Exec(`UPDATE agents SET last_seen_at = NULL WHERE id = ?`, a.agent.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	// First agent request refreshes last_seen_at.
-	rec := env.agent("claude-code", http.MethodGet, "/api/v1/agent/me", nil)
+	rec := env.do(http.MethodGet, "/api/v1/agent/me", a.token, nil)
 	requireStatus(t, rec, http.StatusOK)
 	first := decodeEnvelope[struct {
 		Agent model.Agent `json:"agent"`
 	}](t, rec).Agent.LastSeenAt
-	if first == nil || !first.Equal(fixedTestTime) {
-		t.Fatalf("last_seen_at after first request = %v, want %v", first, fixedTestTime)
+	if first == nil || !first.Equal(start) {
+		t.Fatalf("last_seen_at after first request = %v, want %v", first, start)
 	}
 
 	// Requests within 60 s do not refresh it.
 	env.clock.Advance(30 * time.Second)
-	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/me", nil)
+	rec = env.do(http.MethodGet, "/api/v1/agent/me", a.token, nil)
 	requireStatus(t, rec, http.StatusOK)
 	stillFirst := decodeEnvelope[struct {
 		Agent model.Agent `json:"agent"`
@@ -426,45 +387,26 @@ func TestAgentLastSeenThrottled(t *testing.T) {
 
 	// After 60 s it refreshes again.
 	env.clock.Advance(31 * time.Second)
-	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/me", nil)
+	rec = env.do(http.MethodGet, "/api/v1/agent/me", a.token, nil)
 	requireStatus(t, rec, http.StatusOK)
 	refreshed := decodeEnvelope[struct {
 		Agent model.Agent `json:"agent"`
 	}](t, rec).Agent.LastSeenAt
-	want := fixedTestTime.Add(61 * time.Second)
+	want := start.Add(61 * time.Second)
 	if refreshed == nil || !refreshed.Equal(want) {
 		t.Fatalf("last_seen_at = %v, want %v", refreshed, want)
 	}
 
 	// Heartbeat touches last_seen explicitly and immediately.
 	env.clock.Advance(5 * time.Second)
-	rec = env.agent("claude-code", http.MethodPost, "/api/v1/agent/heartbeat", nil)
+	rec = env.do(http.MethodPost, "/api/v1/agent/heartbeat", a.token, nil)
 	requireStatus(t, rec, http.StatusOK)
-	agent, err := env.srv.db.GetAgent(ctx, env.agentIDs["claude-code"])
+	agent, err := env.srv.db.GetAgent(ctx, a.agent.ID)
 	if err != nil {
 		t.Fatalf("GetAgent: %v", err)
 	}
-	heartbeatWant := fixedTestTime.Add(66 * time.Second)
+	heartbeatWant := start.Add(66 * time.Second)
 	if agent.LastSeenAt == nil || !agent.LastSeenAt.Equal(heartbeatWant) {
 		t.Fatalf("last_seen_at after heartbeat = %v, want %v", agent.LastSeenAt, heartbeatWant)
-	}
-}
-
-func TestDisabledCapabilityHiddenFromAgentList(t *testing.T) {
-	env := newTestEnv(t, true)
-	// Disable a builtin capability.
-	rec := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/aliyun.cloud.read", map[string]any{"enabled": false})
-	requireStatus(t, rec, http.StatusOK)
-
-	rec = env.agent("claude-code", http.MethodGet, "/api/v1/agent/capabilities", nil)
-	requireStatus(t, rec, http.StatusOK)
-	caps := decodeEnvelope[model.ListResponse[model.Capability]](t, rec)
-	if caps.Total != 4 {
-		t.Fatalf("agent capabilities total = %d, want 4 after disabling one", caps.Total)
-	}
-	for _, c := range caps.Items {
-		if c.ID == "aliyun.cloud.read" {
-			t.Fatal("disabled capability is still listed to the agent")
-		}
 	}
 }

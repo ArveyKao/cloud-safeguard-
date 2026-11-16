@@ -30,7 +30,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 7
+const CurrentSchemaVersion = 8
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -245,6 +245,48 @@ var migrations = []migration{
 			`ALTER TABLE persons ADD COLUMN setup_issued_at INTEGER`,
 		},
 	},
+	{ // version 7 -> 8: no admin token, no agents without an owner (CONTRACT §17.7a)
+		statements: []string{
+			`DELETE FROM meta WHERE key IN ('admin_token_hash', 'admin_token_prefix')`,
+		},
+		transform: revokeOwnerlessAgents,
+	},
+}
+
+// revokeOwnerlessAgents revokes every agent that belongs to no person: they
+// were created by the removed admin token or the v0.1 demo seed, and nothing
+// can manage them any more. Their leases are revoked by the startup sweep,
+// which records each one in the audit log.
+func revokeOwnerlessAgents(ctx context.Context, tx *sql.Tx, report *MigrationReport) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM agents WHERE owner_id = '' AND status <> ? ORDER BY id ASC`, string(model.AgentRevoked))
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	now := time.Now().UTC().UnixMilli()
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE agents SET status = ?, updated_at = ? WHERE id = ?`,
+			string(model.AgentRevoked), now, id); err != nil {
+			return err
+		}
+	}
+	if report != nil {
+		report.RevokedAgents = append(report.RevokedAgents, ids...)
+	}
+	return nil
 }
 
 // migrateCloudAccountIDs fills providers.cloud_account_id from each role

@@ -1,5 +1,9 @@
 # Cloud Safeguard — Architecture Decision Records (v0.1)
 
+> **Out of date since 2026-11-15.** This page describes v0.1. The admin token and capability leases were removed; people now
+> sign in to the console, agents sign in with `csg login` and ask for access per cloud account.
+> The running behaviour is [CONTRACT.md](CONTRACT.md) §17. A rewrite of this page is pending.
+
 Short ADRs for the decisions frozen in [SPEC.md](SPEC.md) and [CONTRACT.md](CONTRACT.md).
 Status for all: **Accepted for v0.1**. Changing a decision means changing the contract
 (Lead-owned) and recording a superseding ADR here.

@@ -8,6 +8,10 @@ the capability catalog in §7, the mock cloud in §8, the CLI in §9 and the aud
 Vocabulary and scope: `docs/SPEC.md`. Shared Go types: `internal/model/model.go` (JSON tags
 are the wire contract).
 
+> **Read §17 first.** The admin token and the agent model of §3, §4, §6, §7, §9, §11 and §16
+> were removed on 2026-11-15 (§17.7a). Those sections are kept as the record of v0.1 and are
+> no longer the running behaviour. What still applies from them is listed in §17.7a.
+
 ---
 
 ## 1. Runtime, configuration, file layout
@@ -727,11 +731,11 @@ row can never be re-enabled (400), granted (400), given as a default grant, or l
 - Migration from a real v1 database, covering step 2 and "grants never widen".
 - Mock cloud: account-admin lease is allowed on ECS and gets 403 on RAM.
 
-## 17. Supervisors, people, per-account roles and the access request (accepted, not yet implemented)
+## 17. Supervisors, people, per-account roles and the access request (implemented)
 
 Status: accepted by the project owner on 2026-11-09 and revised on 2026-11-10 (supervisors,
-inherited agent rights, three permission levels, owner approval). Implementation follows the §16
-merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR-015.
+inherited agent rights, three permission levels, owner approval). Implemented; §17.8 lists
+each part. This section is the running behaviour. Rationale: ADR-015.
 
 ### 17.1 Identities
 
@@ -739,6 +743,10 @@ merge. Until it ships, §1–§16 describe the running behaviour. Rationale: ADR
   `pending` (created or reset, setup not finished), `active` or `suspended`. Only setup makes a
   person active; a supervisor can set `active` or `suspended` and can reset. No global cloud
   role.
+- **Supervisors are Administrator on every cloud account** (owner's decision, 2026-11-14): no
+  role binding is needed, and their agents may ask for up to `full` on every account; their
+  approval mode and each account's highest automatic level still decide what waits for them.
+  Removing the flag revokes what their agents hold beyond their own role bindings.
 - **Supervisor**: a person with the platform flag `supervisor`. `csg init` creates the first one
   (replaces the single admin token, §2). Only supervisors may add, change or disable cloud
   accounts, create or suspend people, grant or remove the supervisor flag, bind people to cloud
@@ -1004,24 +1012,55 @@ Agent CLI, same flow from a terminal:
   CMD does not inherit `CSG_TOKEN`.
 - `csg credential --lease ID --export` and `csg revoke --lease ID` work with a request ID.
 
+### 17.7a Removal of the admin token and the §16 agent model (decided 2026-11-14, done 2026-11-15)
+
+- The admin token, `/api/v1/admin/*`, `csg login --token` and the admin CLI commands (`caps`,
+  `agents`, `providers`, `policy`, `audit`, `request`, `leases list|approve|deny|revoke`) are
+  removed. Every removed route answers 404. A token with the old `csg_adm_` prefix is not a
+  credential anywhere.
+- `csg init` creates the master key, the database, the default limits and the first
+  supervisor's setup code, plus a mock cloud account with `--demo`. It creates no token, no
+  agent and no stored capability. It refuses any directory that already holds a `master.key`
+  or a database; there is no `--force`. An existing data directory is upgraded when
+  `csg serve` opens it, and a locked-out supervisor uses `csg supervisor recover`.
+- The §16 agent model is removed: agents created by the operator, agent roles and grants,
+  capability leases (`POST /agent/leases`, `GET /agent/capabilities`), stored and custom
+  capabilities, break-glass and the risk-tier policy engine. Access requests (§17.4) with the
+  code-defined templates are the only way to get a credential. The settings a supervisor can
+  change are the longest validity, the approval timeout, the number of credentials an agent
+  holds at once and the requests per minute.
+- Upgrade (schema version 8). The migration deletes the admin token and revokes every agent
+  without an owner; the `schema.migrated` audit event lists them. At every start the server
+  revokes each pending or active lease that is not an access request, with one
+  `lease.revoked` event each. People sign their agents in again with `csg login`.
+- Supervisors are Administrator on every cloud account (§17.1). A cloud account must be
+  added with a RAM role ARN; a request without one is refused.
+- An unknown path under `/api/` answers 404 for every method.
+- Still in force from §1–§16: the file layout and configuration (§1), envelopes and error
+  codes (§2), the lease states (§5), providers and the mock cloud (§8), the audit hash chain
+  (§10) and the IAM prohibition (§16.3).
+- Next: a person sign-in for `csg` (supervisor commands except adding cloud accounts), then a
+  remote MCP endpoint over HTTPS with OAuth sign-in so an agent connects with a URL.
+
 ### 17.8 Implementation status
 
 | Part | Status |
 | --- | --- |
 | People, supervisors, setup, login, sessions (§17.1, §17.3 item 1) | implemented, schema version 3 |
-| Role bindings and the supervisor API (§17.2) | implemented; not yet enforced on requests |
+| Role bindings and the supervisor API (§17.2) | implemented and enforced on every request |
 | `csg init` first supervisor, `csg supervisor recover` | implemented |
-| Agent ownership and agent-first sign-in (§17.3 item 2) | implemented (API), schema version 4; CLI and console not yet |
-| Five-field request, permission levels, owner approval (§17.4, §17.5) | implemented (API), schema version 5; CLI and console not yet |
-| Approval modes and per-account highest automatic level (§17.5) | implemented (API), schema version 6 |
-| Supervisor API for cloud accounts, settings, audit and the emergency stop | implemented (API) |
-| Removal of the admin token and the §16 agent model | not started; follows the CLI, MCP and console work |
+| Agent ownership and agent-first sign-in (§17.3 item 2) | implemented, schema version 4 |
+| Five-field request, permission levels, owner approval (§17.4, §17.5) | implemented, schema version 5 |
+| Approval modes and per-account highest automatic level (§17.5) | implemented, schema version 6 |
+| Supervisor API for cloud accounts, settings, audit and the emergency stop | implemented |
+| Supervisors are Administrator on every cloud account (§17.1) | implemented |
+| Removal of the admin token and the §16 agent model (§17.7a) | implemented, schema version 8 |
+| Person sign-in for `csg`; remote MCP over HTTPS | not started |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
 | Console redesign (sign-in, Inbox, Agents, Cloud accounts, Activity, People, Settings) | implemented; the admin-token console is removed |
 
-Until the remaining parts ship, the §2 admin token and the §16 agent API keep working
-unchanged alongside the new endpoints:
+The HTTP API:
 
 - `POST /api/v1/auth/setup/begin`, `POST /api/v1/auth/setup/finish`, `POST /api/v1/auth/login`,
   `POST /api/v1/auth/logout`, `GET /api/v1/auth/me`
@@ -1034,14 +1073,15 @@ unchanged alongside the new endpoints:
   `GET /api/v1/me/agents`, `POST /api/v1/me/agents/{id}/revoke` (person session)
 - `GET /api/v1/agent/accounts`, `POST /api/v1/agent/access-requests`,
   `GET /api/v1/agent/access-requests/{id}` (agent token). The request ID is also the lease ID
-  for `POST /api/v1/agent/leases/{id}/credential` and `.../revoke`.
+  for `POST /api/v1/agent/leases/{id}/credential` and `.../revoke`. `GET /api/v1/agent/me`,
+  `GET /api/v1/agent/leases[/{id}]` and `POST /api/v1/agent/heartbeat` complete the agent API.
 - `GET /api/v1/me/requests[?status=pending]`,
   `POST /api/v1/me/requests/{id}/approve|deny|revoke` (person session)
 - `PUT /api/v1/me/approval-mode` (person session; the current mode is in `GET /auth/me`),
   `PUT /api/v1/supervisor/accounts/{provider_id}/auto-level` (supervisor)
 - `GET /api/v1/me/accounts` (person session): the person's own cloud accounts with their
   role, the account's highest automatic level and what their agents get there automatically
-- Supervisor session, same request and response bodies as the operator's routes:
+- Supervisor session:
   - cloud accounts: `GET|POST /api/v1/supervisor/accounts`,
     `GET|PATCH /api/v1/supervisor/accounts/{id}`,
     `POST /api/v1/supervisor/accounts/{id}/rotate|test`

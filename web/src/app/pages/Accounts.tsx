@@ -16,7 +16,7 @@ export function AccountsPage({ person }: { person: Person }) {
     <>
       <PageHead title="Cloud accounts"
         lead={person.supervisor
-          ? 'You are a supervisor: you add accounts and give each person a role. Your own role is set the same way.'
+          ? 'You are a supervisor: you add accounts and give each person a role. You are Administrator on every account yourself.'
           : 'The accounts you have a role on. Your agents inherit it.'}
         actions={person.supervisor && <Button kind="primary" onClick={() => navigate('/accounts/new')}>+ Add cloud account</Button>} />
       <ErrorNote error={mine.error} />

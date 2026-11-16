@@ -9,6 +9,7 @@ import (
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/store"
+	"github.com/arveykao/cloud-safeguard/internal/token"
 )
 
 // downgradeToV1 turns a freshly initialized data dir back into a schema-1
@@ -52,53 +53,42 @@ func countMigrationEvents(t *testing.T, srv *Server) int {
 }
 
 func TestSchemaMigrationIsAuditedOnce(t *testing.T) {
-	for _, viaInit := range []bool{false, true} {
-		name := "upgrade by serve"
-		if viaInit {
-			name = "upgrade by init --force"
+	dir := t.TempDir()
+	if _, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	downgradeToV1(t, dir)
+	// Init never upgrades an existing install; serving does.
+	if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err == nil {
+		t.Fatal("Init ran on an existing data directory")
+	}
+	for start := 1; start <= 2; start++ {
+		srv, err := New(Config{DataDir: dir})
+		if err != nil {
+			t.Fatalf("New: %v", err)
 		}
-		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			if _, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true}); err != nil {
-				t.Fatalf("Init: %v", err)
-			}
-			downgradeToV1(t, dir)
-			if viaInit {
-				if _, err := Init(context.Background(), InitOptions{DataDir: dir, Force: true}); err != nil {
-					t.Fatalf("Init --force: %v", err)
-				}
-			}
-			srv, err := New(Config{DataDir: dir})
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
-			defer srv.Close()
-			if n := countMigrationEvents(t, srv); n != 1 {
-				t.Fatalf("schema.migrated events = %d, want exactly 1", n)
-			}
-			res, err := srv.db.VerifyAudit(context.Background())
-			if err != nil || !res.OK {
-				t.Fatalf("audit chain after migration = %+v, %v", res, err)
-			}
-		})
+		if n := countMigrationEvents(t, srv); n != 1 {
+			t.Fatalf("start %d: schema.migrated events = %d, want exactly 1", start, n)
+		}
+		res, err := srv.db.VerifyAudit(context.Background())
+		if err != nil || !res.OK {
+			t.Fatalf("audit chain after migration = %+v, %v", res, err)
+		}
+		if err := srv.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
-// Review 4, finding 2: a v1 custom capability allowing a bare "*" minted
-// credentials without the mandatory deny. After the upgrade it is disabled, the
-// grant is dropped, and its live lease is revoked on startup.
-func TestUpgradeRevokesLeasesOnV1WildcardCapability(t *testing.T) {
+// The upgrade to schema 8 (CONTRACT §17.7a): the admin token is deleted,
+// agents without an owner are revoked, and leases of the removed capability
+// model are revoked at startup. All of it is recorded in the audit log, and
+// agents that belong to a person are left alone.
+func TestUpgradeRemovesTheAdminTokenAndTheOldAgentModel(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	initRes, err := Init(ctx, InitOptions{DataDir: dir, Demo: true})
-	if err != nil {
+	if _, err := Init(ctx, InitOptions{DataDir: dir, Demo: true}); err != nil {
 		t.Fatalf("Init: %v", err)
-	}
-	var agentID string
-	for _, a := range initRes.Agents {
-		if a.Name == "hermes-researcher" {
-			agentID = a.ID
-		}
 	}
 	db, err := store.Open(ctx, dir)
 	if err != nil {
@@ -106,51 +96,91 @@ func TestUpgradeRevokesLeasesOnV1WildcardCapability(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	expires := now.Add(15 * time.Minute)
-	star := model.Capability{
-		ID: "cap_v1_star", Name: "v1 everything", ProviderType: model.ProviderAliyun,
-		Risk: model.RiskLow, Access: model.AccessAdmin,
-		PolicyTemplate:    `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`,
-		DefaultTTLSeconds: 900, MaxTTLSeconds: 1800, Enabled: true, CreatedAt: now, UpdatedAt: now,
-	}
-	if err := db.CreateCapability(ctx, star); err != nil {
-		t.Fatalf("CreateCapability: %v", err)
-	}
-	ag, _ := db.GetAgent(ctx, agentID)
-	ag.Grants = append(ag.Grants, star.ID)
-	if err := db.UpdateAgent(ctx, ag); err != nil {
-		t.Fatalf("UpdateAgent: %v", err)
-	}
-	providers, _ := db.ListProviders(ctx)
-	if err := db.CreateLease(ctx, model.Lease{
-		ID: "lea_v1_star", AgentID: agentID, AgentName: ag.Name, CapabilityID: star.ID,
-		ProviderID: providers[0].ID, ProviderMode: model.ModeMock, Risk: model.RiskLow,
-		Status: model.LeaseActive, EffectiveTTLSeconds: 900, CreatedAt: now, IssuedAt: &now, ExpiresAt: &expires,
-	}); err != nil {
-		t.Fatalf("CreateLease: %v", err)
-	}
-	db.Close()
-	downgradeToV1(t, dir)
-
-	srv, err := New(Config{DataDir: dir})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer srv.Close()
-	c, _ := srv.db.GetCapability(ctx, star.ID)
-	if c.Enabled {
-		t.Fatal("v1 wildcard capability still enabled after the upgrade")
-	}
-	got, _ := srv.db.GetLease(ctx, "lea_v1_star")
-	if got.Status != model.LeaseRevoked {
-		t.Fatalf("v1 wildcard lease after upgrade = %q, want revoked", got.Status)
-	}
-	after, _ := srv.db.GetAgent(ctx, agentID)
-	for _, g := range after.Grants {
-		if g == star.ID {
-			t.Fatal("grant to the v1 wildcard capability survived the upgrade")
+	tokens := map[string]string{}
+	addAgent := func(id, owner string, status model.AgentStatus) {
+		plain, hash, err := token.Generate(token.AgentPrefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens[id] = plain
+		ag := model.Agent{ID: id, Name: id, Status: status, Role: model.RoleAdministrator, Grants: []string{"aliyun.cloud.read"},
+			OwnerID: owner, MaxTTLSeconds: 3600, MaxConcurrentLeases: 3, TokenPrefix: token.DisplayPrefix(plain), CreatedAt: now, UpdatedAt: now}
+		if err := db.CreateAgent(ctx, ag, hash); err != nil {
+			t.Fatalf("CreateAgent(%s): %v", id, err)
 		}
 	}
-	if after.Role != model.RoleGuest {
-		t.Fatalf("agent role after upgrade = %q, want guest (the wildcard grant must not raise it)", after.Role)
+	people, _ := db.ListPersons(ctx)
+	addAgent("agt_old_active", "", model.AgentActive)
+	addAgent("agt_old_suspended", "", model.AgentSuspended)
+	addAgent("agt_owned", people[0].ID, model.AgentActive)
+	providers, _ := db.ListProviders(ctx)
+	for _, lease := range []model.Lease{
+		{ID: "lea_old_active", Status: model.LeaseActive, IssuedAt: &now, ExpiresAt: &expires, CredentialAvailable: true},
+		{ID: "lea_old_pending", Status: model.LeasePending},
+		{ID: "lea_old_expired", Status: model.LeaseExpired},
+	} {
+		lease.AgentID, lease.AgentName, lease.CapabilityID = "agt_old_active", "agt_old_active", "aliyun.cloud.read"
+		lease.ProviderID, lease.ProviderMode, lease.EffectiveTTLSeconds, lease.CreatedAt = providers[0].ID, model.ModeMock, 900, now
+		if err := db.CreateLease(ctx, lease); err != nil {
+			t.Fatalf("CreateLease(%s): %v", lease.ID, err)
+		}
+	}
+	for key, value := range map[string]string{"admin_token_hash": "0123abcd", "admin_token_prefix": "csg_adm_0123", "schema_version": "7"} {
+		if err := db.SetMeta(ctx, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	for start := 1; start <= 2; start++ {
+		srv, err := New(Config{DataDir: dir})
+		if err != nil {
+			t.Fatalf("start %d: New: %v", start, err)
+		}
+		for _, key := range []string{"admin_token_hash", "admin_token_prefix"} {
+			if _, err := srv.db.GetMeta(ctx, key); err == nil {
+				t.Fatalf("meta %s survived the upgrade", key)
+			}
+		}
+		for id, want := range map[string]model.AgentStatus{
+			"agt_old_active": model.AgentRevoked, "agt_old_suspended": model.AgentRevoked, "agt_owned": model.AgentActive,
+		} {
+			if ag, err := srv.db.GetAgent(ctx, id); err != nil || ag.Status != want {
+				t.Fatalf("agent %s = %q, %v; want %q", id, ag.Status, err, want)
+			}
+		}
+		// The old agents' tokens are dead.
+		for id, want := range map[string]int{"agt_old_active": 403, "agt_old_suspended": 403} {
+			if rec := rawRequest(t, srv.Handler(), "GET", "/api/v1/agent/me", tokens[id], nil); rec.Code != want {
+				t.Fatalf("GET /agent/me as %s = %d, want %d", id, rec.Code, want)
+			}
+		}
+		for id, want := range map[string]model.LeaseStatus{
+			"lea_old_active": model.LeaseRevoked, "lea_old_pending": model.LeaseRevoked, "lea_old_expired": model.LeaseExpired,
+		} {
+			got, err := srv.db.GetLease(ctx, id)
+			if err != nil || got.Status != want || got.CredentialAvailable {
+				t.Fatalf("lease %s = %q (credential %v), %v; want %q", id, got.Status, got.CredentialAvailable, err, want)
+			}
+		}
+		// Recorded once, whatever the number of restarts.
+		migrated, _, err := srv.db.ListAudit(ctx, store.AuditFilter{Action: "schema.migrated", Limit: 10})
+		if err != nil || len(migrated) != 1 {
+			t.Fatalf("start %d: schema.migrated events = %d, %v", start, len(migrated), err)
+		}
+		revokedAgents, _ := migrated[0].Metadata["revoked_agents"].([]any)
+		if len(revokedAgents) != 2 || revokedAgents[0] != "agt_old_active" || revokedAgents[1] != "agt_old_suspended" {
+			t.Fatalf("schema.migrated does not list the revoked agents: %+v", migrated[0].Metadata)
+		}
+		revoked, _, err := srv.db.ListAudit(ctx, store.AuditFilter{Action: "lease.revoked", Limit: 10})
+		if err != nil || len(revoked) != 2 {
+			t.Fatalf("start %d: lease.revoked events = %d, %v", start, len(revoked), err)
+		}
+		if res, err := srv.db.VerifyAudit(ctx); err != nil || !res.OK {
+			t.Fatalf("audit chain after the upgrade = %+v, %v", res, err)
+		}
+		if err := srv.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

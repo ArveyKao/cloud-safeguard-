@@ -3,11 +3,9 @@ package cli
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
-	"github.com/arveykao/cloud-safeguard/internal/token"
 )
 
 // agentMe is the payload of GET /api/v1/agent/me.
@@ -20,20 +18,14 @@ type agentMe struct {
 // runLogin implements `csg login`.
 func (a *App) runLogin(args []string) error {
 	fs := a.newFlagSet("login", `Usage: csg login --server URL [--name NAME] [--description TEXT] [--json]
-       csg login --server URL --token TOKEN [--json]
 
-Without --token: signs this agent in. csg shows a short code and a link; a
-person opens the link in the console, checks the code and approves. The agent
-then belongs to that person and inherits their role on each cloud account.
-No token is copied by hand.
-
-With --token: validates an admin or agent token and saves it.
-
-Either way the result is saved to ~/.config/cloud-safeguard/config.json with
+Signs this agent in. csg shows a short code and a link; a person opens the
+link in the console, checks the code and approves. The agent then belongs to
+that person and inherits their role on each cloud account. No token is copied
+by hand; the result is saved to ~/.config/cloud-safeguard/config.json with
 0600 permissions.
 `)
 	server := fs.String("server", "", "control plane URL (default: $CSG_SERVER or saved config)")
-	tokenFlag := fs.String("token", "", "admin (csg_adm_) or agent (csg_agt_) bearer token")
 	name := fs.String("name", "", "agent name shown to the person who approves (default: csg-<hostname>)")
 	description := fs.String("description", "", "optional description shown with the sign-in")
 	jsonOut := fs.Bool("json", false, "print JSON")
@@ -44,62 +36,11 @@ Either way the result is saved to ~/.config/cloud-safeguard/config.json with
 	if len(positionals) != 0 {
 		return usagef("login takes no positional arguments")
 	}
-	if strings.TrimSpace(*tokenFlag) == "" {
-		serverURL, err := a.resolveServer(&clientFlags{server: *server})
-		if err != nil {
-			return err
-		}
-		return a.agentSignIn(serverURL, *name, *description, *jsonOut)
-	}
-	if strings.TrimSpace(*server) == "" {
-		return usagef("login with --token requires --server")
-	}
-
-	serverURL := normalizeServer(*server)
-	if err := validateServerURL(serverURL); err != nil {
-		return usagef("%v", err)
-	}
-	tokenValue := strings.TrimSpace(*tokenFlag)
-	kind := token.Kind(tokenValue)
-	if kind == "" {
-		return usagef("token must start with %s (admin) or %s (agent)", token.AdminPrefix, token.AgentPrefix)
-	}
-
-	cfg := &resolvedConfig{Server: serverURL, Token: tokenValue, Kind: kind}
-	client := a.newAPIClient(cfg)
-	ctx := context.Background()
-
-	var identity string
-	switch kind {
-	case "admin":
-		var res model.LoginResult
-		if err := client.post(ctx, apiPrefix+"/admin/login", nil, &res); err != nil {
-			return err
-		}
-		identity = "admin"
-	case "agent":
-		var me agentMe
-		if err := client.get(ctx, apiPrefix+"/agent/me", &me); err != nil {
-			return err
-		}
-		identity = fmt.Sprintf("agent %s (%s)", me.Agent.Name, me.Agent.ID)
-	}
-
-	path, err := a.saveFileConfig(fileConfig{Server: serverURL, Token: tokenValue, Kind: kind})
+	serverURL, err := a.resolveServer(&clientFlags{server: *server})
 	if err != nil {
 		return err
 	}
-
-	if *jsonOut {
-		return a.printJSON(map[string]any{
-			"role":        kind,
-			"server":      serverURL,
-			"config_path": path,
-		})
-	}
-	fmt.Fprintf(a.Stdout, "logged in as %s at %s\n", identity, serverURL)
-	fmt.Fprintf(a.Stdout, "config saved to %s (mode 0600)\n", path)
-	return nil
+	return a.agentSignIn(serverURL, *name, *description, *jsonOut)
 }
 
 // runWhoami implements `csg whoami`.
@@ -118,46 +59,20 @@ Shows the identity behind the configured token.
 		return usagef("whoami takes no positional arguments")
 	}
 
-	cfg, err := a.resolveConfig(cf)
+	client, err := a.agentClient(cf)
 	if err != nil {
 		return err
 	}
-	client := a.newAPIClient(cfg)
-	ctx := context.Background()
-
-	switch cfg.Kind {
-	case "admin":
-		var res model.LoginResult
-		if err := client.post(ctx, apiPrefix+"/admin/login", nil, &res); err != nil {
-			return err
-		}
-		if *jsonOut {
-			return a.printJSON(map[string]any{
-				"role":    "admin",
-				"server":  cfg.Server,
-				"version": res.Version,
-			})
-		}
-		fmt.Fprintf(a.Stdout, "role:      admin\nserver:    %s\nversion:   %s\n", cfg.Server, res.Version)
-		return nil
-	case "agent":
-		var me agentMe
-		if err := client.get(ctx, apiPrefix+"/agent/me", &me); err != nil {
-			return err
-		}
-		if *jsonOut {
-			return a.printJSON(me)
-		}
-		fmt.Fprintf(a.Stdout, "agent:         %s (%s)\n", me.Agent.Name, me.Agent.ID)
-		fmt.Fprintf(a.Stdout, "status:        %s\n", me.Agent.Status)
-		fmt.Fprintf(a.Stdout, "role:          %s\n", me.Agent.Role)
-		fmt.Fprintf(a.Stdout, "grants:        %s\n", joinOrDash(me.Agent.Grants))
-		fmt.Fprintf(a.Stdout, "max ttl:       %s\n", formatSeconds(me.Agent.MaxTTLSeconds))
-		fmt.Fprintf(a.Stdout, "max concurrent:%s\n", fmt.Sprintf(" %d", me.Agent.MaxConcurrentLeases))
-		fmt.Fprintf(a.Stdout, "active leases: %d\n", me.ActiveLeases)
-		fmt.Fprintf(a.Stdout, "server:        %s\n", cfg.Server)
-		return nil
-	default:
-		return authf("configured token is %s", tokenKindLabel(cfg.Kind))
+	var me agentMe
+	if err := client.get(context.Background(), apiPrefix+"/agent/me", &me); err != nil {
+		return err
 	}
+	if *jsonOut {
+		return a.printJSON(me)
+	}
+	fmt.Fprintf(a.Stdout, "agent:         %s (%s)\n", me.Agent.Name, me.Agent.ID)
+	fmt.Fprintf(a.Stdout, "status:        %s\n", me.Agent.Status)
+	fmt.Fprintf(a.Stdout, "active leases: %d\n", me.ActiveLeases)
+	fmt.Fprintf(a.Stdout, "server:        %s\n", client.baseURL)
+	return nil
 }

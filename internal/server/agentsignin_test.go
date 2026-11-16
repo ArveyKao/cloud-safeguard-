@@ -89,9 +89,6 @@ func TestAgentSignInFlow(t *testing.T) {
 	}
 
 	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", res.Token, nil), http.StatusOK)
-	// An owned agent cannot use the older capability request at all.
-	recLease := env.do(http.MethodPost, "/api/v1/agent/leases", res.Token, model.CreateLeaseInput{CapabilityID: "aliyun.cloud.read", Reason: "look"})
-	requireErrorCode(t, recLease, http.StatusForbidden, model.ErrCodeForbidden)
 
 	// Neither secret reached the audit log or the server log.
 	events, _, err := env.srv.db.ListAudit(context.Background(), auditAll())
@@ -265,8 +262,8 @@ func TestOwnerManagesOnlyOwnAgents(t *testing.T) {
 	if got := list(sup); len(got) != 0 {
 		t.Fatalf("a supervisor sees other people's agents: %+v", got)
 	}
-	// Someone else's agent, a legacy agent and a missing one all look alike.
-	for _, id := range []string{junAgent.ID, env.agentIDs[demoAgentClaudeCode], "agt_missing"} {
+	// Someone else's agent and a missing one look alike.
+	for _, id := range []string{junAgent.ID, "agt_missing"} {
 		requireStatus(t, mei.do(http.MethodPost, "/api/v1/me/agents/"+id+"/revoke", nil), http.StatusNotFound)
 	}
 	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", junToken, nil), http.StatusOK)

@@ -1,5 +1,9 @@
 # Cloud Safeguard — API Reference (v0.1)
 
+> **Out of date since 2026-11-15.** This page describes v0.1. The agent and admin APIs were removed; people now
+> sign in to the console, agents sign in with `csg login` and ask for access per cloud account.
+> The running behaviour is [CONTRACT.md](CONTRACT.md) §17. A rewrite of this page is pending.
+
 This is a concise reference with curl examples. The **normative** contract is
 [CONTRACT.md](CONTRACT.md) §2–§10; shared wire types are in `internal/model/model.go`.
 If this page and the contract disagree, the contract wins.

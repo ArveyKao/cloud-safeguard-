@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/arveykao/cloud-safeguard/internal/authn"
 	"github.com/arveykao/cloud-safeguard/internal/model"
@@ -113,8 +114,18 @@ func TestStartupRevokesLeasesThatAreNoLongerAuthorized(t *testing.T) {
 	sup := env.supervisorClient()
 	mei := env.addPerson(sup, "mei", false)
 	_, _, owned := env.ownedAgentWithLease(mei, "mei-agent")
-	legacy, rec := env.createLease(demoAgentClaudeCode, model.CreateLeaseInput{CapabilityID: "aliyun.cloud.read", Reason: "look"})
-	requireStatus(t, rec, http.StatusCreated)
+	jun := env.addPerson(sup, "jun", false)
+	junAgent, _, kept := env.ownedAgentWithLease(jun, "jun-agent")
+	// A lease of the removed capability model, as an upgraded database may
+	// still hold one.
+	now := env.clock.Now()
+	expires := now.Add(10 * time.Minute)
+	old := model.Lease{ID: "lea_capability", AgentID: junAgent.ID, AgentName: junAgent.Name, CapabilityID: "aliyun.cloud.read",
+		ProviderID: env.providerID, Status: model.LeaseActive, RequestedTTLSeconds: 600, EffectiveTTLSeconds: 600,
+		CreatedAt: now, IssuedAt: &now, ExpiresAt: &expires, CredentialAvailable: true}
+	if err := env.srv.db.CreateLease(context.Background(), old); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := env.srv.db.SQL().Exec(`UPDATE persons SET status = 'suspended' WHERE id = ?`, mei.person.ID); err != nil {
 		t.Fatal(err)
@@ -126,12 +137,27 @@ func TestStartupRevokesLeasesThatAreNoLongerAuthorized(t *testing.T) {
 	if got := env.getLease(owned.ID); got.Status != model.LeaseRevoked {
 		t.Fatalf("lease of a suspended owner's agent after restart: %s", got.Status)
 	}
-	if got := env.getLease(legacy.ID); got.Status != model.LeaseActive {
+	if got := env.getLease(kept.ID); got.Status != model.LeaseActive {
 		t.Fatalf("an authorized lease was revoked at startup: %s", got.Status)
 	}
-	ev := env.listAudit("lease.revoked")[0]
-	if ev.ActorType != "system" || ev.Metadata["caused_by"] != "startup check" {
-		t.Fatalf("startup revocation not attributed: %+v", ev)
+	if got := env.getLease(old.ID); got.Status != model.LeaseRevoked || !strings.Contains(got.RevokeReason, "capability leases were removed") {
+		t.Fatalf("capability lease after restart: %s (%s)", got.Status, got.RevokeReason)
+	}
+	attributed := 0
+	for _, ev := range env.listAudit("lease.revoked") {
+		switch ev.TargetID {
+		case owned.ID:
+			if ev.ActorType == "system" && ev.Metadata["caused_by"] == "startup check" {
+				attributed++
+			}
+		case old.ID:
+			if ev.ActorType == "system" {
+				attributed++
+			}
+		}
+	}
+	if attributed != 2 {
+		t.Fatalf("startup revocations not recorded: %+v", env.listAudit("lease.revoked"))
 	}
 }
 
@@ -293,39 +319,29 @@ func TestCredentialReleaseIsRechecked(t *testing.T) {
 	}
 }
 
-func TestOwnerSurvivesAdminEditsAndLegacyAgentsAreUntouched(t *testing.T) {
+// Signing in again replaces only the owner's own agent of that name; another
+// person's agent with the same name is untouched.
+func TestReSignInReplacesOnlyTheOwnersAgent(t *testing.T) {
 	env := newTestEnv(t, true)
 	sup := env.supervisorClient()
 	mei := env.addPerson(sup, "mei", false)
-	// Same name as the legacy demo agent, which has no owner.
-	ag, tok := env.signInAgent(mei, demoAgentClaudeCode)
+	jun := env.addPerson(sup, "jun", false)
+	other, otherToken := env.signInAgent(jun, "claude-code")
 
-	rec := env.admin(http.MethodPost, "/api/v1/admin/agents/"+ag.ID+"/token/rotate", nil)
-	requireStatus(t, rec, http.StatusOK)
-	rotated := decodeEnvelope[model.AgentWithToken](t, rec)
-	name := "renamed"
-	requireStatus(t, env.admin(http.MethodPatch, "/api/v1/admin/agents/"+ag.ID, model.UpdateAgentInput{Name: &name}), http.StatusOK)
-	stored, err := env.srv.db.GetAgent(context.Background(), ag.ID)
-	if err != nil || stored.OwnerID != mei.person.ID {
-		t.Fatalf("owner after admin edits: %+v, %v", stored, err)
-	}
-	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", tok, nil), http.StatusUnauthorized)
-	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", rotated.Token, nil), http.StatusOK)
-
-	// Re-sign-in replaces only the owner's own agent of that name.
-	second, _ := env.signInAgent(mei, demoAgentClaudeCode)
-	third, _ := env.signInAgent(mei, demoAgentClaudeCode)
-	if got, _ := env.srv.db.GetAgent(context.Background(), second.ID); got.Status != model.AgentRevoked {
+	first, firstToken := env.signInAgent(mei, "claude-code")
+	second, secondToken := env.signInAgent(mei, "claude-code")
+	if got, _ := env.srv.db.GetAgent(context.Background(), first.ID); got.Status != model.AgentRevoked {
 		t.Fatalf("replaced agent is %s", got.Status)
 	}
-	if got, _ := env.srv.db.GetAgent(context.Background(), third.ID); got.Status != model.AgentActive {
-		t.Fatalf("new agent is %s", got.Status)
+	if got, _ := env.srv.db.GetAgent(context.Background(), second.ID); got.Status != model.AgentActive || got.OwnerID != mei.person.ID {
+		t.Fatalf("new agent is %+v", got)
 	}
-	legacy, err := env.srv.db.GetAgent(context.Background(), env.agentIDs[demoAgentClaudeCode])
-	if err != nil || legacy.Status != model.AgentActive || legacy.OwnerID != "" {
-		t.Fatalf("legacy agent with the same name was touched: %+v, %v", legacy, err)
+	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", firstToken, nil), http.StatusForbidden)
+	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", secondToken, nil), http.StatusOK)
+	if got, err := env.srv.db.GetAgent(context.Background(), other.ID); err != nil || got.Status != model.AgentActive || got.OwnerID != jun.person.ID {
+		t.Fatalf("another person's agent with the same name was touched: %+v, %v", got, err)
 	}
-	requireStatus(t, env.agent(demoAgentClaudeCode, http.MethodGet, "/api/v1/agent/me", nil), http.StatusOK)
+	requireStatus(t, env.do(http.MethodGet, "/api/v1/agent/me", otherToken, nil), http.StatusOK)
 }
 
 func TestAgentSignInRefusesCrossSiteRequests(t *testing.T) {

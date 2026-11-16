@@ -211,14 +211,10 @@ func validateServerURL(server string) error {
 
 // tokenKindLabel describes a token kind for error messages.
 func tokenKindLabel(kind string) string {
-	switch kind {
-	case "admin":
-		return "an admin token"
-	case "agent":
+	if kind == "agent" {
 		return "an agent token"
-	default:
-		return "not a csg token (expected a csg_adm_ or csg_agt_ prefix)"
 	}
+	return "not an agent token (expected a csg_agt_ prefix)"
 }
 
 // apiClient is the typed client of the control plane.
@@ -233,18 +229,6 @@ func (a *App) newAPIClient(cfg *resolvedConfig) *apiClient {
 	return &apiClient{baseURL: cfg.Server, token: cfg.Token, http: a.httpClient()}
 }
 
-// adminClient resolves config and requires an admin token (exit 3 otherwise).
-func (a *App) adminClient(cf *clientFlags) (*apiClient, error) {
-	cfg, err := a.resolveConfig(cf)
-	if err != nil {
-		return nil, err
-	}
-	if cfg.Kind != "admin" {
-		return nil, authf("admin token required (configured token is %s)", tokenKindLabel(cfg.Kind))
-	}
-	return a.newAPIClient(cfg), nil
-}
-
 // agentClient resolves config and requires an agent token (exit 3 otherwise).
 func (a *App) agentClient(cf *clientFlags) (*apiClient, error) {
 	cfg, err := a.resolveConfig(cf)
@@ -252,7 +236,7 @@ func (a *App) agentClient(cf *clientFlags) (*apiClient, error) {
 		return nil, err
 	}
 	if cfg.Kind != "agent" {
-		return nil, authf("agent token required (configured token is %s; use csg login with an agent token)", tokenKindLabel(cfg.Kind))
+		return nil, authf("agent token required (configured token is %s; sign in with csg login)", tokenKindLabel(cfg.Kind))
 	}
 	return a.newAPIClient(cfg), nil
 }
@@ -339,11 +323,6 @@ func (c *apiClient) get(ctx context.Context, path string, out any) error {
 // post performs a POST request.
 func (c *apiClient) post(ctx context.Context, path string, body, out any) error {
 	return c.do(ctx, http.MethodPost, path, body, out)
-}
-
-// patch performs a PATCH request.
-func (c *apiClient) patch(ctx context.Context, path string, body, out any) error {
-	return c.do(ctx, http.MethodPatch, path, body, out)
 }
 
 // put performs a PUT request.

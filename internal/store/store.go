@@ -158,6 +158,9 @@ type MigrationReport struct {
 	DisabledCapabilities []string `json:"disabled_capabilities"`
 	// Agents lists every agent the role migration touched.
 	Agents []AgentMigration `json:"agents"`
+	// RevokedAgents lists the agents without an owner that the schema-8
+	// migration revoked.
+	RevokedAgents []string `json:"revoked_agents,omitempty"`
 }
 
 // AgentMigration is one agent's outcome in the schema-2 role migration.

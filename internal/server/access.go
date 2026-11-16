@@ -113,7 +113,7 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	if err != nil {
 		return model.Lease{}, err
 	}
-	binding, err := s.db.GetBinding(ctx, ag.OwnerID, prov.ID)
+	role, err := s.personRole(ctx, ag.OwnerID, prov.ID)
 	if errors.Is(err, store.ErrNotFound) {
 		s.agentAudit(ctx, ag, "access.refused", "denied", "warning", "provider", prov.ID, map[string]any{
 			"cloud_account_id": accountID, "reason": "owner has no role on this cloud account",
@@ -193,13 +193,13 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 		}
 	}
 	add(ruleOwnerBound, policy.OutcomeAllow,
-		fmt.Sprintf("the agent's owner is %s on cloud account %s", binding.Role, accountID))
-	if binding.Role.Permits(capability.Access) {
+		fmt.Sprintf("the agent's owner is %s on cloud account %s", role, accountID))
+	if role.Permits(capability.Access) {
 		add(ruleOwnerRolePermits, policy.OutcomeAllow,
-			fmt.Sprintf("role %s permits %s access", binding.Role, permission))
+			fmt.Sprintf("role %s permits %s access", role, permission))
 	} else {
 		add(ruleOwnerRolePermits, policy.OutcomeDeny,
-			fmt.Sprintf("the owner's role %s on this cloud account does not permit %s access", binding.Role, permission))
+			fmt.Sprintf("the owner's role %s on this cloud account does not permit %s access", role, permission))
 	}
 	if violation := policyViolation(capability, params); violation != "" {
 		add(policy.RuleIAMProhibited, policy.OutcomeDeny, violation)
@@ -300,7 +300,12 @@ func (s *Server) handleAgentListAccounts(w http.ResponseWriter, r *http.Request)
 	ag, _ := agentFromContext(r.Context())
 	accounts := []model.AgentAccount{}
 	if ag.OwnerID != "" {
-		bindings, err := s.db.ListBindings(r.Context(), ag.OwnerID, "")
+		owner, err := s.db.GetPerson(r.Context(), ag.OwnerID)
+		if err != nil {
+			s.writeHandlerError(w, err)
+			return
+		}
+		bindings, err := s.personBindings(r.Context(), owner)
 		if err != nil {
 			s.writeHandlerError(w, err)
 			return
@@ -322,11 +327,6 @@ func (s *Server) handleAgentListAccounts(w http.ResponseWriter, r *http.Request)
 				if b.Role.Permits(p.Access()) {
 					highest = p
 				}
-			}
-			owner, err := s.db.GetPerson(r.Context(), ag.OwnerID)
-			if err != nil {
-				s.writeHandlerError(w, err)
-				return
 			}
 			_, _, automatic := automaticLevel(owner, prov, s.nowUTC())
 			if automatic.Rank() > highest.Rank() {
@@ -641,7 +641,7 @@ func automaticLevel(owner model.Person, prov model.Provider, now time.Time) (mod
 func (s *Server) handleListMyAccounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
-	bindings, err := s.db.ListBindings(ctx, actor.person.ID, "")
+	bindings, err := s.personBindings(ctx, actor.person)
 	if err != nil {
 		s.writeHandlerError(w, err)
 		return
@@ -681,4 +681,39 @@ func (s *Server) handleListMyAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Name < accounts[j].Name })
 	writeList(s, w, http.StatusOK, accounts, len(accounts))
+}
+
+// personRole is a person's role on one cloud account: an active supervisor is
+// Administrator on every account (§17), anyone else has their role binding.
+// store.ErrNotFound when the person has no role there.
+func (s *Server) personRole(ctx context.Context, personID, providerID string) (model.Role, error) {
+	person, err := s.db.GetPerson(ctx, personID)
+	if err != nil {
+		return "", err
+	}
+	if person.Supervisor && person.Status == model.PersonActive {
+		return model.RoleAdministrator, nil
+	}
+	binding, err := s.db.GetBinding(ctx, personID, providerID)
+	if err != nil {
+		return "", err
+	}
+	return binding.Role, nil
+}
+
+// personBindings is every role a person has, one per cloud account. For an
+// active supervisor it is Administrator on every cloud account.
+func (s *Server) personBindings(ctx context.Context, person model.Person) ([]model.RoleBinding, error) {
+	if !person.Supervisor || person.Status != model.PersonActive {
+		return s.db.ListBindings(ctx, person.ID, "")
+	}
+	providers, err := s.db.ListProviders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.RoleBinding, 0, len(providers))
+	for _, p := range providers {
+		out = append(out, model.RoleBinding{PersonID: person.ID, ProviderID: p.ID, Role: model.RoleAdministrator})
+	}
+	return out, nil
 }

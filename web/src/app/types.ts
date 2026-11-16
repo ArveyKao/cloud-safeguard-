@@ -135,13 +135,10 @@ export interface AuditEvent {
 }
 
 export interface PolicySettings {
-  auto_approve_max_risk: string
-  auto_approve_max_ttl_seconds: number
   max_lease_ttl_seconds: number
   pending_timeout_seconds: number
   max_concurrent_leases_per_agent: number
   leases_per_minute_per_agent: number
-  require_reason_for_risk: string
 }
 
 export interface List<T> {

@@ -75,7 +75,7 @@ func TestDefaultsAreTheSafest(t *testing.T) {
 		t.Fatalf("write = %s", req.Status)
 	}
 	// A new cloud account starts at read too, whatever the request says.
-	rec = a.admin(http.MethodPost, "/api/v1/admin/providers", map[string]any{
+	rec = a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", map[string]any{
 		"name": "new", "type": "aliyun", "mode": "mock", "region": "cn-hangzhou",
 		"role_arn": "acs:ram::6543210987654321:role/csg", "access_key_id": "LTAI5tNewAccount1",
 		"access_key_secret": "placeholder-secret-value", "max_auto_level": "full"})
@@ -139,9 +139,9 @@ func TestOnlyTheRightPeopleSetModesAndLevels(t *testing.T) {
 	path := "/api/v1/me/approval-mode"
 	body := model.SetApprovalModeInput{Mode: model.ModeFull}
 
-	// Not an agent token, not the operator, not without the CSRF token.
+	// Not an agent token, not without a session, not without the CSRF token.
 	requireStatus(t, a.do(http.MethodPut, path, a.token, body), http.StatusUnauthorized)
-	requireStatus(t, a.admin(http.MethodPut, path, body), http.StatusUnauthorized)
+	requireStatus(t, a.do(http.MethodPut, path, "", body), http.StatusUnauthorized)
 	requireStatus(t, a.testEnv.request(http.MethodPut, path, a.mei.cookie, nil, body), http.StatusForbidden)
 	// A supervisor sets only their own mode: there is no route for another
 	// person's mode.

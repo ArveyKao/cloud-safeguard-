@@ -178,6 +178,10 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		if supervisor != person.Supervisor {
 			s.personAudit(ctx, actor.person, "person.supervisor_changed", "ok", "critical", "person", id,
 				map[string]any{"username": person.Username, "supervisor": supervisor})
+			if !supervisor && status == person.Status {
+				// A former supervisor keeps only their role bindings.
+				s.afterBindingReduced(ctx, actor.person, id, "")
+			}
 		}
 		if status != person.Status {
 			s.personAudit(ctx, actor.person, "person.status_changed", "ok", "warning", "person", id,

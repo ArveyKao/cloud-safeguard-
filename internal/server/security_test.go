@@ -20,10 +20,10 @@ const (
 	canaryBrokerSecret = "csg-canary-broker-secret-7f3a9b1c"
 )
 
-// createCanaryProvider creates an sts provider holding canary credentials.
-func createCanaryProvider(t *testing.T, env *testEnv) model.Provider {
+// createCanaryProvider creates an sts cloud account holding canary credentials.
+func createCanaryProvider(t *testing.T, a *accessEnv) model.Provider {
 	t.Helper()
-	rec := env.admin(http.MethodPost, "/api/v1/admin/providers", model.CreateProviderInput{
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", model.CreateProviderInput{
 		Name:            "canary-sts",
 		Type:            model.ProviderAliyun,
 		Mode:            model.ModeSTS,
@@ -37,35 +37,36 @@ func createCanaryProvider(t *testing.T, env *testEnv) model.Provider {
 }
 
 // TestProviderSecretsNeverReturnedByAPI proves the broker AccessKey pair is
-// write-only across every admin/agent response.
+// write-only across every supervisor, person and agent response.
 func TestProviderSecretsNeverReturnedByAPI(t *testing.T) {
-	env := newTestEnv(t, true)
-	provider := createCanaryProvider(t, env)
+	a := newAccessEnv(t, model.RoleMember)
+	provider := createCanaryProvider(t, a)
 
-	// Create a lease and fetch the (fake, short-lived) credential.
-	lease, _ := env.createLease("claude-code", model.CreateLeaseInput{
-		CapabilityID: "aliyun.cloud.read",
-		Reason:       "secret exposure test",
-	})
-	if lease.Status != model.LeaseActive {
-		t.Fatalf("lease status = %q", lease.Status)
+	// Ask for access and fetch the (fake, short-lived) credential.
+	req := a.request(accessInput("ecs", "read"))
+	if req.Status != model.LeaseActive {
+		t.Fatalf("request status = %q", req.Status)
 	}
 
 	responses := map[string]string{
-		"create provider": env.admin(http.MethodPost, "/api/v1/admin/providers", model.CreateProviderInput{
+		"create account": a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", model.CreateProviderInput{
 			Name: "canary-2", Type: model.ProviderAliyun, Mode: model.ModeSTS, Region: "cn-hangzhou",
 			RoleARN: "acs:ram::7777777777777777:role/canary", AccessKeyID: canaryBrokerAKID, AccessKeySecret: canaryBrokerSecret,
 		}).Body.String(),
-		"list providers": env.admin(http.MethodGet, "/api/v1/admin/providers", nil).Body.String(),
-		"get provider":   env.admin(http.MethodGet, "/api/v1/admin/providers/"+provider.ID, nil).Body.String(),
-		"test provider":  env.admin(http.MethodPost, "/api/v1/admin/providers/"+provider.ID+"/test", nil).Body.String(),
-		"overview":       env.admin(http.MethodGet, "/api/v1/admin/overview", nil).Body.String(),
-		"audit list":     env.admin(http.MethodGet, "/api/v1/admin/audit?limit=200", nil).Body.String(),
-		"provider rotate": env.admin(http.MethodPost, "/api/v1/admin/providers/"+provider.ID+"/rotate", model.RotateProviderCredentialInput{
+		"list accounts":    a.sup.do(http.MethodGet, "/api/v1/supervisor/accounts", nil).Body.String(),
+		"get account":      a.sup.do(http.MethodGet, "/api/v1/supervisor/accounts/"+provider.ID, nil).Body.String(),
+		"test account":     a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts/"+provider.ID+"/test", nil).Body.String(),
+		"my accounts":      a.sup.do(http.MethodGet, "/api/v1/me/accounts", nil).Body.String(),
+		"agent's accounts": a.do(http.MethodGet, "/api/v1/agent/accounts", a.token, nil).Body.String(),
+		"audit list":       a.sup.do(http.MethodGet, "/api/v1/supervisor/audit?limit=200", nil).Body.String(),
+		"rotate account": a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts/"+provider.ID+"/rotate", model.RotateProviderCredentialInput{
 			AccessKeyID: canaryBrokerAKID, AccessKeySecret: canaryBrokerSecret,
 		}).Body.String(),
 	}
 	for name, body := range responses {
+		if body == "" {
+			t.Errorf("%s: empty response", name)
+		}
 		if strings.Contains(body, canaryBrokerAKID) {
 			t.Errorf("%s response leaks the raw broker AccessKey ID", name)
 		}
@@ -75,22 +76,24 @@ func TestProviderSecretsNeverReturnedByAPI(t *testing.T) {
 	}
 
 	// The masked form IS allowed.
-	if !strings.Contains(env.admin(http.MethodGet, "/api/v1/admin/providers", nil).Body.String(), "LTAI****ID42") {
-		t.Fatal("masked AccessKey ID missing from provider list")
+	if !strings.Contains(a.sup.do(http.MethodGet, "/api/v1/supervisor/accounts", nil).Body.String(), "LTAI****ID42") {
+		t.Fatal("masked AccessKey ID missing from the account list")
 	}
 
-	// The credential endpoint exposes only the lease credential, never the broker pair.
-	credBody := env.agent("claude-code", http.MethodPost, "/api/v1/agent/leases/"+lease.ID+"/credential", nil).Body.String()
+	// The credential endpoint exposes only the request's credential, never the broker pair.
+	credRec := a.credential(req.ID)
+	requireStatus(t, credRec, http.StatusOK)
+	credBody := credRec.Body.String()
 	if strings.Contains(credBody, canaryBrokerAKID) || strings.Contains(credBody, canaryBrokerSecret) {
 		t.Fatal("credential endpoint response leaks the broker credential")
 	}
-	envelope := decodeEnvelope[model.CredentialEnvelope](t, env.agent("claude-code", http.MethodPost, "/api/v1/agent/leases/"+lease.ID+"/credential", nil))
-	if !strings.Contains(credBody, envelope.Credential.AccessKeyID) {
-		t.Fatal("credential endpoint did not return the lease credential")
+	envelope := decodeEnvelope[model.CredentialEnvelope](t, credRec)
+	if envelope.Credential.AccessKeyID == "" || envelope.Credential.AccessKeySecret == "" {
+		t.Fatal("credential endpoint did not return the request's credential")
 	}
 
 	// Audit metadata must never contain either secret.
-	events, _, err := env.srv.db.ListAudit(context.Background(), store.AuditFilter{Limit: 200})
+	events, _, err := a.srv.db.ListAudit(context.Background(), store.AuditFilter{Limit: 200})
 	if err != nil {
 		t.Fatalf("ListAudit: %v", err)
 	}
@@ -103,60 +106,58 @@ func TestProviderSecretsNeverReturnedByAPI(t *testing.T) {
 }
 
 // TestNoSecretsInDatabaseLogsOrAudit scans the on-disk database files, access
-// logs and audit events for canary plaintext secrets (A8).
+// logs and audit events for plaintext secrets (A8).
 func TestNoSecretsInDatabaseLogsOrAudit(t *testing.T) {
-	env := newTestEnv(t, true)
-	createCanaryProvider(t, env)
+	a := newAccessEnv(t, model.RoleMember)
+	createCanaryProvider(t, a)
 
 	// Generate traffic including credential issuance and fetch.
-	lease, _ := env.createLease("claude-code", model.CreateLeaseInput{
-		CapabilityID: "aliyun.cloud.read",
-		Reason:       "scan test",
-	})
-	envelope, rec := env.fetchCredential("claude-code", lease.ID)
+	req := a.request(accessInput("ecs", "read"))
+	envelope, rec := a.fetchCredential(a.token, req.ID)
 	requireStatus(t, rec, http.StatusOK)
-	env.admin(http.MethodGet, "/api/v1/admin/overview", nil)
-	env.admin(http.MethodPost, "/api/v1/admin/login", nil)
-	env.admin(http.MethodGet, "/api/v1/admin/audit?limit=200", nil)
+	a.sup.do(http.MethodGet, "/api/v1/supervisor/audit?limit=200", nil)
+	a.mei.do(http.MethodGet, "/api/v1/me/requests", nil)
 
-	agentToken := env.agentTokens["claude-code"]
-	adminToken := env.adminToken
-	leaseSecret := envelope.Credential.AccessKeySecret
+	canaries := map[string]string{
+		"broker AccessKey ID":       canaryBrokerAKID,
+		"broker secret":             canaryBrokerSecret,
+		"agent token":               a.token,
+		"session cookie":            a.sup.cookie.Value,
+		"CSRF token":                a.sup.csrf,
+		"TOTP secret":               a.sup.secret,
+		"password":                  testPassword,
+		"supervisor's setup code":   a.supervisor.SetupCode,
+		"request credential secret": envelope.Credential.AccessKeySecret,
+	}
+	for name, canary := range canaries {
+		if canary == "" {
+			t.Fatalf("no value to look for: %s", name)
+		}
+	}
 
 	// Nothing sensitive may appear in the access log (which also proves
-	// Authorization values are never logged).
-	logOutput := env.logs.String()
+	// Authorization and Cookie values are never logged).
+	logOutput := a.logs.String()
 	if logOutput == "" {
 		t.Fatal("access log is empty")
 	}
-	for name, canary := range map[string]string{
-		"broker AccessKey ID":     canaryBrokerAKID,
-		"broker secret":           canaryBrokerSecret,
-		"agent token":             agentToken,
-		"admin token":             adminToken,
-		"lease credential secret": leaseSecret,
-	} {
+	for name, canary := range canaries {
 		if strings.Contains(logOutput, canary) {
 			t.Errorf("server log leaks %s", name)
 		}
 	}
-	if strings.Contains(strings.ToLower(logOutput), "authorization") {
-		t.Error("server log contains an Authorization header")
+	if lower := strings.ToLower(logOutput); strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") {
+		t.Error("server log contains an Authorization or Cookie header")
 	}
 
 	// Close the server so SQLite checkpoints/removes the WAL before scanning.
-	if err := env.srv.Close(); err != nil {
+	if err := a.srv.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-
-	canaries := map[string]string{
-		"broker AccessKey ID":     canaryBrokerAKID,
-		"broker secret":           canaryBrokerSecret,
-		"agent token":             agentToken,
-		"admin token":             adminToken,
-		"lease credential secret": leaseSecret,
-	}
-	entries, err := os.ReadDir(env.dir)
+	// The CSRF token is stored as issued; it is useless without the session
+	// cookie, which is stored only as a hash.
+	delete(canaries, "CSRF token")
+	entries, err := os.ReadDir(a.dir)
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
@@ -166,7 +167,7 @@ func TestNoSecretsInDatabaseLogsOrAudit(t *testing.T) {
 		if !strings.HasPrefix(name, store.DBFileName) {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(env.dir, name))
+		data, err := os.ReadFile(filepath.Join(a.dir, name))
 		if err != nil {
 			t.Fatalf("ReadFile(%s): %v", name, err)
 		}
@@ -181,8 +182,8 @@ func TestNoSecretsInDatabaseLogsOrAudit(t *testing.T) {
 		t.Fatal("no database files were scanned")
 	}
 
-	// The encrypted blobs exist and the audit chain still verifies after reopen.
-	db, err := store.Open(context.Background(), env.dir)
+	// The audit chain still verifies after reopen.
+	db, err := store.Open(context.Background(), a.dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
@@ -196,46 +197,58 @@ func TestNoSecretsInDatabaseLogsOrAudit(t *testing.T) {
 // TestAccessLogFormat checks the documented "method path status duration_ms"
 // line format and that paths with query strings are logged without the query.
 func TestAccessLogFormat(t *testing.T) {
-	env := newTestEnv(t, true)
+	a := newAccessEnv(t, "")
+	env := a.testEnv
+	env.logs.Reset()
 	env.do(http.MethodGet, "/healthz", "", nil)
-	env.admin(http.MethodGet, "/api/v1/admin/overview?secret=should-not-be-logged", nil)
+	a.sup.do(http.MethodGet, "/api/v1/supervisor/audit?secret=should-not-be-logged", nil)
 
 	lines := strings.Split(strings.TrimSpace(env.logs.String()), "\n")
 	if len(lines) < 2 {
 		t.Fatalf("expected access log lines, got %q", env.logs.String())
 	}
-	var healthLine, overviewLine string
+	var healthLine, auditLine string
 	for _, line := range lines {
 		if strings.Contains(line, "GET /healthz") {
 			healthLine = line
 		}
-		if strings.Contains(line, "GET /api/v1/admin/overview") {
-			overviewLine = line
+		if strings.Contains(line, "GET /api/v1/supervisor/audit") {
+			auditLine = line
 		}
 	}
 	if healthLine == "" || !strings.Contains(healthLine, " 200 ") {
 		t.Fatalf("health access log line = %q", healthLine)
 	}
-	if overviewLine == "" {
-		t.Fatalf("overview access log line missing: %q", env.logs.String())
+	if auditLine == "" {
+		t.Fatalf("audit access log line missing: %q", env.logs.String())
 	}
-	if strings.Contains(overviewLine, "should-not-be-logged") {
-		t.Fatalf("access log leaked the query string: %q", overviewLine)
+	if strings.Contains(auditLine, "should-not-be-logged") {
+		t.Fatalf("access log leaked the query string: %q", auditLine)
 	}
-	if !strings.HasSuffix(overviewLine, "ms") {
-		t.Fatalf("access log line does not end with a duration: %q", overviewLine)
+	if !strings.HasSuffix(auditLine, "ms") {
+		t.Fatalf("access log line does not end with a duration: %q", auditLine)
 	}
 }
 
-// TestRequestBodyLimit checks the 1 MiB request body cap.
+// TestRequestBodyLimit checks the 1 MiB request body cap, for an agent and
+// for a person.
 func TestRequestBodyLimit(t *testing.T) {
-	env := newTestEnv(t, true)
+	a := newAccessEnv(t, model.RoleMember)
 	huge := make([]byte, maxRequestBody+1024)
 	for i := range huge {
 		huge[i] = 'a'
 	}
-	body := append([]byte(`{"capability_id":"`), huge...)
+	body := append([]byte(`{"cloud_account_id":"`), huge...)
 	body = append(body, []byte(`"}`)...)
-	rec := env.agent("claude-code", http.MethodPost, "/api/v1/agent/leases", body)
+	before := a.leaseCount()
+	rec := a.do(http.MethodPost, "/api/v1/agent/access-requests", a.token, body)
 	requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
+
+	body = append([]byte(`{"username":"`), huge...)
+	body = append(body, []byte(`"}`)...)
+	rec = a.sup.do(http.MethodPost, "/api/v1/supervisor/people", body)
+	requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
+	if a.leaseCount() != before {
+		t.Fatal("an oversized request was stored")
+	}
 }

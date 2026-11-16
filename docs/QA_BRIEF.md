@@ -1,12 +1,13 @@
 # QA brief: end-to-end testing of Cloud Safeguard
 
-For the tester (Qoder). Branch `feat/agent-roles`, commit `42be770` or later.
+For the tester (Qoder). Branch `feat/agent-roles`, the commit that removes the admin token or
+later.
 
 ## Goal
 
-Verify that the current build does what `docs/CONTRACT.md` says, on a local machine, first
-against the built-in mock cloud and then against a real Alibaba Cloud account. Report every
-problem as a GitHub issue.
+Verify that the current build does what `docs/CONTRACT.md` §17 says, on a local machine,
+first against the built-in mock cloud and then against a real Alibaba Cloud account. Report
+every problem as a GitHub issue.
 
 ## Rules
 
@@ -14,8 +15,8 @@ problem as a GitHub issue.
    maintainers.
 2. Never put an AccessKey, secret, token, setup code, password or TOTP secret in an issue,
    commit, log excerpt or chat. Replace them with `<redacted>`.
-3. The project owner types real cloud AccessKey secrets into the tool. Do not ask for them and
-   do not read them from files.
+3. The project owner types real cloud AccessKey secrets into the console. Do not ask for
+   them and do not read them from files.
 4. On the real cloud account, run read-only tests first. Change or delete only resources the
    owner created for testing and named for you.
 5. A security problem (credential exposure, a way around a role, approval or the IAM ban) is
@@ -27,34 +28,39 @@ problem as a GitHub issue.
 go build -o build/csg ./cmd/csg
 ./scripts/demo.sh            # must end with "all S1-S9 scenarios passed"
 go test ./...                # must pass
-./build/csg init --data-dir ./build/qa-data --demo
+./build/csg init --demo --data-dir ./build/qa-data
 ./build/csg serve --data-dir ./build/qa-data
 ```
 
-`csg init` prints the admin token, two demo agent tokens and the first supervisor's setup code
-once. Console: `http://127.0.0.1:8787/`. CLI help: `csg help`, `csg <command> -h`. API
-reference: `docs/API.md` (v0.1) plus CONTRACT §16 and §17.8 for what changed since.
+`csg init` prints one secret, once: the first supervisor's setup code. There is no admin
+token. Console: `http://127.0.0.1:8787/`. CLI help: `csg help`, `csg <command> -h`. The API
+is listed in CONTRACT §17.8; `docs/QUICKSTART.md` walks through the whole flow.
 
 ## In scope
 
-### A. Agent roles and the IAM ban (CONTRACT §16), mock cloud
+### A. Agents, access requests and the IAM ban (CONTRACT §17.3–§17.7a), mock cloud
 
-- A guest agent gets read capabilities only; a write request is denied with rule
-  `role_permits`.
-- A member agent can request write capabilities; requests above the auto-approve threshold wait
-  for approval; approve, deny and timeout all behave as documented.
-- An administrator agent's `aliyun.account.admin` request always needs approval, and the issued
-  credential is still refused on RAM endpoints of the mock cloud.
-- Creating or editing a capability whose policy allows `ram:*`, any `sts:` action other than
-  `GetCallerIdentity`, `NotAction`, `NotResource` or a bare `*` (below admin) is rejected.
-- Demoting or suspending an agent, disabling a capability or provider, and tightening the
-  policy settings each revoke the leases that are no longer allowed, at once.
-- A credential cannot be fetched after its lease expired, was revoked or was denied.
-- The audit log records every step and `csg audit verify` passes afterwards.
-- (The older console screens for agent roles were removed with the console redesign; test
-  agent roles through the admin API and CLI.)
+- An agent signs in with `csg login`; a person approves the short code in the console. The
+  token is never printed and is saved with mode 0600.
+- A guest's agent gets read at once; write and full are denied at once.
+- A member's agent gets write only after its owner approves; full is denied. An
+  administrator's (and a supervisor's) agent can get full after approval.
+- Only the owner approves. A supervisor or another person cannot; a supervisor can deny and
+  revoke through the API.
+- Approval modes (Read, Write, Full, with an optional expiry) and the account's highest
+  automatic level decide what is issued without approval; neither exceeds the role.
+- A credential allows only what was asked for (one resource type, one permission level,
+  optionally one resource), and is refused on RAM endpoints of the mock cloud at every level.
+- Lowering or removing a role, suspending or resetting a person, revoking an agent and
+  disabling a cloud account each revoke what is no longer allowed, at once.
+- A credential cannot be fetched after it expired, was revoked or was denied.
+- The removed routes (`/api/v1/admin/*`, `POST /api/v1/agent/leases`,
+  `GET /api/v1/agent/capabilities`) answer 404, and the removed commands (`csg providers`,
+  `agents`, `caps`, `policy`, `audit`, `request`) are unknown.
+- `csg mcp`: the five tools work, and `get_credential` never returns the secret.
+- The audit log records every step, and the Activity page shows the chain as verified.
 
-### B. People, supervisors and sign-in (CONTRACT §17.1–§17.3, API only)
+### B. People, supervisors and sign-in (CONTRACT §17.1–§17.3)
 
 Test in the console (setup, sign-in, Inbox, Agents, Cloud accounts, People, Settings) and with
 `curl` against the endpoints in CONTRACT §17.8. Setup and login need the header
@@ -73,32 +79,32 @@ Test in the console (setup, sign-in, Inbox, Agents, Cloud accounts, People, Sett
 
 ### C. Real Alibaba Cloud (after the owner connects an account)
 
-The owner adds the provider with `csg providers add --mode sts ...` and tells you which test
-resources exist.
+The owner adds the cloud account in the console (Cloud accounts → + Add cloud account) and
+tells you which test resources exist.
 
-- A read lease yields a working short-lived credential (`csg exec` with the `aliyun` CLI or an
-  SDK), and it lists the expected resources.
+- A read request yields a working short-lived credential (`csg exec --account ...` with the
+  `aliyun` CLI or an SDK), and it lists the expected resources.
 - The same credential is refused for an action outside its policy.
 - A credential at any level is refused by Alibaba Cloud on a RAM API call.
 - The credential stops working at its deadline (minimum validity on real accounts: 15 minutes).
-- A write lease waits for approval, then works only on the named resource.
-- Provider connection test, credential rotation and disabling the provider behave as
+- A write request waits for approval, then works only on the named resource.
+- The connection test, replacing the AccessKey and disabling the account behave as
   documented.
 
 ## Out of scope (known, do not report)
 
-- The admin token and the §16 agent model still exist alongside §17 until they are removed.
-- README, QUICKSTART, SECURITY, API and PRODUCT still describe v0.1.
+- SECURITY, API, ARCHITECTURE, SPEC, DECISIONS and PRODUCT still describe v0.1 and say so at
+  the top.
 - AWS and GCP are not supported.
-- Two known low-severity items: an access-level change racing a new grant, and a retired
-  capability shown as a checkbox in the agent detail drawer.
+- People cannot sign in with `csg` yet; supervisor work is console-only.
+- The console has no button for the supervisor's emergency stop (it is in the API).
 
 ## Reporting
 
 One GitHub issue per problem, with:
 
-- title: `[area] what is wrong` (areas: `roles`, `iam-ban`, `leases`, `auth`, `supervisor`,
-  `console`, `cli`, `sts`, `docs`)
+- title: `[area] what is wrong` (areas: `roles`, `iam-ban`, `requests`, `auth`, `supervisor`,
+  `console`, `cli`, `mcp`, `sts`, `docs`)
 - commit hash, OS, and whether the mock cloud or the real account was used
 - exact steps or commands, with secrets redacted
 - what you expected (cite the CONTRACT section) and what happened

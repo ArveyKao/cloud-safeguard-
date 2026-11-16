@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/arveykao/cloud-safeguard/internal/authn"
-	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/mockcloud"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
@@ -121,12 +120,6 @@ type Server struct {
 	// mint twice. The server is a single process per data dir (ADR-002).
 	leaseLocksMu sync.Mutex
 	leaseLocks   map[string]*leaseLock
-	// capLocks make capability edits and activations of that capability
-	// mutually exclusive: an activation holds the read side from reading the
-	// capability until the lease is active; an edit holds the write side from
-	// reading the capability until its lease sweeps finish.
-	capLocksMu sync.Mutex
-	capLocks   map[string]*capLock
 
 	// personLocks serialize sign-in and authority changes per person, so the
 	// lockout count is exact under parallel logins and a login can never
@@ -216,7 +209,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	// An initialized install always carries both the schema version and the
-	// admin token hash; anything else means `csg init` never ran (or the data
+	// bootstrap time; anything else means `csg init` never ran (or the data
 	// dir is damaged).
 	if _, err := db.GetMeta(context.Background(), store.MetaSchemaVersion); err != nil {
 		db.Close()
@@ -225,12 +218,12 @@ func New(cfg Config) (*Server, error) {
 		}
 		return nil, fmt.Errorf("server: read schema version: %w", err)
 	}
-	if _, err := db.GetMeta(context.Background(), store.MetaAdminTokenHash); err != nil {
+	if _, err := db.GetMeta(context.Background(), store.MetaBootstrapTime); err != nil {
 		db.Close()
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, notInitializedErr(cfg.DataDir)
 		}
-		return nil, fmt.Errorf("server: read admin token: %w", err)
+		return nil, fmt.Errorf("server: read bootstrap time: %w", err)
 	}
 
 	s := &Server{
@@ -270,16 +263,14 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.mockCloud = mockcloud.NewHandler(mockcloud.Deps{Store: db, SigningKey: s.signingKey})
 	s.handler = s.buildHandler()
-	// Retired capabilities must not keep live leases across a restart, even if
-	// the schema-2 migration already disabled them (CONTRACT §16.6).
-	// Record what an upgrade migration changed, so role assignments and
-	// disabled capabilities are attributable in the audit chain.
+	// Record what an upgrade migration changed (revoked agents, for one), so
+	// it is attributable in the audit chain.
 	if err := auditMigrationReport(context.Background(), db); err != nil {
 		s.logf("audit schema migration: %v", err)
 	}
-	if err := s.retireCapabilityLeases(context.Background()); err != nil {
+	if err := s.revokeUnsupportedLeases(context.Background()); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("server: revoke leases that violate the IAM prohibition: %w", err)
+		return nil, fmt.Errorf("server: revoke leases that are no longer supported: %w", err)
 	}
 	// Re-check every pending and active lease once at startup. Authority can
 	// change while the server is down or in a crash between a status change
@@ -293,10 +284,6 @@ func New(cfg Config) (*Server, error) {
 	s.startSweeper()
 	return s, nil
 }
-
-// retiredCapabilityIDs are capabilities that are kept in the catalog for
-// historic leases but may never be leased again.
-var retiredCapabilityIDs = []string{capcatalog.IDBreakGlass}
 
 // notInitializedErr builds the clear bootstrap error required by CONTRACT §11.
 func notInitializedErr(dataDir string) error {

@@ -88,9 +88,20 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   wizard, Activity, People, Settings); the old admin-token console and `web/devmock` are
   removed. Checked in a browser against a real server. Step 3 of the four-step plan is done;
   step 4 (remove the admin token and the §16 agent model) remains.
-- **Agreed next (owner, 2026-11-11):** remove the admin token and the §16 agent model once
-  supervisors can manage cloud accounts, audit and settings, and the console and `csg` use the
-  new login. Supervisors keep an emergency revoke/deny, never approve.
+- **Admin token and the §16 agent model removed (2026-11-15):** step 4 of the four-step plan.
+  No admin token, admin API or admin CLI; no agent roles, grants, stored capabilities,
+  break-glass or risk-tier policy engine. `csg init` prints only the first supervisor's setup
+  code and never touches an existing directory. Schema version 8 deletes the admin token and
+  revokes agents without an owner; leases that are not access requests are revoked at start.
+  Supervisors are Administrator on every cloud account (owner's decision, 2026-11-14).
+  `scripts/demo.sh` now runs nine scenarios through `scripts/demo/` (people over HTTP, the
+  agent through the real `csg`). Verified locally; awaiting commit and independent review.
+- **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
+  for everything except adding a cloud account, which stays console-only; (2) remote MCP over
+  HTTPS with OAuth-style sign-in so an agent connects with just a URL.
+- **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
+  README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
+  Alibaba Cloud is untested.
 - **Blocked:** none. Future work (not v0.1): credential-free proxy mode, per-parameter
   grant constraints, chat approvals, multi-cloud, SSO/multi-tenant (see README roadmap).
 
@@ -106,8 +117,8 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 - **Target kind / environment / surface:** local dev artifact on this macOS machine
   (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console (target surface = api; browser E2E covers the console).
   No production deployment requested.
-- **Address / artifact:** `bin/csg` (single binary), demo on `http://127.0.0.1:18787`.
-- **Final demo:** `make demo` → S1–S8 pass; console screenshots captured by verifier.
+- **Address / artifact:** `build/csg` (single binary), demo on `http://127.0.0.1:18787`.
+- **Final demo:** `make demo` → S1–S9 pass; console screenshots captured by verifier.
 - **Evidence / review:** `scripts/demo.sh` transcript, `go test ./...`, `npm run build`,
   verifier report `changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md`, canonical
   `arvey-develop delivery check --phase complete` PASS.
@@ -120,7 +131,7 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 | Dependency setup / build | `make build` (`go` 1.24+, `npm`/Node ≥20) |
 | Automated checks | `go test ./...`; `go vet ./...`; `cd web && npm run typecheck && npm run build` |
 | Demo / E2E | `make demo` (`./scripts/demo.sh --port 18787 --data-dir .demo/data`) |
-| Run console | `./bin/csg init --demo --data-dir .demo/data && ./bin/csg serve --data-dir .demo/data` |
+| Run console | `./build/csg init --demo --data-dir .demo/data && ./build/csg serve --data-dir .demo/data` |
 | Server/API contract checks | Go httptest suites in `internal/server`, `internal/mockcloud`; verifier probes |
 | Performance budget | not triggered (no hot-path optimization target) |
 

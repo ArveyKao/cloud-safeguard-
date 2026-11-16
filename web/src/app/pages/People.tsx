@@ -45,8 +45,8 @@ export function PeoplePage({ me }: { me: Person }) {
                     'Reset', async () => { setIssued(await api.resetPerson(p.id)) })}>Reset</Button>
                   <Button kind="link" onClick={() => ask(p.supervisor ? `Remove ${label(p)} as supervisor?` : `Make ${label(p)} a supervisor?`,
                     p.supervisor
-                      ? 'They can no longer manage cloud accounts, people, roles or limits. Their own roles stay.'
-                      : 'They can add cloud accounts, add and suspend people, change everyone\'s roles and the platform limits. It gives no cloud access by itself.',
+                      ? 'They can no longer manage cloud accounts, people, roles or limits, and they stop being Administrator on every cloud account. They keep the roles given to them by name; credentials their agents hold beyond those are revoked.'
+                      : 'They can add cloud accounts, add and suspend people, change everyone\'s roles and the platform limits. They also become Administrator on every cloud account, so their agents can ask for full access there.',
                     p.supervisor ? 'Remove supervisor' : 'Make supervisor',
                     async () => { await api.updatePerson(p.id, { supervisor: !p.supervisor }); toast(p.supervisor ? 'Supervisor removed' : 'Now a supervisor') }, !p.supervisor)}>
                     {p.supervisor ? 'Remove supervisor' : 'Make supervisor'}
@@ -81,7 +81,7 @@ function CreatePerson({ onClose, onCreated }: { onClose: () => void; onCreated: 
       <Field label="Username" value={username} onChange={(v) => setUsername(v.toLowerCase())} autoFocus
         hint="Lowercase letters, digits, dot, dash or underscore." />
       <Field label="Name shown in the console" value={display} onChange={setDisplay} />
-      <label className="check"><input type="checkbox" checked={supervisor} onChange={(e) => setSupervisor(e.target.checked)} /> Supervisor (manages the platform; no cloud access by itself)</label>
+      <label className="check"><input type="checkbox" checked={supervisor} onChange={(e) => setSupervisor(e.target.checked)} /> Supervisor (manages the platform and is Administrator on every cloud account)</label>
       <ErrorNote error={action.error} />
       <div className="row-actions">
         <Button onClick={onClose}>Cancel</Button>

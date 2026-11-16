@@ -9,624 +9,355 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
 	"github.com/arveykao/cloud-safeguard/internal/store"
 )
 
-// These tests reproduce the window between "authorization checked" and "lease
-// written as active". The fake minter's hook changes state at exactly that
-// point. Before the compare-and-set activation, the final write overwrote the
-// revoked status and resurrected the lease with a live credential.
+// These tests reproduce the window between "authorization checked" and
+// "request written as active". The fake minter's hook changes state at
+// exactly that point. Without the compare-and-set activation, the final write
+// would overwrite the revoked status and bring the request back with a live
+// credential.
 
-// requireNoLiveCredential asserts a lease is not active, has no stored
+// requireNoLiveCredential asserts a request is not active, has no stored
 // credential and cannot be fetched by its agent.
-func requireNoLiveCredential(t *testing.T, env *testEnv, agentName string, leaseID string, wantStatus model.LeaseStatus) {
+func requireNoLiveCredential(t *testing.T, a *accessEnv, leaseID string, wantStatus model.LeaseStatus) {
 	t.Helper()
-	got := env.getLease(leaseID)
+	got := a.getLease(leaseID)
 	if got.Status != wantStatus {
-		t.Fatalf("lease status = %q, want %q", got.Status, wantStatus)
+		t.Fatalf("status = %q, want %q", got.Status, wantStatus)
 	}
 	if got.CredentialAvailable {
-		t.Fatal("lease still reports credential_available=true")
+		t.Fatal("request still reports credential_available=true")
 	}
-	if _, err := env.srv.db.GetLeaseCredential(context.Background(), leaseID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("stored credential after lost activation: err = %v, want ErrNotFound", err)
+	if _, err := a.srv.db.GetLeaseCredential(context.Background(), leaseID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stored credential after a lost activation: err = %v, want ErrNotFound", err)
 	}
-	if _, rec := env.fetchCredential(agentName, leaseID); rec.Code == http.StatusOK {
-		t.Fatal("agent fetched a credential for a lease that lost its activation")
+	if rec := a.credential(leaseID); rec.Code == http.StatusOK {
+		t.Fatal("the agent fetched a credential for a request that lost its activation")
 	}
-	if !env.hasAction("lease.activation_aborted") {
+	if !a.hasAction("lease.activation_aborted") {
 		t.Fatal("missing lease.activation_aborted audit event")
 	}
-	if res := env.verifyAudit(); !res.OK {
-		t.Fatalf("audit chain invalid after lost activation: %+v", res)
+	a.verifyAudit()
+}
+
+// supervisorRevoke is the emergency stop, as a supervisor.
+func (a *accessEnv) supervisorRevoke(leaseID, reason string) *httptest.ResponseRecorder {
+	return a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+leaseID+"/revoke", model.RevokeLeaseInput{Reason: reason})
+}
+
+// onlyLeaseID returns the ID of the single lease the agent has.
+func (a *accessEnv) onlyLeaseID() string {
+	a.t.Helper()
+	leases, err := a.srv.db.ListAllLeases(context.Background(), store.LeaseFilter{AgentID: a.agent.ID})
+	if err != nil || len(leases) != 1 {
+		a.t.Fatalf("leases of the agent: %d, %v", len(leases), err)
 	}
+	return leases[0].ID
 }
 
 func TestApprovalLosesRaceWithConcurrentRevoke(t *testing.T) {
-	env := newTestEnv(t, true)
-	env.createAgent("racer", model.RoleMember, nil)
-	lease, rec := env.createLease("racer", model.CreateLeaseInput{
-		CapabilityID: capcatalog.IDDNSManage,
-		Params:       map[string]string{"domain": "arveykao.com"},
-		Reason:       "approval race test",
-	})
-	requireStatus(t, rec, http.StatusCreated)
-	if lease.Status != model.LeasePending {
-		t.Fatalf("lease status = %q, want pending", lease.Status)
+	a := newAccessEnv(t, model.RoleMember)
+	req := a.request(accessInput("ecs", "write"))
+	if req.Status != model.LeasePending {
+		t.Fatalf("status = %q, want pending", req.Status)
 	}
-
-	env.minter.onMint = func(req provider.MintRequest) {
-		r := env.admin(http.MethodPost, "/api/v1/admin/leases/"+req.LeaseID+"/revoke",
-			model.RevokeLeaseInput{Reason: "revoked while approval was minting"})
-		requireStatus(t, r, http.StatusOK)
+	a.minter.onMint = func(m provider.MintRequest) {
+		requireStatus(t, a.supervisorRevoke(m.LeaseID, "revoked while the approval was minting"), http.StatusOK)
 	}
-	approve := env.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", model.ApproveLeaseInput{Note: "race"})
-	requireErrorCode(t, approve, http.StatusConflict, model.ErrCodeConflict)
-	requireNoLiveCredential(t, env, "racer", lease.ID, model.LeaseRevoked)
-	if env.hasAction("lease.approved") {
-		t.Fatal("lease.approved was audited for an approval that lost the race")
+	requireErrorCode(t, a.approve(a.mei, req.ID), http.StatusConflict, model.ErrCodeConflict)
+	requireNoLiveCredential(t, a, req.ID, model.LeaseRevoked)
+	if a.hasAction("lease.approved") {
+		t.Fatal("lease.approved was recorded for an approval that lost the race")
 	}
 }
 
-func TestApprovalLosesRaceWithConcurrentDemotion(t *testing.T) {
-	env := newTestEnv(t, true)
-	env.createAgent("racer", model.RoleMember, nil)
-	lease, rec := env.createLease("racer", model.CreateLeaseInput{
-		CapabilityID: capcatalog.IDECSOps,
-		Params:       map[string]string{"instance_id": "i-2ze0demo001"},
-		Reason:       "demotion race test",
-	})
-	requireStatus(t, rec, http.StatusCreated)
-	if lease.Status != model.LeasePending {
-		t.Fatalf("lease status = %q, want pending", lease.Status)
-	}
-
-	env.minter.onMint = func(provider.MintRequest) {
-		guest := model.RoleGuest
-		env.patchAgent("racer", model.UpdateAgentInput{Role: &guest})
-	}
-	approve := env.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", model.ApproveLeaseInput{Note: "race"})
-	requireErrorCode(t, approve, http.StatusConflict, model.ErrCodeConflict)
-	requireNoLiveCredential(t, env, "racer", lease.ID, model.LeaseRevoked)
+func TestApprovalLosesRaceWithConcurrentRoleChange(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	req := a.request(accessInput("ecs", "write"))
+	a.minter.onMint = func(provider.MintRequest) { a.bind(a.mei, model.RoleGuest) }
+	requireErrorCode(t, a.approve(a.mei, req.ID), http.StatusConflict, model.ErrCodeConflict)
+	requireNoLiveCredential(t, a, req.ID, model.LeaseRevoked)
 }
 
-func TestAutoApprovalLosesRaceWithConcurrentRevoke(t *testing.T) {
-	env := newTestEnv(t, true)
-	env.createAgent("racer", model.RoleGuest, nil)
-
-	env.minter.onMint = func(req provider.MintRequest) {
-		r := env.admin(http.MethodPost, "/api/v1/admin/leases/"+req.LeaseID+"/revoke",
-			model.RevokeLeaseInput{Reason: "revoked while auto-approval was minting"})
-		requireStatus(t, r, http.StatusOK)
+func TestAutomaticIssueLosesRaceWithConcurrentRevoke(t *testing.T) {
+	a := newAccessEnv(t, model.RoleGuest)
+	a.minter.onMint = func(m provider.MintRequest) {
+		requireStatus(t, a.supervisorRevoke(m.LeaseID, "revoked while the request was minting"), http.StatusOK)
 	}
-	_, rec := env.createLease("racer", model.CreateLeaseInput{
-		CapabilityID: capcatalog.IDCloudRead,
-		Reason:       "auto-approval race test",
-	})
-	requireErrorCode(t, rec, http.StatusConflict, model.ErrCodeConflict)
-
-	leaseID := env.minter.lastRequest(t).LeaseID
-	requireNoLiveCredential(t, env, "racer", leaseID, model.LeaseRevoked)
+	requireErrorCode(t, a.requestRaw(a.token, accessInput("ecs", "read")), http.StatusConflict, model.ErrCodeConflict)
+	requireNoLiveCredential(t, a, a.minter.lastRequest(t).LeaseID, model.LeaseRevoked)
 }
 
-// Authority changes that do not touch the lease's status (written straight to
-// the store, so no sweep runs) must still stop activation: the post-mint
-// recheck in activateLease re-reads the agent and capability.
+// Authority changes that do not touch the request's status (written straight
+// to the store, so no sweep runs) must still stop activation: the check after
+// minting reads the agent, its owner, the role and the cloud account again.
 func TestActivationRechecksAuthorityChangedDuringMint(t *testing.T) {
 	ctx := context.Background()
+	exec := func(t *testing.T, a *accessEnv, query string, args ...any) {
+		t.Helper()
+		if _, err := a.srv.db.SQL().Exec(query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
 	cases := []struct {
 		name    string
-		auto    bool
-		breakIt func(t *testing.T, env *testEnv)
+		breakIt func(t *testing.T, a *accessEnv)
 	}{
-		{"approval: grant removed during mint", false, func(t *testing.T, env *testEnv) {
-			ag, _ := env.srv.db.GetAgent(ctx, env.agentIDs["racer"])
-			ag.Grants = []string{capcatalog.IDCloudRead}
-			if err := env.srv.db.UpdateAgent(ctx, ag); err != nil {
-				t.Fatalf("UpdateAgent: %v", err)
+		{"role removed", func(t *testing.T, a *accessEnv) {
+			if err := a.srv.db.DeleteBinding(ctx, a.mei.person.ID, a.providerID); err != nil {
+				t.Fatal(err)
 			}
 		}},
-		{"approval: agent suspended during mint", false, func(t *testing.T, env *testEnv) {
-			ag, _ := env.srv.db.GetAgent(ctx, env.agentIDs["racer"])
-			ag.Status = model.AgentSuspended
-			if err := env.srv.db.UpdateAgent(ctx, ag); err != nil {
-				t.Fatalf("UpdateAgent: %v", err)
+		{"agent suspended", func(t *testing.T, a *accessEnv) {
+			exec(t, a, `UPDATE agents SET status = 'suspended' WHERE id = ?`, a.agent.ID)
+		}},
+		{"agent revoked", func(t *testing.T, a *accessEnv) {
+			exec(t, a, `UPDATE agents SET status = 'revoked' WHERE id = ?`, a.agent.ID)
+		}},
+		{"owner suspended", func(t *testing.T, a *accessEnv) {
+			exec(t, a, `UPDATE persons SET status = 'suspended' WHERE id = ?`, a.mei.person.ID)
+		}},
+		{"cloud account disabled", func(t *testing.T, a *accessEnv) {
+			p, err := a.srv.db.GetProvider(ctx, a.providerID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.Status = model.ProviderDisabled
+			if err := a.srv.db.UpdateProvider(ctx, p); err != nil {
+				t.Fatal(err)
 			}
 		}},
-		{"approval: capability disabled during mint", false, func(t *testing.T, env *testEnv) {
-			c, _ := env.srv.db.GetCapability(ctx, capcatalog.IDDNSManage)
-			c.Enabled = false
-			if err := env.srv.db.UpdateCapability(ctx, c); err != nil {
-				t.Fatalf("UpdateCapability: %v", err)
-			}
-		}},
-		{"auto-approval: grant removed during mint", true, func(t *testing.T, env *testEnv) {
-			ag, _ := env.srv.db.GetAgent(ctx, env.agentIDs["racer"])
-			ag.Grants = []string{capcatalog.IDDNSManage}
-			if err := env.srv.db.UpdateAgent(ctx, ag); err != nil {
-				t.Fatalf("UpdateAgent: %v", err)
+		{"longest validity lowered", func(t *testing.T, a *accessEnv) {
+			settings := model.DefaultPolicySettings()
+			settings.MaxLeaseTTLSeconds = 300
+			if err := a.srv.db.SetPolicySettings(ctx, settings); err != nil {
+				t.Fatal(err)
 			}
 		}},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			env := newTestEnv(t, true)
-			env.createAgent("racer", model.RoleMember, nil)
-			var leaseID string
-			var rec = (*httptest.ResponseRecorder)(nil)
-			if tc.auto {
-				env.minter.onMint = func(provider.MintRequest) { tc.breakIt(t, env) }
-				_, rec = env.createLease("racer", model.CreateLeaseInput{CapabilityID: capcatalog.IDCloudRead, Reason: "auto race"})
-				leaseID = env.minter.lastRequest(t).LeaseID
-			} else {
-				lease, r := env.createLease("racer", model.CreateLeaseInput{
-					CapabilityID: capcatalog.IDDNSManage,
-					Params:       map[string]string{"domain": "arveykao.com"},
-					Reason:       "approval race",
-				})
-				requireStatus(t, r, http.StatusCreated)
-				leaseID = lease.ID
-				env.minter.onMint = func(provider.MintRequest) { tc.breakIt(t, env) }
-				rec = env.admin(http.MethodPost, "/api/v1/admin/leases/"+leaseID+"/approve", model.ApproveLeaseInput{Note: "race"})
+		for _, automatic := range []bool{false, true} {
+			name := tc.name + " during an approval"
+			if automatic {
+				name = tc.name + " during an automatic issue"
 			}
-			requireErrorCode(t, rec, http.StatusConflict, model.ErrCodeConflict)
-			requireNoLiveCredential(t, env, "racer", leaseID, model.LeaseRevoked)
-		})
-	}
-}
-
-// Authority changes made through the admin API revoke affected leases in the
-// same request (CONTRACT §16.5), so an approval racing them loses its
-// compare-and-set even when the change lands after the post-mint recheck.
-func TestAuthorityChangesRevokeAffectedLeases(t *testing.T) {
-	t.Run("suspension revokes pending and active leases", func(t *testing.T) {
-		env := newTestEnv(t, true)
-		env.createAgent("sus", model.RoleMember, nil)
-		active, _ := env.createLease("sus", model.CreateLeaseInput{CapabilityID: capcatalog.IDCloudRead, Reason: "read"})
-		pending, _ := env.createLease("sus", model.CreateLeaseInput{
-			CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "arveykao.com"}, Reason: "write",
-		})
-		if active.Status != model.LeaseActive || pending.Status != model.LeasePending {
-			t.Fatalf("setup statuses = %q/%q, want active/pending", active.Status, pending.Status)
-		}
-		requireStatus(t, env.admin(http.MethodPost, "/api/v1/admin/agents/"+env.agentIDs["sus"]+"/suspend", nil), http.StatusOK)
-		for _, id := range []string{active.ID, pending.ID} {
-			if got := env.getLease(id); got.Status != model.LeaseRevoked {
-				t.Fatalf("lease %s status after suspension = %q, want revoked", id, got.Status)
-			}
-		}
-	})
-
-	t.Run("grant removal revokes leases on the removed capability only", func(t *testing.T) {
-		env := newTestEnv(t, true)
-		env.createAgent("grt", model.RoleMember, nil)
-		keep, _ := env.createLease("grt", model.CreateLeaseInput{CapabilityID: capcatalog.IDCloudRead, Reason: "read"})
-		drop, _ := env.createLease("grt", model.CreateLeaseInput{
-			CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "arveykao.com"}, Reason: "write",
-		})
-		grants := []string{capcatalog.IDCloudRead}
-		env.patchAgent("grt", model.UpdateAgentInput{Grants: &grants})
-		if got := env.getLease(keep.ID); got.Status != model.LeaseActive {
-			t.Fatalf("still-granted lease status = %q, want active", got.Status)
-		}
-		if got := env.getLease(drop.ID); got.Status != model.LeaseRevoked {
-			t.Fatalf("removed-grant lease status = %q, want revoked", got.Status)
-		}
-	})
-
-	t.Run("disabling a capability revokes its pending leases", func(t *testing.T) {
-		env := newTestEnv(t, true)
-		env.createAgent("cap", model.RoleMember, nil)
-		pending, _ := env.createLease("cap", model.CreateLeaseInput{
-			CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "arveykao.com"}, Reason: "write",
-		})
-		requireStatus(t, env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+capcatalog.IDDNSManage, map[string]any{"enabled": false}), http.StatusOK)
-		if got := env.getLease(pending.ID); got.Status != model.LeaseRevoked {
-			t.Fatalf("pending lease after disable = %q, want revoked", got.Status)
-		}
-	})
-
-	t.Run("an agent update re-runs the sweep, so a retry finishes it", func(t *testing.T) {
-		ctx := context.Background()
-		env := newTestEnv(t, true)
-		env.createAgent("retry", model.RoleMember, nil)
-		drop, _ := env.createLease("retry", model.CreateLeaseInput{
-			CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "arveykao.com"}, Reason: "write",
-		})
-		// Simulate a demotion whose sweep failed half-way: the agent row changed
-		// but the lease was left behind.
-		ag, _ := env.srv.db.GetAgent(ctx, env.agentIDs["retry"])
-		ag.Role = model.RoleGuest
-		ag.Grants = []string{capcatalog.IDCloudRead}
-		if err := env.srv.db.UpdateAgent(ctx, ag); err != nil {
-			t.Fatalf("UpdateAgent: %v", err)
-		}
-		// Retrying the same change through the API (a no-op for the row) must
-		// still revoke the stranded lease.
-		guest := model.RoleGuest
-		env.patchAgent("retry", model.UpdateAgentInput{Role: &guest})
-		if got := env.getLease(drop.ID); got.Status != model.LeaseRevoked {
-			t.Fatalf("stranded lease after retry = %q, want revoked", got.Status)
-		}
-	})
-}
-
-// The retired aliyun.iam.break_glass row is kept for history and can never be
-// re-enabled, granted or leased (CONTRACT §16.6).
-func TestRetiredCapabilityCannotBeRevived(t *testing.T) {
-	ctx := context.Background()
-	env := newTestEnv(t, true)
-	retired := model.Capability{
-		ID: capcatalog.IDBreakGlass, Name: "Retired break-glass", ProviderType: model.ProviderAliyun,
-		Risk: model.RiskCritical, Access: model.AccessAdmin,
-		PolicyTemplate:    `{"Version":"1","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}`,
-		DefaultTTLSeconds: 900, MaxTTLSeconds: 1800, Enabled: false, Builtin: true,
-		CreatedAt: fixedTestTime, UpdatedAt: fixedTestTime,
-	}
-	if err := env.srv.db.CreateCapability(ctx, retired); err != nil {
-		t.Fatalf("CreateCapability: %v", err)
-	}
-
-	rec := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+capcatalog.IDBreakGlass, map[string]any{"enabled": true})
-	requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
-
-	grants := []string{capcatalog.IDBreakGlass}
-	rec = env.admin(http.MethodPatch, "/api/v1/admin/agents/"+env.agentIDs["claude-code"], model.UpdateAgentInput{Grants: &grants})
-	requireErrorCode(t, rec, http.StatusBadRequest, model.ErrCodeInvalidRequest)
-
-	// Even if the row were enabled and granted behind the API's back, a lease
-	// on it is denied by policy.
-	retired.Enabled = true
-	if err := env.srv.db.UpdateCapability(ctx, retired); err != nil {
-		t.Fatalf("UpdateCapability: %v", err)
-	}
-	ag, _ := env.srv.db.GetAgent(ctx, env.agentIDs["claude-code"])
-	ag.Grants = append(ag.Grants, capcatalog.IDBreakGlass)
-	if err := env.srv.db.UpdateAgent(ctx, ag); err != nil {
-		t.Fatalf("UpdateAgent: %v", err)
-	}
-	lease, _ := env.createLease("claude-code", model.CreateLeaseInput{
-		CapabilityID: capcatalog.IDBreakGlass, Reason: "revive attempt", BreakGlass: true,
-	})
-	if lease.Status != model.LeaseDenied {
-		t.Fatalf("lease on retired capability status = %q, want denied", lease.Status)
-	}
-
-	// New administrators never get it by default.
-	admin := env.createAgent("fresh-admin", model.RoleAdministrator, nil)
-	for _, g := range admin.Grants {
-		if g == capcatalog.IDBreakGlass {
-			t.Fatal("retired capability was granted by default to a new administrator")
+			t.Run(name, func(t *testing.T) {
+				a := newAccessEnv(t, model.RoleMember)
+				var leaseID string
+				var rec *httptest.ResponseRecorder
+				if automatic {
+					a.minter.onMint = func(provider.MintRequest) { tc.breakIt(t, a) }
+					rec = a.requestRaw(a.token, accessInput("ecs", "read"))
+					leaseID = a.minter.lastRequest(t).LeaseID
+				} else {
+					leaseID = a.request(accessInput("ecs", "write")).ID
+					a.minter.onMint = func(provider.MintRequest) { tc.breakIt(t, a) }
+					rec = a.approve(a.mei, leaseID)
+				}
+				requireErrorCode(t, rec, http.StatusConflict, model.ErrCodeConflict)
+				got := a.getLease(leaseID)
+				if got.Status != model.LeaseRevoked || got.CredentialAvailable {
+					t.Fatalf("request = %q credential_available=%v, want revoked without a credential", got.Status, got.CredentialAvailable)
+				}
+				if _, err := a.srv.db.GetLeaseCredential(ctx, leaseID); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("stored credential: err = %v, want ErrNotFound", err)
+				}
+				if !a.hasAction("lease.activation_aborted") {
+					t.Fatal("missing lease.activation_aborted audit event")
+				}
+				a.verifyAudit()
+			})
 		}
 	}
 }
 
-// Two approvals of one pending lease at the same moment (double click, client
-// retry) must mint once and leave the winner's credential usable.
+// Two approvals of one waiting request at the same moment (double click,
+// client retry) must mint once and leave the winner's credential usable.
 func TestConcurrentApprovalsMintOnceAndKeepWinnerCredential(t *testing.T) {
 	for round := 0; round < 5; round++ {
-		env := newTestEnv(t, true)
-		env.createAgent("dbl", model.RoleMember, nil)
-		lease, rec := env.createLease("dbl", model.CreateLeaseInput{
-			CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "arveykao.com"}, Reason: "double approve",
-		})
-		requireStatus(t, rec, http.StatusCreated)
+		a := newAccessEnv(t, model.RoleMember)
+		req := a.request(accessInput("ecs", "write"))
 
 		codes := make(chan int, 2)
 		start := make(chan struct{})
 		for i := 0; i < 2; i++ {
 			go func() {
 				<-start
-				r := env.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", model.ApproveLeaseInput{Note: "dbl"})
-				codes <- r.Code
+				codes <- a.approve(a.mei, req.ID).Code
 			}()
 		}
 		close(start)
-		a, b := <-codes, <-codes
-		if !((a == http.StatusOK && b == http.StatusConflict) || (a == http.StatusConflict && b == http.StatusOK)) {
-			t.Fatalf("round %d: approval codes = %d, %d; want one 200 and one 409", round, a, b)
+		first, second := <-codes, <-codes
+		if !((first == http.StatusOK && second == http.StatusConflict) || (first == http.StatusConflict && second == http.StatusOK)) {
+			t.Fatalf("round %d: approval codes = %d, %d; want one 200 and one 409", round, first, second)
 		}
-		if n := env.minter.requestCount(); n != 1 {
-			t.Fatalf("round %d: minter called %d times, want 1", round, n)
+		if n := a.minter.requestCount(); n != 1 {
+			t.Fatalf("round %d: minted %d times, want 1", round, n)
 		}
-		got := env.getLease(lease.ID)
+		got := a.getLease(req.ID)
 		if got.Status != model.LeaseActive || !got.CredentialAvailable {
-			t.Fatalf("round %d: lease = %q credential_available=%v, want active with credential", round, got.Status, got.CredentialAvailable)
+			t.Fatalf("round %d: request = %q credential_available=%v, want active with a credential", round, got.Status, got.CredentialAvailable)
 		}
-		if _, r := env.fetchCredential("dbl", lease.ID); r.Code != http.StatusOK {
-			t.Fatalf("round %d: winner's credential fetch = %d, want 200", round, r.Code)
+		if rec := a.credential(req.ID); rec.Code != http.StatusOK {
+			t.Fatalf("round %d: the winner's credential fetch = %d, want 200", round, rec.Code)
 		}
 	}
 }
 
-// The post-mint recheck also covers TTL ceilings and the provider.
-func TestActivationRechecksTTLAndProvider(t *testing.T) {
-	ctx := context.Background()
-	cases := []struct {
-		name    string
-		breakIt func(t *testing.T, env *testEnv)
-	}{
-		{"agent max TTL lowered during mint", func(t *testing.T, env *testEnv) {
-			ag, _ := env.srv.db.GetAgent(ctx, env.agentIDs["ttl"])
-			ag.MaxTTLSeconds = 600
-			if err := env.srv.db.UpdateAgent(ctx, ag); err != nil {
-				t.Fatalf("UpdateAgent: %v", err)
-			}
-		}},
-		{"capability max TTL lowered during mint", func(t *testing.T, env *testEnv) {
-			c, _ := env.srv.db.GetCapability(ctx, capcatalog.IDDNSManage)
-			c.DefaultTTLSeconds, c.MaxTTLSeconds = 300, 600
-			if err := env.srv.db.UpdateCapability(ctx, c); err != nil {
-				t.Fatalf("UpdateCapability: %v", err)
-			}
-		}},
-		{"provider disabled during mint", func(t *testing.T, env *testEnv) {
-			p, _ := env.srv.db.GetProvider(ctx, env.providerID)
-			p.Status = model.ProviderDisabled
-			if err := env.srv.db.UpdateProvider(ctx, p); err != nil {
-				t.Fatalf("UpdateProvider: %v", err)
-			}
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			env := newTestEnv(t, true)
-			env.createAgent("ttl", model.RoleMember, nil)
-			lease, rec := env.createLease("ttl", model.CreateLeaseInput{
-				CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "arveykao.com"},
-				TTLSeconds: 1800, Reason: "long lease",
-			})
-			requireStatus(t, rec, http.StatusCreated)
-			env.minter.onMint = func(provider.MintRequest) { tc.breakIt(t, env) }
-			approve := env.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", model.ApproveLeaseInput{Note: "race"})
-			requireErrorCode(t, approve, http.StatusConflict, model.ErrCodeConflict)
-			requireNoLiveCredential(t, env, "ttl", lease.ID, model.LeaseRevoked)
-		})
-	}
+// A request that would be issued automatically is decided by someone else
+// after its pending row is written but before the automatic issue takes the
+// lock. The automatic issue must not mint over that decision.
+func TestAutomaticIssueSkipsARequestDecidedBeforeItsLock(t *testing.T) {
+	t.Run("the owner approved it", func(t *testing.T) {
+		a := newAccessEnv(t, model.RoleGuest)
+		a.srv.hookBeforeAutoLock = func(leaseID string) {
+			requireStatus(t, a.approve(a.mei, leaseID), http.StatusOK)
+		}
+		requireErrorCode(t, a.requestRaw(a.token, accessInput("ecs", "read")), http.StatusConflict, model.ErrCodeConflict)
+		if n := a.minter.requestCount(); n != 1 {
+			t.Fatalf("minted %d times, want 1 (the approval only)", n)
+		}
+		leaseID := a.onlyLeaseID()
+		if got := a.getLease(leaseID); got.Status != model.LeaseActive || got.ApprovedBy == "auto" {
+			t.Fatalf("request = %q approved by %q, want active by the owner", got.Status, got.ApprovedBy)
+		}
+		requireStatus(t, a.credential(leaseID), http.StatusOK)
+	})
+	t.Run("a supervisor denied it", func(t *testing.T) {
+		a := newAccessEnv(t, model.RoleGuest)
+		a.srv.hookBeforeAutoLock = func(leaseID string) {
+			rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+leaseID+"/deny", model.DenyLeaseInput{Reason: "stop"})
+			requireStatus(t, rec, http.StatusOK)
+		}
+		requireErrorCode(t, a.requestRaw(a.token, accessInput("ecs", "read")), http.StatusConflict, model.ErrCodeConflict)
+		if n := a.minter.requestCount(); n != 0 {
+			t.Fatalf("minted %d times for a denied request", n)
+		}
+		leaseID := a.onlyLeaseID()
+		if got := a.getLease(leaseID); got.Status != model.LeaseDenied {
+			t.Fatalf("request = %q, want denied", got.Status)
+		}
+		if rec := a.credential(leaseID); rec.Code == http.StatusOK {
+			t.Fatal("a denied request handed out a credential")
+		}
+	})
 }
 
-// F2: an operator approves an auto-approvable lease after its pending row is
-// written but before auto-approval takes the lease lock. Auto-approval must not
-// mint a second credential over the approved one.
-func TestAutoApprovalSkipsLeaseApprovedBeforeItsLock(t *testing.T) {
-	env := newTestEnv(t, true)
-	env.createAgent("f2", model.RoleGuest, nil)
-	env.srv.hookBeforeAutoLock = func(leaseID string) {
-		r := env.admin(http.MethodPost, "/api/v1/admin/leases/"+leaseID+"/approve", model.ApproveLeaseInput{TTLSeconds: 60, Note: "first"})
-		requireStatus(t, r, http.StatusOK)
-	}
-	_, rec := env.createLease("f2", model.CreateLeaseInput{CapabilityID: capcatalog.IDCloudRead, Reason: "auto vs approve"})
-	requireErrorCode(t, rec, http.StatusConflict, model.ErrCodeConflict)
-
-	if n := env.minter.requestCount(); n != 1 {
-		t.Fatalf("minter called %d times, want 1 (approval only)", n)
-	}
-	leaseID := env.minter.lastRequest(t).LeaseID
-	got := env.getLease(leaseID)
-	if got.Status != model.LeaseActive || got.EffectiveTTLSeconds != 60 {
-		t.Fatalf("lease = %q ttl=%d, want active with the approved 60s", got.Status, got.EffectiveTTLSeconds)
-	}
-	cred, r := env.fetchCredential("f2", leaseID)
-	requireStatus(t, r, http.StatusOK)
-	if want := env.minter.lastRequest(t).DurationSeconds; want != 60 {
-		t.Fatalf("minted duration = %d, want 60", want)
-	}
-	if cred.Credential.AccessKeyID == "" {
-		t.Fatal("approved credential missing")
-	}
-}
-
-// F3: the exact interleaving the review found, for edits that do not take the
-// capability lock (agent and provider). The approval passes its post-mint
-// recheck; the edit commits; the activation write lands; only then does the
-// edit's re-check sweep run. The sweep must see the active lease and revoke it.
+// The exact interleaving an earlier review found. The approval passes its
+// check after minting; an authority change commits; the activation write
+// lands; only then does the change's sweep run. The sweep must see the active
+// request and revoke it.
 func TestChangeBetweenRecheckAndActivationIsEnforced(t *testing.T) {
 	cases := []struct {
 		name   string
 		kind   string
-		change func(env *testEnv) *httptest.ResponseRecorder
+		change func(a *accessEnv) *httptest.ResponseRecorder
 	}{
-		{"agent max TTL lowered", "agent", func(env *testEnv) *httptest.ResponseRecorder {
-			ttl := 600
-			return env.admin(http.MethodPatch, "/api/v1/admin/agents/"+env.agentIDs["f3"], model.UpdateAgentInput{MaxTTLSeconds: &ttl})
+		{"role lowered", "binding", func(a *accessEnv) *httptest.ResponseRecorder {
+			return a.sup.do(http.MethodPut, "/api/v1/supervisor/accounts/"+a.providerID+"/people/"+a.mei.person.ID,
+				model.PutBindingInput{Role: model.RoleGuest})
 		}},
-		{"provider disabled", "provider", func(env *testEnv) *httptest.ResponseRecorder {
-			return env.admin(http.MethodPatch, "/api/v1/admin/providers/"+env.providerID, map[string]any{"status": "disabled"})
+		{"role removed", "binding", func(a *accessEnv) *httptest.ResponseRecorder {
+			return a.sup.do(http.MethodDelete, "/api/v1/supervisor/accounts/"+a.providerID+"/people/"+a.mei.person.ID, nil)
+		}},
+		{"owner suspended", "person", func(a *accessEnv) *httptest.ResponseRecorder {
+			suspended := model.PersonSuspended
+			return a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+a.mei.person.ID, model.UpdatePersonInput{Status: &suspended})
+		}},
+		{"cloud account disabled", "provider", func(a *accessEnv) *httptest.ResponseRecorder {
+			return a.sup.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+a.providerID, map[string]any{"status": "disabled"})
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			env := newTestEnv(t, true)
-			env.createAgent("f3", model.RoleMember, nil)
-			lease, rec := env.createLease("f3", model.CreateLeaseInput{
-				CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "arveykao.com"},
-				TTLSeconds: 1800, Reason: "window",
-			})
-			requireStatus(t, rec, http.StatusCreated)
+			a := newAccessEnv(t, model.RoleMember)
+			req := a.request(accessInput("ecs", "write"))
 
 			rechecked, goActivate := make(chan struct{}), make(chan struct{})
 			committed, goSweep := make(chan struct{}), make(chan struct{})
-			env.srv.hookAfterLeaseRecheck = func(string) { close(rechecked); <-goActivate }
-			env.srv.hookAfterAuthorityWrite = func(kind string) {
+			a.srv.hookAfterLeaseRecheck = func(string) { close(rechecked); <-goActivate }
+			a.srv.hookAfterAuthorityWrite = func(kind string) {
 				if kind == tc.kind {
 					close(committed)
 					<-goSweep
 				}
 			}
 			approveDone := make(chan int, 1)
-			go func() {
-				approveDone <- env.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", model.ApproveLeaseInput{Note: "window"}).Code
-			}()
+			go func() { approveDone <- a.approve(a.mei, req.ID).Code }()
 			<-rechecked
 			changeDone := make(chan int, 1)
-			go func() { changeDone <- tc.change(env).Code }()
+			go func() { changeDone <- tc.change(a).Code }()
 			<-committed
 			close(goActivate)
 			if code := <-approveDone; code != http.StatusOK {
 				t.Fatalf("approval = %d; the interleaving did not happen as intended", code)
 			}
-			if got := env.getLease(lease.ID); got.Status != model.LeaseActive {
-				t.Fatalf("lease before the sweep = %q, want active", got.Status)
+			if got := a.getLease(req.ID); got.Status != model.LeaseActive {
+				t.Fatalf("request before the sweep = %q, want active", got.Status)
 			}
 			close(goSweep)
 			if code := <-changeDone; code != http.StatusOK {
-				t.Fatalf("edit = %d, want 200", code)
+				t.Fatalf("change = %d, want 200", code)
 			}
-			if got := env.getLease(lease.ID); got.Status != model.LeaseRevoked {
-				t.Fatalf("lease after %s = %q, want revoked by the edit's sweep", tc.name, got.Status)
+			if got := a.getLease(req.ID); got.Status != model.LeaseRevoked {
+				t.Fatalf("request after %s = %q, want revoked by the change's sweep", tc.name, got.Status)
 			}
-		})
-	}
-}
-
-// Capability edits take the capability's write lock, so they cannot commit
-// while an approval of one of its leases is between reading the capability and
-// activating. The edit waits, then its sweep applies to the now-active lease.
-// For a narrowed policy this is what keeps a lease from being "pending when the
-// edit committed, then activated with the old policy" (review 4, finding 1).
-func TestCapabilityEditWaitsForInFlightActivation(t *testing.T) {
-	cases := []struct {
-		name        string
-		body        map[string]any
-		wantRevoked bool
-	}{
-		{"disabled", map[string]any{"enabled": false}, true},
-		{"max TTL lowered", map[string]any{"default_ttl_seconds": 300, "max_ttl_seconds": 600}, true},
-		// The approval finished before the narrowing committed, so its lease
-		// was legitimately approved under the old definition and stays.
-		{"policy narrowed", map[string]any{"policy_template": `{"Version":"1","Statement":[{"Effect":"Allow","Action":["oss:ListBuckets"],"Resource":["*"]}]}`, "params": []any{}}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			env := newTestEnv(t, true)
-			env.createAgent("cw", model.RoleAdministrator, nil)
-			custom := env.admin(http.MethodPost, "/api/v1/admin/capabilities", map[string]any{
-				"name": "custom write", "risk": "medium", "access": "write",
-				"policy_template":     `{"Version":"1","Statement":[{"Effect":"Allow","Action":["oss:PutObject","oss:ListBuckets"],"Resource":["*"]}]}`,
-				"default_ttl_seconds": 900, "max_ttl_seconds": 1800,
-			})
-			requireStatus(t, custom, http.StatusCreated)
-			capID := decodeEnvelope[model.Capability](t, custom).ID
-			ag, _ := env.srv.db.GetAgent(context.Background(), env.agentIDs["cw"])
-			grants := append(ag.Grants, capID)
-			env.patchAgent("cw", model.UpdateAgentInput{Grants: &grants})
-			lease, rec := env.createLease("cw", model.CreateLeaseInput{CapabilityID: capID, TTLSeconds: 1800, Reason: "edit wait"})
-			requireStatus(t, rec, http.StatusCreated)
-			if lease.Status != model.LeasePending {
-				t.Fatalf("lease = %q, want pending", lease.Status)
-			}
-
-			rechecked, goActivate := make(chan struct{}), make(chan struct{})
-			committed := make(chan struct{}, 1)
-			env.srv.hookAfterLeaseRecheck = func(string) { close(rechecked); <-goActivate }
-			env.srv.hookAfterAuthorityWrite = func(kind string) {
-				if kind == "capability" {
-					committed <- struct{}{}
-				}
-			}
-			approveDone := make(chan int, 1)
-			go func() {
-				approveDone <- env.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", model.ApproveLeaseInput{Note: "edit wait"}).Code
-			}()
-			<-rechecked
-			editDone := make(chan int, 1)
-			go func() { editDone <- env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+capID, tc.body).Code }()
-			select {
-			case <-committed:
-				t.Fatal("capability edit committed while an activation of its lease was in flight")
-			case <-time.After(150 * time.Millisecond):
-			}
-			close(goActivate)
-			if code := <-approveDone; code != http.StatusOK {
-				t.Fatalf("approval = %d, want 200", code)
-			}
-			if code := <-editDone; code != http.StatusOK {
-				t.Fatalf("edit = %d, want 200", code)
-			}
-			got := env.getLease(lease.ID)
-			if tc.wantRevoked && got.Status != model.LeaseRevoked {
-				t.Fatalf("lease after %s = %q, want revoked", tc.name, got.Status)
-			}
-			if !tc.wantRevoked && got.Status != model.LeaseActive {
-				t.Fatalf("lease after %s = %q, want active (approved before the edit)", tc.name, got.Status)
+			if rec := a.credential(req.ID); rec.Code == http.StatusOK {
+				t.Fatalf("credential handed out after %s", tc.name)
 			}
 		})
 	}
 }
 
-// Auto-approval decided against an earlier read of the capability; if the
-// capability changed before it takes the capability lock, it must not mint.
-func TestAutoApprovalAbortsWhenCapabilityChangedBeforeMint(t *testing.T) {
-	env := newTestEnv(t, true)
-	env.createAgent("ac", model.RoleGuest, nil)
-	env.srv.hookBeforeAutoLock = func(string) {
-		r := env.admin(http.MethodPatch, "/api/v1/admin/capabilities/"+capcatalog.IDCloudRead, map[string]any{"description": "unchanged grant"})
-		requireStatus(t, r, http.StatusOK)
-		// A real narrowing of a builtin is not possible through the API, so
-		// change what it grants directly in the store.
-		c, _ := env.srv.db.GetCapability(context.Background(), capcatalog.IDCloudRead)
-		c.MaxTTLSeconds = 1200
-		if err := env.srv.db.UpdateCapability(context.Background(), c); err != nil {
-			t.Fatalf("UpdateCapability: %v", err)
-		}
-	}
-	_, rec := env.createLease("ac", model.CreateLeaseInput{CapabilityID: capcatalog.IDCloudRead, Reason: "auto vs edit"})
-	requireErrorCode(t, rec, http.StatusConflict, model.ErrCodeConflict)
-	if n := env.minter.requestCount(); n != 0 {
-		t.Fatalf("minter called %d times after the capability changed, want 0", n)
-	}
-}
-
-// Review 5, F5-1: an authority sweep must see every affected lease even while
-// other leases leave the pending/active set during the sweep. With LIMIT/OFFSET
+// An authority sweep must see every affected request even while other
+// requests leave the pending/active set during the sweep. With LIMIT/OFFSET
 // paging, rows shifted between pages were skipped.
 func TestSuspensionSweepSeesEveryLeaseDuringConcurrentExpiry(t *testing.T) {
 	ctx := context.Background()
-	env := newTestEnv(t, true)
-	env.createAgent("many", model.RoleMember, nil)
-	agentID := env.agentIDs["many"]
-	now := env.clock.Now()
+	a := newAccessEnv(t, model.RoleMember)
+	template := a.getLease(a.request(accessInput("ecs", "read")).ID)
+	now := a.clock.Now()
 	expires := now.Add(15 * time.Minute)
 	const total = 2500
 	ids := make([]string, 0, total)
 	for i := 0; i < total; i++ {
-		id := fmt.Sprintf("lea_many_%05d", i)
+		lease := template
+		lease.ID = fmt.Sprintf("lea_many_%05d", i)
 		created := now.Add(time.Duration(i) * time.Millisecond)
-		if err := env.srv.db.CreateLease(ctx, model.Lease{
-			ID: id, AgentID: agentID, AgentName: "many", CapabilityID: capcatalog.IDDNSManage,
-			ProviderID: env.providerID, ProviderMode: model.ModeMock, Risk: model.RiskMedium,
-			Status: model.LeaseActive, EffectiveTTLSeconds: 900, CreatedAt: created, IssuedAt: &created, ExpiresAt: &expires,
-		}); err != nil {
+		lease.CreatedAt, lease.IssuedAt, lease.ExpiresAt = created, &created, &expires
+		if err := a.srv.db.CreateLease(ctx, lease); err != nil {
 			t.Fatalf("CreateLease: %v", err)
 		}
-		ids = append(ids, id)
+		ids = append(ids, lease.ID)
 	}
-	// Concurrently move the 200 newest leases to expired while the sweep runs.
+	// Concurrently move the 200 newest to expired while the sweep runs.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := total - 1; i >= total-200; i-- {
-			l, err := env.srv.db.GetLease(ctx, ids[i])
+			l, err := a.srv.db.GetLease(ctx, ids[i])
 			if err != nil {
 				continue
 			}
 			l.Status = model.LeaseExpired
-			_ = env.srv.db.UpdateLeaseIfStatus(ctx, l, model.LeaseActive)
+			_ = a.srv.db.UpdateLeaseIfStatus(ctx, l, model.LeaseActive)
 		}
 	}()
-	requireStatus(t, env.admin(http.MethodPost, "/api/v1/admin/agents/"+agentID+"/suspend", nil), http.StatusOK)
+	suspended := model.PersonSuspended
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+a.mei.person.ID,
+		model.UpdatePersonInput{Status: &suspended}), http.StatusOK)
 	<-done
 
-	left, err := env.srv.db.ListAllLeases(ctx, store.LeaseFilter{
-		AgentID: agentID, Statuses: []model.LeaseStatus{model.LeasePending, model.LeaseActive},
+	left, err := a.srv.db.ListAllLeases(ctx, store.LeaseFilter{
+		AgentID: a.agent.ID, Statuses: []model.LeaseStatus{model.LeasePending, model.LeaseActive},
 	})
 	if err != nil {
 		t.Fatalf("ListAllLeases: %v", err)
 	}
 	if len(left) != 0 {
-		t.Fatalf("%d leases of the suspended agent are still pending/active (e.g. %s)", len(left), left[0].ID)
+		t.Fatalf("%d requests of the suspended owner's agent are still pending or active (e.g. %s)", len(left), left[0].ID)
 	}
 }

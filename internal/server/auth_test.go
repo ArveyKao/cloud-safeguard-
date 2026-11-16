@@ -381,11 +381,9 @@ func TestSupervisorRoutesNeedASupervisorSession(t *testing.T) {
 	requireStatus(t, env.request(http.MethodGet, path, nil, nil, nil), http.StatusUnauthorized)
 	requireStatus(t, mei.do(http.MethodGet, path, nil), http.StatusForbidden)
 	requireStatus(t, mei.do(http.MethodPost, path, model.CreatePersonInput{Username: "jun"}), http.StatusForbidden)
-	// The legacy admin token and agent tokens are not sessions.
-	requireStatus(t, env.do(http.MethodGet, path, env.adminToken, nil), http.StatusUnauthorized)
-	requireStatus(t, env.do(http.MethodGet, path, env.agentTokens[demoAgentClaudeCode], nil), http.StatusUnauthorized)
-	// A session is not an admin or agent token.
-	requireStatus(t, sup.do(http.MethodGet, "/api/v1/admin/agents", nil), http.StatusUnauthorized)
+	// Agent tokens are not sessions, and a session is not an agent token.
+	_, agentToken := env.signInAgent(mei, "mei-agent")
+	requireStatus(t, env.do(http.MethodGet, path, agentToken, nil), http.StatusUnauthorized)
 	requireStatus(t, sup.do(http.MethodGet, "/api/v1/agent/me", nil), http.StatusUnauthorized)
 
 	// Listed people never carry authentication material.
@@ -547,18 +545,6 @@ func TestRecoverSupervisor(t *testing.T) {
 	}
 	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: t.TempDir(), Username: "admin"}); err == nil {
 		t.Fatal("recovery ran on an uninitialized directory")
-	}
-}
-
-func TestInitForceKeepsExistingSupervisor(t *testing.T) {
-	env := newTestEnv(t, false)
-	env.supervisorClient()
-	res, err := Init(context.Background(), InitOptions{DataDir: env.dir, Force: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Supervisor != nil {
-		t.Fatal("init --force issued a second supervisor")
 	}
 }
 

@@ -530,16 +530,6 @@ func TestLeaseCRUDAndQueries(t *testing.T) {
 	if n, err := db.CountLeasesSince(ctx, "agt_test1", testTime.Add(15*time.Second)); err != nil || n != 2 {
 		t.Fatalf("CountLeasesSince = %d, %v", n, err)
 	}
-	risk, err := db.CountLeasesByRisk(ctx, []model.LeaseStatus{model.LeasePending, model.LeaseActive})
-	if err != nil {
-		t.Fatalf("CountLeasesByRisk: %v", err)
-	}
-	if risk.Low != 3 { // two pending + one still-active lease
-		t.Fatalf("risk breakdown low = %d, want 3", risk.Low)
-	}
-	if n, err := db.CountLeasesCreatedSinceByStatus(ctx, model.LeaseDenied, testTime); err != nil || n != 1 {
-		t.Fatalf("CountLeasesCreatedSinceByStatus = %d, %v", n, err)
-	}
 }
 
 func TestPolicySettings(t *testing.T) {
@@ -555,18 +545,18 @@ func TestPolicySettings(t *testing.T) {
 	}
 
 	s := model.DefaultPolicySettings()
-	s.AutoApproveMaxRisk = model.RiskMedium
+	s.PendingTimeoutSeconds = 300
 	s.MaxLeaseTTLSeconds = 7200
 	if err := db.SetPolicySettings(ctx, s); err != nil {
 		t.Fatalf("SetPolicySettings: %v", err)
 	}
 	got, _ = db.GetPolicySettings(ctx)
-	if got.AutoApproveMaxRisk != model.RiskMedium || got.MaxLeaseTTLSeconds != 7200 {
+	if got.PendingTimeoutSeconds != 300 || got.MaxLeaseTTLSeconds != 7200 {
 		t.Fatalf("settings not persisted: %+v", got)
 	}
 
 	bad := model.DefaultPolicySettings()
-	bad.AutoApproveMaxRisk = "nonsense"
+	bad.PendingTimeoutSeconds = 0
 	if err := db.SetPolicySettings(ctx, bad); err == nil {
 		t.Fatal("SetPolicySettings accepted invalid settings")
 	}

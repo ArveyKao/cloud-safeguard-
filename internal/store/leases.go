@@ -352,65 +352,6 @@ func (db *DB) listLeasesByStatus(ctx context.Context, status model.LeaseStatus) 
 	return out, nil
 }
 
-// CountLeasesByRisk counts leases in the given statuses grouped by risk tier.
-// It backs the dashboard risk breakdown (not part of the frozen Store interface).
-func (db *DB) CountLeasesByRisk(ctx context.Context, statuses []model.LeaseStatus) (model.RiskBreakdown, error) {
-	var out model.RiskBreakdown
-	if len(statuses) == 0 {
-		return out, nil
-	}
-	placeholders := make([]string, 0, len(statuses))
-	args := make([]any, 0, len(statuses))
-	for _, s := range statuses {
-		placeholders = append(placeholders, "?")
-		args = append(args, string(s))
-	}
-	rows, err := db.sql.QueryContext(ctx,
-		`SELECT risk, COUNT(*) FROM leases WHERE status IN (`+strings.Join(placeholders, ", ")+`) GROUP BY risk`,
-		args...)
-	if err != nil {
-		return out, mapErr(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			risk string
-			n    int
-		)
-		if err := rows.Scan(&risk, &n); err != nil {
-			return out, mapErr(err)
-		}
-		switch model.RiskTier(risk) {
-		case model.RiskLow:
-			out.Low += n
-		case model.RiskMedium:
-			out.Medium += n
-		case model.RiskHigh:
-			out.High += n
-		case model.RiskCritical:
-			out.Critical += n
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return out, mapErr(err)
-	}
-	return out, nil
-}
-
-// CountLeasesCreatedSinceByStatus counts leases with one status created since
-// the given time (dashboard "denied in last 24h" counter). It is a concrete-DB
-// extension, not part of the frozen Store interface.
-func (db *DB) CountLeasesCreatedSinceByStatus(ctx context.Context, status model.LeaseStatus, since time.Time) (int, error) {
-	var n int
-	err := db.sql.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM leases WHERE status = ? AND created_at >= ?`,
-		string(status), toMillis(since)).Scan(&n)
-	if err != nil {
-		return 0, mapErr(err)
-	}
-	return n, nil
-}
-
 // pageParams normalizes pagination: default limit 50, cap 200, offset >= 0.
 func pageParams(limit, offset int) (int, int) {
 	if limit <= 0 {

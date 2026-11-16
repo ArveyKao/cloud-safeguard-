@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
 	"github.com/arveykao/cloud-safeguard/internal/store"
@@ -194,7 +193,7 @@ func TestWriteAndFullWaitForTheOwner(t *testing.T) {
 			}
 
 			// Nobody but the owner approves: not another administrator of
-			// the account, not a supervisor, not the operator token.
+			// the account and not a supervisor, who has no approve route.
 			for name, rec := range map[string]*httptest.ResponseRecorder{
 				"other administrator": a.approve(jun, req.ID),
 				"supervisor":          a.approve(a.sup, req.ID),
@@ -205,7 +204,7 @@ func TestWriteAndFullWaitForTheOwner(t *testing.T) {
 					t.Errorf("%s: status %d", name, rec.Code)
 				}
 			}
-			requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+req.ID+"/approve", nil), http.StatusConflict)
+			requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+req.ID+"/approve", nil), http.StatusNotFound)
 			if rec := jun.do(http.MethodGet, "/api/v1/me/requests", nil); decodeEnvelope[listData[model.AccessRequest]](t, rec).Total != 0 {
 				t.Error("another person sees the request")
 			}
@@ -289,11 +288,6 @@ func TestAccessRequestValidation(t *testing.T) {
 		t.Fatalf("responses differ:\n%s\n%s", unbound.Body.String(), unknown.Body.String())
 	}
 
-	// Agents without an owner cannot use access requests, and the old
-	// capability request cannot name an access template.
-	requireStatus(t, a.requestRaw(a.agentTokens[demoAgentClaudeCode], accessInput("ecs", "read")), http.StatusForbidden)
-	requireStatus(t, a.do(http.MethodPost, "/api/v1/agent/leases", a.agentTokens[demoAgentClaudeCode],
-		model.CreateLeaseInput{CapabilityID: "aliyun.access.ecs.full", Params: map[string]string{"resource_name": "*"}}), http.StatusNotFound)
 	requireStatus(t, a.requestRaw("", accessInput("ecs", "read")), http.StatusUnauthorized)
 	if a.leaseCount() != before {
 		t.Fatal("a refused request left a record")
@@ -459,7 +453,7 @@ func (a *accessEnv) request2(p *personClient, id string) *httptest.ResponseRecor
 	return a.testEnv.request(http.MethodPost, "/api/v1/me/requests/"+id+"/approve", p.cookie, nil, nil)
 }
 
-func TestAgentAccountsAndReservedIDs(t *testing.T) {
+func TestAgentAccounts(t *testing.T) {
 	a := newAccessEnv(t, model.RoleMember)
 	rec := a.do(http.MethodGet, "/api/v1/agent/accounts", a.token, nil)
 	requireStatus(t, rec, http.StatusOK)
@@ -468,32 +462,19 @@ func TestAgentAccountsAndReservedIDs(t *testing.T) {
 		list.Items[0].HighestPermission != "write" || strings.Join(list.Items[0].Resources, ",") != "dns,ecs,oss" {
 		t.Fatalf("accounts = %+v", list)
 	}
-	rec = a.do(http.MethodGet, "/api/v1/agent/accounts", a.agentTokens[demoAgentHermes], nil)
-	if decodeEnvelope[listData[model.AgentAccount]](t, rec).Total != 0 {
-		t.Fatal("an agent without an owner sees accounts")
-	}
-
-	// The operator cannot define a capability under a reserved ID.
-	tpl, _ := capcatalog.LookupAccessTemplate(model.ProviderAliyun, "ecs", capcatalog.PermissionRead)
-	forged := tpl.Capability
-	forged.PolicyTemplate = `{"Version":"1","Statement":[{"Effect":"Allow","Action":["ecs:DeleteInstance"],"Resource":["*"]}]}`
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/capabilities", forged), http.StatusBadRequest)
-	if _, err := a.srv.db.GetCapability(context.Background(), forged.ID); err == nil {
-		t.Fatal("a capability with a reserved ID was stored")
-	}
 }
 
 func TestCloudAccountIsFixedPerProvider(t *testing.T) {
 	a := newAccessEnv(t, "")
 	other := "acs:ram::6543210987654321:role/elsewhere"
-	rec := a.admin(http.MethodPatch, "/api/v1/admin/providers/"+a.providerID, model.UpdateProviderInput{RoleARN: &other})
+	rec := a.sup.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+a.providerID, model.UpdateProviderInput{RoleARN: &other})
 	requireStatus(t, rec, http.StatusConflict)
 	same := "acs:ram::" + demoAccountID + ":role/another-role"
-	requireStatus(t, a.admin(http.MethodPatch, "/api/v1/admin/providers/"+a.providerID, model.UpdateProviderInput{RoleARN: &same}), http.StatusOK)
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+a.providerID, model.UpdateProviderInput{RoleARN: &same}), http.StatusOK)
 
 	dup := model.CreateProviderInput{Name: "dup", Type: model.ProviderAliyun, Mode: model.ModeMock, Region: "cn-hangzhou",
 		RoleARN: "acs:ram::" + demoAccountID + ":role/dup", AccessKeyID: "LTAI5tDupDupDupDup", AccessKeySecret: "placeholder-secret-value"}
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/providers", dup), http.StatusConflict)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", dup), http.StatusConflict)
 	for arn, want := range map[string]string{
 		"acs:ram::1234567890123456:role/x": "1234567890123456", "acs:ram::12:role/x": "", "arn:aws:iam::1:role/x": "",
 		"acs:ram::1234567890123456:user/x": "", "": "", "acs:ram::1234567890123456:role/": "",
@@ -504,52 +485,47 @@ func TestCloudAccountIsFixedPerProvider(t *testing.T) {
 	}
 }
 
-// An agent that belongs to a person has no role or grants of its own and
-// cannot use the older capability request; a person decides access requests
-// only, never the operator's capability leases.
-func TestOwnedAgentsAndOperatorLeasesStayApart(t *testing.T) {
+// The capability-lease API of the removed agent model is gone: nothing
+// answers on its routes, with an agent token or with the old admin token.
+func TestRemovedCapabilityAndAdminRoutesAreGone(t *testing.T) {
 	a := newAccessEnv(t, model.RoleAdministrator)
-	role, grants := model.RoleMember, []string{capcatalog.IDDNSManage}
-	requireStatus(t, a.admin(http.MethodPatch, "/api/v1/admin/agents/"+a.agent.ID, model.UpdateAgentInput{Role: &role}), http.StatusConflict)
-	requireStatus(t, a.admin(http.MethodPatch, "/api/v1/admin/agents/"+a.agent.ID, model.UpdateAgentInput{Grants: &grants}), http.StatusConflict)
-	stored, _ := a.srv.db.GetAgent(context.Background(), a.agent.ID)
-	if stored.Role != model.RoleGuest || len(stored.Grants) != 0 {
-		t.Fatalf("owned agent got a role or grants: %+v", stored)
-	}
-	old := model.CreateLeaseInput{CapabilityID: capcatalog.IDCloudRead, Reason: "look"}
-	requireErrorCode(t, a.do(http.MethodPost, "/api/v1/agent/leases", a.token, old), http.StatusForbidden, model.ErrCodeForbidden)
+	before := a.leaseCount()
+	old := map[string]any{"capability_id": "aliyun.cloud.read", "reason": "look"}
+	requireStatus(t, a.do(http.MethodPost, "/api/v1/agent/leases", a.token, old), http.StatusNotFound)
+	requireStatus(t, a.do(http.MethodGet, "/api/v1/agent/capabilities", a.token, nil), http.StatusNotFound)
+	template := map[string]any{"capability_id": "aliyun.access.ecs.full", "params": map[string]string{"resource_name": "*"}}
+	requireStatus(t, a.do(http.MethodPost, "/api/v1/agent/leases", a.token, template), http.StatusNotFound)
 
-	// A pending capability lease of an agent without an owner.
-	rec := a.do(http.MethodPost, "/api/v1/agent/leases", a.agentTokens[demoAgentClaudeCode], model.CreateLeaseInput{
-		CapabilityID: capcatalog.IDDNSManage, Params: map[string]string{"domain": "example.com"}, Reason: "dns change",
-	})
-	requireStatus(t, rec, http.StatusCreated)
-	lease := decodeEnvelope[model.Lease](t, rec)
-	if lease.Status != model.LeasePending {
-		t.Fatalf("lease status = %s", lease.Status)
+	const oldAdminToken = "csg_adm_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	for _, path := range []string{"/api/v1/admin/login", "/api/v1/admin/providers", "/api/v1/admin/agents",
+		"/api/v1/admin/capabilities", "/api/v1/admin/leases", "/api/v1/admin/policy", "/api/v1/admin/audit"} {
+		for _, method := range []string{http.MethodGet, http.MethodPost} {
+			if code := a.do(method, path, oldAdminToken, nil).Code; code != http.StatusNotFound {
+				t.Errorf("%s %s with an admin token = %d", method, path, code)
+			}
+			if code := a.sup.do(method, path, nil).Code; code != http.StatusNotFound {
+				t.Errorf("%s %s as a supervisor = %d", method, path, code)
+			}
+		}
 	}
-	for _, action := range []string{"approve", "deny", "revoke"} {
-		requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/requests/"+lease.ID+"/"+action, nil), http.StatusNotFound)
-		requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/me/requests/"+lease.ID+"/"+action, nil), http.StatusNotFound)
+	// An admin token is no credential anywhere else either.
+	requireStatus(t, a.do(http.MethodGet, "/api/v1/supervisor/accounts", oldAdminToken, nil), http.StatusUnauthorized)
+	requireStatus(t, a.do(http.MethodGet, "/api/v1/agent/me", oldAdminToken, nil), http.StatusUnauthorized)
+	requireStatus(t, a.do(http.MethodGet, "/api/v1/me/requests", oldAdminToken, nil), http.StatusUnauthorized)
+	if a.leaseCount() != before || a.minter.requestCount() != 0 {
+		t.Fatal("a removed route created a lease")
 	}
-	if a.status(lease.ID) != model.LeasePending || a.minter.requestCount() != 0 {
-		t.Fatal("a person decided an operator lease")
-	}
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+lease.ID+"/approve", nil), http.StatusOK)
 }
 
-// A capability lease held by an owned agent (made before the rule, or put
-// there behind the API) does not follow the owner's role, so it ends at the
-// next re-check and its credential is not handed out.
+// A capability lease left over from the removed model (or put there behind
+// the API) is not an access request, so its credential is never handed out
+// and it ends at the next re-check.
 func TestLegacyLeaseOfOwnedAgentEnds(t *testing.T) {
 	a := newAccessEnv(t, model.RoleMember)
 	ctx := context.Background()
-	if _, err := a.srv.db.SQL().Exec(`UPDATE agents SET role = 'member', grants_json = '["aliyun.cloud.read"]' WHERE id = ?`, a.agent.ID); err != nil {
-		t.Fatal(err)
-	}
 	now := a.clock.Now()
 	expires := now.Add(10 * time.Minute)
-	lease := model.Lease{ID: "lea_legacy", AgentID: a.agent.ID, AgentName: a.agent.Name, CapabilityID: capcatalog.IDCloudRead,
+	lease := model.Lease{ID: "lea_legacy", AgentID: a.agent.ID, AgentName: a.agent.Name, CapabilityID: "aliyun.cloud.read",
 		ProviderID: a.providerID, Status: model.LeaseActive, RequestedTTLSeconds: 600, EffectiveTTLSeconds: 600,
 		CreatedAt: now, IssuedAt: &now, ExpiresAt: &expires, CredentialAvailable: true}
 	if err := a.srv.db.CreateLease(ctx, lease); err != nil {
@@ -643,7 +619,7 @@ func TestInputSizesAreBounded(t *testing.T) {
 	req := a.request(accessInput("ecs", "read"))
 	long := model.RevokeLeaseInput{Reason: strings.Repeat("x", 501)}
 	requireStatus(t, a.do(http.MethodPost, "/api/v1/agent/leases/"+req.ID+"/revoke", a.token, long), http.StatusBadRequest)
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+req.ID+"/revoke", long), http.StatusBadRequest)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+req.ID+"/revoke", long), http.StatusBadRequest)
 	if a.status(req.ID) != model.LeaseActive {
 		t.Fatal("a refused revoke changed the lease")
 	}
@@ -671,7 +647,7 @@ func TestApprovalNoteIsNotShownToTheAgent(t *testing.T) {
 // A role on one cloud account gives nothing on another.
 func TestRoleOnOneAccountDoesNotReachAnother(t *testing.T) {
 	a := newAccessEnv(t, model.RoleAdministrator)
-	rec := a.admin(http.MethodPost, "/api/v1/admin/providers", model.CreateProviderInput{
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", model.CreateProviderInput{
 		Name: "second", Type: model.ProviderAliyun, Mode: model.ModeMock, Region: "cn-hangzhou",
 		RoleARN: "acs:ram::6543210987654321:role/csg", AccessKeyID: "LTAI5tSecondAccount", AccessKeySecret: "placeholder-secret-value"})
 	requireStatus(t, rec, http.StatusCreated)
@@ -693,9 +669,9 @@ func TestRoleOnOneAccountDoesNotReachAnother(t *testing.T) {
 	}
 }
 
-// Revocations caused by a role change name the supervisor who made it. The
-// operator can stop an access request but never grant one.
-func TestRevocationAttributionAndOperatorLimits(t *testing.T) {
+// Revocations caused by a role change name the supervisor who made it. A
+// supervisor can stop an access request but never grant one.
+func TestRevocationAttributionAndSupervisorLimits(t *testing.T) {
 	a := newAccessEnv(t, model.RoleMember)
 	write := a.request(accessInput("ecs", "write"))
 	requireStatus(t, a.approve(a.mei, write.ID), http.StatusOK)
@@ -712,11 +688,11 @@ func TestRevocationAttributionAndOperatorLimits(t *testing.T) {
 
 	a.bind(a.mei, model.RoleMember)
 	pending := a.request(accessInput("ecs", "write"))
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/approve", nil), http.StatusConflict)
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/deny", model.DenyLeaseInput{Reason: "stop"}), http.StatusOK)
-	requireStatus(t, a.admin(http.MethodPost, "/api/v1/admin/leases/"+pending.ID+"/deny", model.DenyLeaseInput{Reason: "again"}), http.StatusConflict)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+pending.ID+"/approve", nil), http.StatusNotFound)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+pending.ID+"/deny", model.DenyLeaseInput{Reason: "stop"}), http.StatusOK)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+pending.ID+"/deny", model.DenyLeaseInput{Reason: "again"}), http.StatusConflict)
 	requireStatus(t, a.approve(a.mei, pending.ID), http.StatusConflict)
 	if a.status(pending.ID) != model.LeaseDenied || a.minter.requestCount() != 1 {
-		t.Fatal("a request the operator stopped was issued")
+		t.Fatal("a request a supervisor stopped was issued")
 	}
 }

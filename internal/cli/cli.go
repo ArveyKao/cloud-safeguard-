@@ -1,5 +1,5 @@
-// Package cli implements the csg command-line interface: the operator/admin
-// commands, the agent-side lease workflow and the local init/serve commands.
+// Package cli implements the csg command-line interface: the agent-side
+// access workflow, the MCP server and the local init/serve commands.
 //
 // The CLI is a thin client of the HTTP control plane for everything except
 // `init` and `serve`; this keeps the server authoritative for policy, limits,
@@ -146,20 +146,8 @@ func (a *App) Run(args []string) int {
 		err = a.runLogin(rest)
 	case "whoami":
 		err = a.runWhoami(rest)
-	case "caps":
-		err = a.runCaps(rest)
-	case "agents":
-		err = a.runAgents(rest)
-	case "providers":
-		err = a.runProviders(rest)
 	case "leases":
 		err = a.runLeases(rest)
-	case "audit":
-		err = a.runAudit(rest)
-	case "policy":
-		err = a.runPolicy(rest)
-	case "request":
-		err = a.runRequest(rest)
 	case "credential":
 		err = a.runCredential(rest)
 	case "exec":
@@ -218,36 +206,25 @@ func (a *App) printUsage(w io.Writer) {
 
 Usage: csg <command> [flags]
 
-Local:
-  init       Bootstrap a data directory (admin token shown once)
-  serve      Run the control plane and embedded console
-  supervisor recover  Restore a locked-out supervisor (run on the server host)
+Local (run on the server host):
+  init       Bootstrap a data directory (the first supervisor's setup code is shown once)
+  serve      Run the control plane and the console
+  supervisor recover  Restore a locked-out supervisor
   version    Print the version
 
-Authentication:
-  login      Sign this agent in (a person approves a short code), or save a token
-  whoami     Show the current identity
-
-Agent (signed in with csg login):
+Agent:
+  login      Sign this agent in: a person approves a short code in the console
+  whoami     Show the signed-in agent
   accounts   Cloud accounts you may ask for, with your owner's role
   access     request | status: ask for read, write or full access
   exec       Ask for access and run a command with the credential env
+  credential Fetch the credential of an approved request
+  revoke     Give a credential back before it expires
+  leases     mine | get ID: this agent's requests
   mcp        Run the MCP server for Claude, Cursor and other agents
 
-Admin:
-  caps       list | show ID
-  agents     list | get ID | create | set-role ID ROLE | suspend ID | activate ID | rotate-token ID
-  providers  list | get ID | add | update ID | rotate ID | test ID
-  leases     list | get ID | approve ID | deny ID | revoke ID
-  audit      list | verify
-  policy     show | set
-
-Agent (older capability leases):
-  request    Request a capability lease
-  credential Fetch the credential for a lease
-  exec       Request a lease and run a command with the credential env
-  leases mine  List my leases
-  revoke     Revoke a lease you own
+People sign in to the console to approve requests and to manage cloud
+accounts, people and settings.
 
 Demo:
   mock request METHOD /v1/PATH [JSON_BODY]

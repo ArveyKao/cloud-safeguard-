@@ -168,17 +168,17 @@ func TestUsageExitCodes(t *testing.T) {
 	}{
 		{"no args", nil},
 		{"unknown command", []string{"frobnicate"}},
-		{"caps without subcommand", []string{"caps"}},
-		{"agents unknown sub", []string{"agents", "explode"}},
+		{"removed admin command", []string{"providers", "list"}},
+		{"removed capability request", []string{"request", "--capability", "aliyun.cloud.read"}},
 		{"leases without sub", []string{"leases"}},
-		{"audit without sub", []string{"audit"}},
-		{"policy without sub", []string{"policy"}},
+		{"leases unknown sub", []string{"leases", "approve", "lea_1"}},
 		{"mock without sub", []string{"mock"}},
-		{"request without capability", []string{"request"}},
 		{"credential without lease", []string{"credential"}},
 		{"revoke without lease", []string{"revoke"}},
-		{"exec without separator", []string{"exec", "--capability", "aliyun.cloud.read"}},
-		{"exec without command", []string{"exec", "--capability", "aliyun.cloud.read", "--"}},
+		{"exec without separator", []string{"exec", "--account", "1234567890123456"}},
+		{"exec without command", []string{"exec", "--account", "1234567890123456", "--"}},
+		{"exec without account", []string{"exec", "--", "true"}},
+		{"exec with the removed capability flag", []string{"exec", "--capability", "aliyun.cloud.read", "--", "true"}},
 		{"login without flags", []string{"login"}},
 		{"version with args", []string{"version", "extra"}},
 	}
@@ -201,7 +201,7 @@ func TestHelpSucceeds(t *testing.T) {
 	if code := ta.run("help"); code != ExitOK {
 		t.Fatalf("help exit = %d", code)
 	}
-	for _, want := range []string{"init", "serve", "request", "credential", "exec", "audit"} {
+	for _, want := range []string{"init", "serve", "login", "accounts", "access", "credential", "exec", "mcp"} {
 		if !strings.Contains(ta.out(), want) {
 			t.Fatalf("help output missing %q", want)
 		}
@@ -251,55 +251,6 @@ func TestParseOptionalDurationSeconds(t *testing.T) {
 	}
 	if got, err := parseOptionalDurationSeconds("10m"); err != nil || got != 600 {
 		t.Fatalf("optional 10m = (%d, %v)", got, err)
-	}
-}
-
-func TestParseRiskTier(t *testing.T) {
-	for _, want := range []model.RiskTier{model.RiskLow, model.RiskMedium, model.RiskHigh, model.RiskCritical} {
-		got, err := parseRiskTier(strings.ToUpper(string(want)))
-		if err != nil || got != want {
-			t.Fatalf("parseRiskTier(%q) = (%v, %v)", want, got, err)
-		}
-	}
-	if _, err := parseRiskTier("extreme"); err == nil {
-		t.Fatal("parseRiskTier(extreme) = nil error")
-	}
-}
-
-func TestParamValues(t *testing.T) {
-	var params paramValues
-	for _, input := range []string{"domain=arveykao.com", "instance_id=i-2ze0demo001"} {
-		if err := params.Set(input); err != nil {
-			t.Fatalf("Set(%q) error = %v", input, err)
-		}
-	}
-	got := params.mapValue()
-	if got["domain"] != "arveykao.com" || got["instance_id"] != "i-2ze0demo001" {
-		t.Fatalf("params = %v", got)
-	}
-	var bad paramValues
-	if err := bad.Set("noequals"); err == nil {
-		t.Fatal("Set(noequals) = nil error")
-	}
-	if err := bad.Set("=value"); err == nil {
-		t.Fatal("Set(=value) = nil error")
-	}
-	if empty := (paramValues{}).mapValue(); empty != nil {
-		t.Fatalf("empty params map = %v, want nil", empty)
-	}
-}
-
-func TestStringSliceFlag(t *testing.T) {
-	var grants stringSliceFlag
-	if err := grants.Set("aliyun.cloud.read, aliyun.dns.manage"); err != nil {
-		t.Fatalf("Set error = %v", err)
-	}
-	if err := grants.Set("aliyun.cert.dns01"); err != nil {
-		t.Fatalf("Set error = %v", err)
-	}
-	want := []string{"aliyun.cloud.read", "aliyun.dns.manage", "aliyun.cert.dns01"}
-	if strings.Join(grants.values(), ",") != strings.Join(want, ",") {
-		t.Fatalf("grants = %v, want %v", grants.values(), want)
 	}
 }
 
@@ -357,8 +308,8 @@ func TestSafeCredentialEnv(t *testing.T) {
 // TestUnreachableServerIsOperationError proves network failures exit 1, not 2/3.
 func TestUnreachableServerIsOperationError(t *testing.T) {
 	ta := newTestApp(t)
-	ta.useServer("http://127.0.0.1:1", "csg_adm_test")
-	code := ta.run("caps", "list")
+	ta.useServer("http://127.0.0.1:1", "csg_agt_test")
+	code := ta.run("accounts")
 	if code != ExitOperationErr {
 		t.Fatalf("exit = %d, want %d; stderr = %q", code, ExitOperationErr, ta.errOut())
 	}
@@ -376,8 +327,8 @@ func TestResponseMissingEnvelopeIsError(t *testing.T) {
 	defer srv.Close()
 
 	ta := newTestApp(t)
-	ta.useServer(srv.URL, "csg_adm_test")
-	if code := ta.run("caps", "list"); code != ExitOperationErr {
+	ta.useServer(srv.URL, "csg_agt_test")
+	if code := ta.run("accounts"); code != ExitOperationErr {
 		t.Fatalf("exit = %d, want %d; stderr = %q", code, ExitOperationErr, ta.errOut())
 	}
 	if !strings.Contains(ta.errOut(), "data envelope") {
