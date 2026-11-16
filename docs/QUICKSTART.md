@@ -20,6 +20,7 @@ against a fake endpoint. Verify it in your account before relying on it.
 - Node.js ≥ 20 and npm (needed by `make build` for the console)
 - macOS or Linux, a free loopback port (`8787` by default, `18787` for the scripted demo)
 - An authenticator app (any TOTP app) for the console sign-in
+- `curl` and `python3` for the scripted demo (`make demo`)
 
 ---
 
@@ -147,7 +148,7 @@ As the supervisor, change mei's role to **Member**, then ask again and wait:
 ```
 
 The request appears in mei's **Inbox**. Only mei can approve it; a supervisor can deny or
-revoke any request but never approve one. After she approves, the command returns and the
+revoke any request but cannot approve someone else's. After she approves, the command returns and the
 credential can restart that one instance and nothing else.
 
 ## 1.9 Approval modes
@@ -219,10 +220,13 @@ users, roles and policies.
 > (the session policy intersects the role's policy; `DurationSeconds` is at least 900 s),
 > [RAM role trust policy](https://www.alibabacloud.com/help/en/ram/user-guide/edit-the-trust-policy-of-a-ram-role).
 
+The console's **Add cloud account** page shows the same three steps with your account ID
+filled in, ready to copy. Use these names so the policies fit as they are.
+
 ## 2.1 Create the broker RAM user
 
-1. In **RAM → Identities → Users**, create a user `csg-broker` with an AccessKey, and save
-   the AccessKey ID and secret once.
+1. In **RAM → Identities → Users**, create a user `cloud-safeguard-broker` with an AccessKey,
+   and save the AccessKey ID and secret once.
 2. Attach a custom policy that only allows assuming the platform's role. Replace
    `<account-id>`:
 
@@ -230,7 +234,7 @@ users, roles and policies.
 {
   "Version": "1",
   "Statement": [
-    { "Effect": "Allow", "Action": ["sts:AssumeRole"], "Resource": ["acs:ram::<account-id>:role/csg-agent"] }
+    { "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "acs:ram::<account-id>:role/cloud-safeguard" }
   ]
 }
 ```
@@ -240,19 +244,20 @@ permissions of its own.
 
 ## 2.2 Create the RAM role
 
-1. In **RAM → Identities → Roles**, create `csg-agent`, trusted by the RAM user `csg-broker`:
+1. In **RAM → Identities → Roles**, create `cloud-safeguard`, trusted by the RAM user
+   `cloud-safeguard-broker` only:
 
 ```json
 {
   "Version": "1",
   "Statement": [
-    { "Effect": "Allow", "Action": "sts:AssumeRole", "Principal": { "RAM": ["acs:ram::<account-id>:user/csg-broker"] } }
+    { "Effect": "Allow", "Action": "sts:AssumeRole", "Principal": { "RAM": ["acs:ram::<account-id>:user/cloud-safeguard-broker"] } }
   ]
 }
 ```
 
 2. Attach a permission policy to the role. It is the outer limit: each credential's own
-   policy can only narrow it. For everything the built-in templates can ask for:
+   policy can only narrow it. This is everything the built-in templates can ask for:
 
 ```json
 {
@@ -264,21 +269,24 @@ permissions of its own.
         "ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance",
         "ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance",
         "alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
-        "alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus",
-        "alidns:AddDomain", "alidns:DeleteDomain",
+        "alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus", "alidns:AddDomain", "alidns:DeleteDomain",
         "oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload",
         "oss:PutBucket", "oss:DeleteBucket",
         "sts:GetCallerIdentity"
       ],
-      "Resource": ["*"]
-    }
+      "Resource": "*"
+    },
+    { "Effect": "Deny", "Action": ["ram:*", "sts:AssumeRole"], "Resource": "*" }
   ]
 }
 ```
 
 Leave out what you never want an agent to do; a request for it then fails in the cloud. Do
-not attach `AdministratorAccess`, and do not allow any `ram:` action. The role's maximum
-session duration must be at least 3600 s if you keep the default one-hour limit.
+not attach `AdministratorAccess` and do not use a wildcard per service: `ecs:*` would include
+`ecs:ModifyInstanceAttribute`, which can set an instance's login password. If the broker's
+AccessKey ever leaks, this policy is what the thief could reach, so keep it narrow. The
+role's maximum session duration must be at least 3600 s if you keep the default one-hour
+limit.
 
 ## 2.3 Start a real instance
 
@@ -303,10 +311,13 @@ and never by an agent.
 
 1. **Cloud accounts → + Add cloud account**.
 2. **Account**: the numeric account ID, a name and the region.
-3. **Role**: the page shows the trust policy from 2.2 with your account ID filled in.
-4. **Connect**: the role ARN (`acs:ram::<account-id>:role/csg-agent`) and the broker's
-   AccessKey ID and secret. The secret is encrypted on arrival and never shown again.
-5. **Test connection** signs one `sts:GetCallerIdentity` call.
+3. **Role**: the page shows the three policies from 2.1 and 2.2 with your account ID filled
+   in. The role must be named `cloud-safeguard`; the console builds its ARN from that name.
+4. **Connect**: the broker's AccessKey ID and secret. The secret is encrypted on arrival and
+   never shown again.
+5. The connection test runs at once. It checks that the AccessKey is valid
+   (`sts:GetCallerIdentity`) and that it can assume the role (one `AssumeRole` for 15
+   minutes with a policy that allows nothing useful; the result is thrown away).
 
 Then give people their roles on the account, and decide its highest automatic level.
 
@@ -332,7 +343,7 @@ export ALIBABA_CLOUD_IGNORE_PROFILE=TRUE
 
 ## 2.7 Rotate the broker AccessKey
 
-Create a new AccessKey for `csg-broker` in the Alibaba Cloud console, then in **Cloud
+Create a new AccessKey for `cloud-safeguard-broker` in the Alibaba Cloud console, then in **Cloud
 accounts → the account → Replace AccessKey** enter the new pair and run **Test connection**. Delete
 the old AccessKey in Alibaba Cloud afterwards. Credentials already issued keep working until
 their deadline; no agent or script changes.
@@ -382,7 +393,7 @@ make demo
 | Request `denied` at once | The owner's role does not allow that permission, or the agent is at its limit of credentials or requests per minute. |
 | Request stays `pending` | It waits for the owner in the console's Inbox. It expires after 10 minutes by default. |
 | `409 lease_not_active` fetching a credential | The request is still pending, or was denied, revoked or expired. |
-| Request `failed` with a cloud error | Wrong or disabled broker AccessKey, the role does not trust the broker user, a typo in the role ARN, or a validity below 900 s. Run **Test connection**. |
+| Request `failed` with a cloud error | Wrong or disabled broker AccessKey, the role does not trust the broker user, the role is not named `cloud-safeguard`, or a validity below 900 s. **Test connection** on the Cloud accounts page checks the key and the role. |
 | `404` on `/mock-cloud/` | No mock account exists (the instance was created without `--demo`). |
 | The Alibaba Cloud CLI uses an old key | Set `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` and remove the old profile. |
 | The server refuses to start after `CSG_MASTER_KEY` changed | The key does not match the data directory. Restore the original key. |

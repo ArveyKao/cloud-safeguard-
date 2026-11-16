@@ -12,12 +12,9 @@ import (
 	"strings"
 )
 
-// Token prefixes. The prefix lets the CLI and the server route a bearer token
-// to the right identity domain without a second lookup.
-const (
-	AgentPrefix = "csg_agt_"
-	AdminPrefix = "csg_adm_"
-)
+// AgentPrefix starts every agent token, the only bearer token there is.
+// People sign in with a password and an authenticator code instead.
+const AgentPrefix = "csg_agt_"
 
 // ErrEntropy is returned when the system random source fails.
 var ErrEntropy = errors.New("token: cannot read system randomness")
@@ -27,7 +24,7 @@ const entropyBytes = 32
 // Generate creates a new token with the given prefix. It returns the plaintext
 // token (show once) and the hex SHA-256 hash to persist.
 func Generate(prefix string) (plain string, hash string, err error) {
-	if prefix != AgentPrefix && prefix != AdminPrefix {
+	if prefix != AgentPrefix {
 		return "", "", errors.New("token: unknown prefix")
 	}
 	buf := make([]byte, entropyBytes)
@@ -44,13 +41,11 @@ func Hash(plain string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Kind classifies a plaintext token by its prefix: "agent", "admin" or "".
+// Kind classifies a plaintext token by its prefix: "agent" or "".
 func Kind(plain string) string {
 	switch {
 	case strings.HasPrefix(plain, AgentPrefix):
 		return "agent"
-	case strings.HasPrefix(plain, AdminPrefix):
-		return "admin"
 	default:
 		return ""
 	}

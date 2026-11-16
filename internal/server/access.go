@@ -153,9 +153,6 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	}
 	minTTL := minProviderTTL(prov.Mode)
 	maxTTL := capability.MaxTTLSeconds
-	if ag.MaxTTLSeconds < maxTTL {
-		maxTTL = ag.MaxTTLSeconds
-	}
 	if settings.MaxLeaseTTLSeconds < maxTTL {
 		maxTTL = settings.MaxLeaseTTLSeconds
 	}
@@ -206,9 +203,9 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	} else {
 		add(policy.RuleIAMProhibited, policy.OutcomeAllow, "the policy grants no IAM or RAM management")
 	}
-	if activeCount >= ag.MaxConcurrentLeases {
+	if activeCount >= settings.MaxConcurrentLeasesPerAgent {
 		add(policy.RuleConcurrency, policy.OutcomeDeny,
-			fmt.Sprintf("%d credentials or requests of this agent are active or waiting; the limit is %d", activeCount, ag.MaxConcurrentLeases))
+			fmt.Sprintf("%d credentials or requests of this agent are active or waiting; the limit is %d", activeCount, settings.MaxConcurrentLeasesPerAgent))
 	}
 	if lastMinute >= settings.LeasesPerMinutePerAgent {
 		add(policy.RuleRateLimit, policy.OutcomeDeny,
@@ -510,7 +507,8 @@ func (s *Server) handleRevokeMyRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // ownedAccessLease loads an access-request lease that belongs to one of the
-// person's agents. Anything else (missing, someone else's, a §16 lease) is
+// person's agents. Anything else (missing, someone else's, not an access
+// request) is
 // reported as not found.
 func (s *Server) ownedAccessLease(ctx context.Context, leaseID, personID string) (model.Lease, model.Agent, bool) {
 	lease, err := s.db.GetLease(ctx, leaseID)

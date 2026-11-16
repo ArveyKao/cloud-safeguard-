@@ -3,7 +3,7 @@ package model
 import "time"
 
 // Role is a person's role on one cloud account (CONTRACT §17.2). It shares
-// the guest < member < administrator ladder with the §16 agent role.
+// the guest < member < administrator ladder with model.AgentRole.
 type Role = AgentRole
 
 // PersonStatus is the lifecycle state of a human account.
@@ -32,8 +32,9 @@ type Person struct {
 	Username    string       `json:"username"`
 	DisplayName string       `json:"display_name"`
 	Status      PersonStatus `json:"status"`
-	// Supervisor is the platform flag: may manage cloud accounts, people and
-	// role bindings. It grants no cloud access.
+	// Supervisor is the platform flag: may manage cloud accounts, people,
+	// role bindings and limits, and is Administrator on every cloud account
+	// while active (CONTRACT §17.1).
 	Supervisor bool `json:"supervisor"`
 	// ApprovalMode is the level up to which this person's agents get access
 	// without asking (CONTRACT §17.5). Only the person sets it.

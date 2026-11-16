@@ -585,14 +585,28 @@ func TestPendingRequestsAreBounded(t *testing.T) {
 	if got := decodeEnvelope[listData[model.AccessRequest]](t, rec).Total; got != a.agent.MaxConcurrentLeases {
 		t.Fatalf("%d requests waiting", got)
 	}
-	// With the limit lowered behind the API, approval re-checks it.
-	if _, err := a.srv.db.SQL().Exec(`UPDATE agents SET max_concurrent_leases = 1 WHERE id = ?`, a.agent.ID); err != nil {
-		t.Fatal(err)
-	}
+	// A supervisor lowers the limit: it applies to an agent that signed in
+	// before, at approval and for new requests alike.
+	settings := model.DefaultPolicySettings()
+	settings.MaxConcurrentLeasesPerAgent = 1
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
 	requireStatus(t, a.approve(a.mei, ids[0]), http.StatusOK)
 	requireStatus(t, a.approve(a.mei, ids[1]), http.StatusConflict)
 	if a.minter.requestCount() != 1 {
 		t.Fatalf("minted %d times past the limit", a.minter.requestCount())
+	}
+	for _, id := range ids[1:] {
+		requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/requests/"+id+"/deny", model.DenyRequestInput{Reason: "over the limit"}), http.StatusOK)
+	}
+	if over := a.request(accessInput("ecs", "read")); over.Status != model.LeaseDenied {
+		t.Fatalf("a second credential under a limit of 1 = %s", over.Status)
+	}
+	// Raising it applies at once too, without signing the agent in again.
+	settings.MaxConcurrentLeasesPerAgent = 2
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+	a.clock.Advance(2 * time.Minute) // past the requests-per-minute limit
+	if second := a.request(accessInput("ecs", "read")); second.Status != model.LeaseActive {
+		t.Fatalf("a second credential under a limit of 2 = %s", second.Status)
 	}
 }
 

@@ -74,7 +74,7 @@ func (s *Server) writeHandlerError(w http.ResponseWriter, err error) {
 
 // submitLease persists a decided lease request (in every outcome) and, when
 // the decision is auto-approve, mints and activates it. It is the shared
-// second half of the §16 capability request and the §17 access request.
+// second half of an access request (createAccessRequest decides it).
 func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability model.Capability, selected *model.Provider, decision model.PolicyDecision, auditExtra map[string]any, in model.CreateLeaseInput, now time.Time) (model.Lease, error) {
 	leaseID, err := newID("lea_")
 	if err != nil {
@@ -142,8 +142,8 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 		}
 		unlock := s.lockLease(lease.ID)
 		defer unlock()
-		// The pending row was visible before this lock was taken: an operator
-		// may have approved, denied or revoked it meanwhile. Only a lease that
+		// The pending row was visible before this lock was taken: its owner
+		// or a supervisor may have approved, denied or revoked it meanwhile. Only a lease that
 		// is still pending under the lock may be minted.
 		if current, err := s.db.GetLease(ctx, lease.ID); err != nil {
 			return model.Lease{}, err
@@ -188,8 +188,7 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 
 // policyViolation returns a non-empty, human-readable violation when the
 // capability cannot render a policy that satisfies the IAM prohibition
-// (CONTRACT §16.3). The server computes it so the policy engine stays free of
-// the capability catalog.
+// (CONTRACT §16.3).
 //
 // It fails closed on every render error, not only on prohibition violations: a
 // template that cannot be rendered can never mint a credential, so letting the
@@ -537,11 +536,9 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 		return model.Lease{}, err
 	}
 	agentMissing := err != nil
-	accessRequest := capcatalog.IsAccessTemplateID(lease.CapabilityID)
-	switch {
-	case approver == nil && accessRequest:
-		return model.Lease{}, errConflictAPI("only the person who owns the agent can approve this request")
-	case approver != nil && (!accessRequest || agentMissing || ag.OwnerID == "" || ag.OwnerID != approver.ID):
+	// Only the owner of the requesting agent, and only an access request.
+	if approver == nil || !capcatalog.IsAccessTemplateID(lease.CapabilityID) ||
+		agentMissing || ag.OwnerID == "" || ag.OwnerID != approver.ID {
 		return model.Lease{}, notFound
 	}
 	if lease.Status != model.LeasePending {
@@ -564,9 +561,6 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 		}
 		return model.Lease{}, err
 	}
-	if agentMissing {
-		return model.Lease{}, errConflictAPI("agent no longer exists")
-	}
 	if lease.ProviderID == "" {
 		return model.Lease{}, errConflictAPI("lease has no provider")
 	}
@@ -583,10 +577,10 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 	if prov.Status != model.ProviderActive {
 		return model.Lease{}, errConflictAPI("provider is not active")
 	}
-	// Re-check the authorization that held when the lease was requested: an
-	// approval can arrive after a suspension, a grant removal, a demotion, a
-	// lowered role binding or a capability edit, and must never mint in those
-	// cases (CONTRACT §16.5, §17.5). activateLease repeats this after minting.
+	// Re-check the authorization that held when the request was made: an
+	// approval can arrive after a suspension or a lowered role, and must
+	// never mint in those cases (CONTRACT §17.5). activateLease repeats this
+	// after minting.
 	if problem, err := s.leaseAuthorityProblem(ctx, ag, capability, lease); err != nil {
 		return model.Lease{}, err
 	} else if problem != "" {
@@ -600,15 +594,15 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 
 	// The limit on simultaneously active credentials holds at approval too
 	// (requests are counted when they are made, but several can be pending).
-	if accessRequest {
-		active, err := s.db.CountActiveLeases(ctx, ag.ID)
-		if err != nil {
-			return model.Lease{}, err
-		}
-		if active >= ag.MaxConcurrentLeases {
-			return model.Lease{}, errConflictAPI(fmt.Sprintf(
-				"%d credentials of this agent are active; the limit is %d. Revoke one or wait for it to expire.", active, ag.MaxConcurrentLeases))
-		}
+	// It is the supervisor's current setting, not what it was when the agent
+	// signed in.
+	active, err := s.db.CountActiveLeases(ctx, ag.ID)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	if active >= settings.MaxConcurrentLeasesPerAgent {
+		return model.Lease{}, errConflictAPI(fmt.Sprintf(
+			"%d credentials of this agent are active; the limit is %d. Revoke one or wait for it to expire.", active, settings.MaxConcurrentLeasesPerAgent))
 	}
 
 	if in.TTLSeconds < 0 {
@@ -624,15 +618,11 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 	if ttl <= 0 {
 		return model.Lease{}, errBadRequestAPI("ttl_seconds must be positive")
 	}
-	// The owner approves exactly what was asked for; only the operator may
-	// set another validity period on a §16 lease.
-	if accessRequest && ttl != lease.RequestedTTLSeconds {
+	// The owner approves exactly what was asked for.
+	if ttl != lease.RequestedTTLSeconds {
 		return model.Lease{}, errBadRequestAPI("the validity period of an access request cannot be changed at approval")
 	}
 	maxTTL := capability.MaxTTLSeconds
-	if ag.MaxTTLSeconds < maxTTL {
-		maxTTL = ag.MaxTTLSeconds
-	}
 	if settings.MaxLeaseTTLSeconds < maxTTL {
 		maxTTL = settings.MaxLeaseTTLSeconds
 	}
@@ -641,19 +631,12 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 	}
 
 	audit := func(action, status, severity string, metadata map[string]any) {
-		if approver == nil {
-			s.actorAudit(ctx, action, status, severity, "lease", lease.ID, metadata)
-			return
-		}
 		metadata["agent_id"] = ag.ID
 		metadata["agent_name"] = ag.Name
 		s.personAudit(ctx, *approver, action, status, severity, "lease", lease.ID, metadata)
 	}
 	approvedAt := now
-	lease.ApprovedBy = "admin"
-	if approver != nil {
-		lease.ApprovedBy = "owner:" + approver.ID
-	}
+	lease.ApprovedBy = "owner:" + approver.ID
 	lease.ApprovalNote = in.Note
 	lease.ApprovedAt = &approvedAt
 	lease.EffectiveTTLSeconds = ttl
@@ -748,7 +731,7 @@ func (s *Server) handleRevokeLease(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
-	fallback := "revoked by operator"
+	fallback := "revoked by a supervisor"
 	if sc, ok := sessionFromContext(r.Context()); ok {
 		fallback = "revoked by supervisor " + sc.person.Username
 	}
@@ -923,9 +906,6 @@ func (s *Server) recheckLeaseAuthorization(ctx context.Context, lease model.Leas
 		return "", err
 	}
 	maxTTL := capability.MaxTTLSeconds
-	if ag.MaxTTLSeconds < maxTTL {
-		maxTTL = ag.MaxTTLSeconds
-	}
 	if settings.MaxLeaseTTLSeconds < maxTTL {
 		maxTTL = settings.MaxLeaseTTLSeconds
 	}
@@ -1010,12 +990,10 @@ func (s *Server) credentialReleaseProblem(ctx context.Context, agentID, leaseID 
 	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil || problem != "" {
 		return problem, err
 	}
-	// What an owned agent may hold depends on its owner's role, which can
-	// change at any time: read it again now (CONTRACT §17.2).
-	if ag.OwnerID != "" || capcatalog.IsAccessTemplateID(lease.CapabilityID) {
-		return s.recheckLeaseAuthorization(ctx, lease)
-	}
-	return "", nil
+	// What an agent may hold depends on its owner's role, which can change
+	// at any time: read it again now (CONTRACT §17.2). This also refuses
+	// anything that is not an access request.
+	return s.recheckLeaseAuthorization(ctx, lease)
 }
 
 // revalidateLeases re-runs the full activation check (recheckLeaseAuthorization)
@@ -1030,8 +1008,9 @@ func (s *Server) revalidateLeases(ctx context.Context, filter store.LeaseFilter,
 }
 
 // revalidateLeasesAs is revalidateLeases with audit attribution. With a nil
-// cause the revocations are recorded as the operator's (the legacy admin
-// API). Otherwise they are recorded as the control plane's, and cause (for
+// cause the revocations are recorded as the signed-in person's (a
+// supervisor changing settings or a cloud account). Otherwise they are
+// recorded as the control plane's, and cause (for
 // example caused_by, owner_id) is added to each event, so the audit log
 // names who triggered the revocation (§17.6).
 func (s *Server) revalidateLeasesAs(ctx context.Context, filter store.LeaseFilter, reason string, cause map[string]any) ([]string, error) {
@@ -1123,11 +1102,11 @@ func (s *Server) revokeLeaseAsSystem(ctx context.Context, lease model.Lease, rea
 	if err != nil {
 		return model.Lease{}, err
 	}
-	s.systemAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, map[string]any{
+	s.systemAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, s.leaseAgentMetadata(ctx, lease, map[string]any{
 		"actor":           "system",
 		"reason":          reason,
 		"previous_status": string(previousStatus),
-	})
+	}))
 	return updated, nil
 }
 
@@ -1254,10 +1233,10 @@ func (s *Server) expireLease(ctx context.Context, lease model.Lease, reason stri
 	if err := s.db.ClearLeaseCredential(ctx, current.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.logf("sweeper: clear credential for %s: %v", current.ID, err)
 	}
-	s.systemAudit(ctx, "lease.expired", "ok", "warning", "lease", current.ID, map[string]any{
+	s.systemAudit(ctx, "lease.expired", "ok", "warning", "lease", current.ID, s.leaseAgentMetadata(ctx, current, map[string]any{
 		"previous_status": string(lease.Status),
 		"reason":          reason,
-	})
+	}))
 }
 
 // lockAgentRequests serializes the requests of one agent, so the rate and

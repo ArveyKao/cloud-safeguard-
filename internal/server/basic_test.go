@@ -113,7 +113,7 @@ func TestAuthBoundaries(t *testing.T) {
 
 	// Malformed / non-bearer credentials, and the prefix of the removed
 	// admin token.
-	for _, bogus := range []string{"not-a-token", "Bearer", token.AdminPrefix + strings.Repeat("B", 43)} {
+	for _, bogus := range []string{"not-a-token", "Bearer", "csg_adm_" + strings.Repeat("B", 43)} {
 		for _, path := range []string{"/api/v1/agent/me", "/api/v1/agent/accounts", "/api/v1/agent/leases"} {
 			rec := env.do(http.MethodGet, path, bogus, nil)
 			requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
@@ -263,7 +263,7 @@ func TestInitBootstrapArtifacts(t *testing.T) {
 	}
 	// Init hands out no token of any kind: the setup code is the only secret.
 	raw, _ := json.Marshal(result)
-	for _, prefix := range []string{token.AdminPrefix, token.AgentPrefix} {
+	for _, prefix := range []string{"csg_adm_", token.AgentPrefix} {
 		if strings.Contains(string(raw), prefix) {
 			t.Fatalf("InitResult carries a %s token: %s", prefix, raw)
 		}

@@ -747,11 +747,13 @@ each part. This section is the running behaviour. Rationale: ADR-015.
   role binding is needed, and their agents may ask for up to `full` on every account; their
   approval mode and each account's highest automatic level still decide what waits for them.
   Removing the flag revokes what their agents hold beyond their own role bindings.
-- **Supervisor**: a person with the platform flag `supervisor`. `csg init` creates the first one
-  (replaces the single admin token, §2). Only supervisors may add, change or disable cloud
-  accounts, create or suspend people, grant or remove the supervisor flag, bind people to cloud
-  accounts, and change global settings. The flag gives no cloud access: a supervisor needs a
-  role binding like anyone else, and binding oneself is audited at warning level.
+- **Supervisor**: a person with the platform flag `supervisor`. `csg init` creates the first one.
+  Only supervisors may add, change or disable cloud accounts, create or suspend people, grant
+  or remove the supervisor flag, bind people to cloud accounts, and change global settings.
+  Granting or removing the flag is audited at critical level, because it also gives or takes
+  Administrator on every cloud account.
+- The server does not start when no person holds the supervisor flag (an install upgraded
+  from a version that had only the admin token): it says to run `csg supervisor recover`.
 - The last active supervisor cannot be suspended or lose the flag. A supervisor locked out of
   the console is restored with a local `csg` command on the server host, which needs the vault
   master key and is audited at critical. The data directory stores a key check, so recovery
@@ -778,10 +780,9 @@ each part. This section is the running behaviour. Rationale: ADR-015.
 
 - An agent **inherits** its owner's role on each account. The role is read from the binding at
   every request, approval and credential fetch; it is never copied onto the agent. An agent
-  that belongs to a person has no role or grants of its own: the operator cannot set them, the
-  §16 capability request (`POST /agent/leases`) refuses it with 403, and a §16 lease found on
-  such an agent is revoked at the next re-check. Agents without an owner keep the §16 model
-  until it is removed.
+  has no role or grants of its own. Every agent belongs to a person: an agent without an
+  owner is refused on every agent route (403), and a lease that is not an access request is
+  never handed out and is revoked at the next re-check or start.
 - The IAM prohibition (§16.3) applies at every role and to supervisors.
 
 ### 17.3 Authentication
@@ -835,8 +836,7 @@ each part. This section is the running behaviour. Rationale: ADR-015.
    - **Collect**: the agent polls with its device code. On approval it receives its token
      exactly once; the token is generated at that moment and never stored. No token is issued
      if the approver is no longer active.
-   - **Owned agents**: the approver is the owner. The agent starts with no grants, so it gets
-     nothing through the §16 request path. Signing in again under the same name replaces the
+   - **Ownership**: the approver is the owner. Signing in again under the same name replaces the
      owner's earlier agent: the old token stops working and its leases are revoked.
    - **Owner's control**: a person lists and revokes their own agents; other people's agents
      are invisible to them.
@@ -944,16 +944,19 @@ agent or the request.
   - Changes of a mode or of an account's level are audited; an automatic issue records the
     mode and level that allowed it.
 - A request that waits is approved by the **agent's owner**, signed in to the console. Nobody
-  else can approve, including supervisors and the operator token; to anyone else the request
-  does not exist (404). The owner cannot change the validity period at approval.
+  else can approve, supervisors included; to anyone else the request does not exist (404). A
+  supervisor approves the requests of their own agents like any other owner. The owner
+  cannot change the validity period at approval.
 - The owner can also deny a pending request and revoke an issued one early.
-- The operator token (until it is removed) can see, deny and revoke access requests as a
-  safety control, with every such action audited. It can never approve one. The note an
-  owner writes at approval is not shown to the agent.
+- A supervisor can see, deny and revoke anyone's access requests as a safety control, with
+  every such action audited, and can never approve another person's. The note an owner
+  writes at approval is not shown to the agent.
 - The approval shows the agent, cloud account, resource type, resource name, permission, validity
   period and reason exactly as they will be issued.
-- Approval rechecks everything in §17.4 and §16.5 at decision time. A pending request expires
-  after the §6 approval timeout.
+- Approval rechecks everything in §17.4 at decision time, and again after the credential is
+  minted. A pending request expires after the approval timeout (10 minutes by default).
+- The limits (longest validity, credentials per agent, requests per minute) are the
+  supervisor's current settings. They apply to every agent at once, whenever it signed in.
 
 ### 17.6 Lifecycle
 
@@ -966,7 +969,7 @@ agent or the request.
   sweep). A credential cannot be extended; the agent sends a new request.
 - Suspending a person suspends their agents and revokes their pending and active leases.
 - Removing or lowering a binding revokes that person's agents' leases on that account that the
-  new role does not permit (as §16.5 demotion). Real STS credentials stay valid until expiry.
+  new role does not permit. Real STS credentials stay valid until expiry.
 - Every audit event names the person (owner, approver or supervisor) as well as the agent.
   A `lease.revoked` event caused by a person's action (suspension, reset, an owner revoking
   an agent, a re-sign-in) is recorded as the control plane's, with `caused_by`, `owner_id`,
@@ -999,10 +1002,9 @@ old one atomically. Sign-in requests never carry a saved token.
 
 Agent CLI, same flow from a terminal:
 
-- `csg login --server URL [--name NAME]` without `--token` runs the agent-first sign-in: it
-  prints the link and the short code, waits for a person to approve, and saves the agent token
-  (0600). The device code and the token are never printed. `csg login --token` still saves a
-  token directly.
+- `csg login --server URL [--name NAME]` runs the agent-first sign-in: it prints the link and
+  the short code, waits for a person to approve, and saves the agent token (0600). The device
+  code and the token are never printed. There is no way to paste a token in.
 - `csg accounts`, `csg access request --account ID --resource R --permission P --ttl DUR
   [--name] [--reason] [--wait]`, `csg access status ID`.
 - `csg exec --account ID --resource R --permission P --ttl DUR -- CMD` asks for access, runs
@@ -1029,13 +1031,23 @@ Agent CLI, same flow from a terminal:
   code-defined templates are the only way to get a credential. The settings a supervisor can
   change are the longest validity, the approval timeout, the number of credentials an agent
   holds at once and the requests per minute.
-- Upgrade (schema version 8). The migration deletes the admin token and revokes every agent
-  without an owner; the `schema.migrated` audit event lists them. At every start the server
-  revokes each pending or active lease that is not an access request, with one
-  `lease.revoked` event each. People sign their agents in again with `csg login`.
+- Upgrade (schema version 8). The migration deletes the admin token, revokes every agent
+  without an owner and clears the role and grants stored on every agent; the
+  `schema.migrated` audit event says whether an admin token was deleted and lists the
+  revoked agents, whichever command opens the database first (`csg serve` or
+  `csg supervisor recover`). At every start the server revokes each pending or active lease
+  that is not an access request, with one `lease.revoked` event each. People sign their
+  agents in again with `csg login`. An install that never had a supervisor does not start
+  until `csg supervisor recover --username NAME` creates one.
 - Supervisors are Administrator on every cloud account (§17.1). A cloud account must be
-  added with a RAM role ARN; a request without one is refused.
-- An unknown path under `/api/` answers 404 for every method.
+  added with a RAM role ARN; a request without one is refused. A provider an older upgrade
+  left without a cloud account ID can be given one by setting a role ARN in an account that
+  is not connected yet (the roles set on it before are removed), or disabled.
+- The connection test of an `sts` account checks the AccessKey (`GetCallerIdentity`) and then
+  assumes the role once for 15 minutes with a policy that allows nothing useful.
+- A path that matches no route answers 404 for every method. Under `/api/v1/agent/`,
+  `/api/v1/me/` and `/api/v1/supervisor/` the caller is authenticated first, so without a
+  valid credential the answer is 401 whatever the path.
 - Still in force from §1–§16: the file layout and configuration (§1), envelopes and error
   codes (§2), the lease states (§5), providers and the mock cloud (§8), the audit hash chain
   (§10) and the IAM prohibition (§16.3).

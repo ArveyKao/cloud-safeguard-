@@ -16,13 +16,11 @@ import (
 // Meta keys stored in the meta table. These are part of the bootstrap contract
 // (docs/CONTRACT.md §11) and are read by the CLI/serve startup checks.
 const (
-	MetaSchemaVersion    = "schema_version"
-	MetaInstanceID       = "instance_id"
-	MetaAdminTokenHash   = "admin_token_hash"
-	MetaAdminTokenPrefix = "admin_token_prefix"
-	MetaBootstrapTime    = "bootstrap_time"
-	MetaDemoMode         = "demo_mode"
-	MetaPolicySettings   = "policy_settings"
+	MetaSchemaVersion  = "schema_version"
+	MetaInstanceID     = "instance_id"
+	MetaBootstrapTime  = "bootstrap_time"
+	MetaDemoMode       = "demo_mode"
+	MetaPolicySettings = "policy_settings"
 	// MetaVaultKeyCheck holds a known plaintext encrypted with the master
 	// key, so a wrong key is detected even when nothing else is encrypted.
 	MetaVaultKeyCheck = "vault_key_check"
@@ -246,18 +244,29 @@ var migrations = []migration{
 		},
 	},
 	{ // version 7 -> 8: no admin token, no agents without an owner (CONTRACT §17.7a)
-		statements: []string{
-			`DELETE FROM meta WHERE key IN ('admin_token_hash', 'admin_token_prefix')`,
-		},
-		transform: revokeOwnerlessAgents,
+		transform: removeAdminTokenAndOldAgentModel,
 	},
 }
 
-// revokeOwnerlessAgents revokes every agent that belongs to no person: they
-// were created by the removed admin token or the v0.1 demo seed, and nothing
-// can manage them any more. Their leases are revoked by the startup sweep,
-// which records each one in the audit log.
-func revokeOwnerlessAgents(ctx context.Context, tx *sql.Tx, report *MigrationReport) error {
+// removeAdminTokenAndOldAgentModel deletes the admin token, revokes every
+// agent that belongs to no person and clears the role and grants stored on
+// every agent. Agents without an owner were created by the removed admin
+// token or the v0.1 demo seed, and nothing can manage them any more. An
+// agent's own role and grants mean nothing now (it inherits its owner's role),
+// so they must not be shown as if they did. Leases of the removed model are
+// revoked by the startup sweep, which records each one in the audit log.
+func removeAdminTokenAndOldAgentModel(ctx context.Context, tx *sql.Tx, report *MigrationReport) error {
+	res, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE key IN ('admin_token_hash', 'admin_token_prefix')`)
+	if err != nil {
+		return err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agents SET role = 'guest', grants_json = '[]'`); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id FROM agents WHERE owner_id = '' AND status <> ? ORDER BY id ASC`, string(model.AgentRevoked))
 	if err != nil {
@@ -284,6 +293,7 @@ func revokeOwnerlessAgents(ctx context.Context, tx *sql.Tx, report *MigrationRep
 		}
 	}
 	if report != nil {
+		report.DeletedAdminToken = deleted > 0
 		report.RevokedAgents = append(report.RevokedAgents, ids...)
 	}
 	return nil
@@ -291,8 +301,9 @@ func revokeOwnerlessAgents(ctx context.Context, tx *sql.Tx, report *MigrationRep
 
 // migrateCloudAccountIDs fills providers.cloud_account_id from each role
 // ARN. When several providers point at the same cloud account, only the
-// oldest gets the ID; the others keep "" and cannot serve access requests
-// until a supervisor removes the duplicate.
+// oldest gets the ID; the others keep "" and cannot serve access requests.
+// A supervisor disables such a duplicate, or points it at a role in an
+// account that is not connected yet, which gives it that account's ID.
 func migrateCloudAccountIDs(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
 	rows, err := tx.QueryContext(ctx, `SELECT id, type, role_arn FROM providers ORDER BY created_at ASC, id ASC`)
 	if err != nil {

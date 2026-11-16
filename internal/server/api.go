@@ -88,9 +88,9 @@ func (s *Server) buildHandler() http.Handler {
 	supervisorMux.HandleFunc("DELETE /api/v1/supervisor/accounts/{provider}/people/{person}", s.handleDeleteBinding)
 	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/auto-level", s.handleSetAccountAutoLevel)
 	// Cloud accounts, settings, audit and the emergency stop (CONTRACT §17.8).
-	// They reuse the operator's handlers; actions are attributed to the
-	// signed-in supervisor. There is deliberately no approve route: a
-	// supervisor can stop any request or credential but never grant one.
+	// Actions are attributed to the signed-in supervisor. There is
+	// deliberately no approve route: a supervisor can stop any request or
+	// credential but never grant one for somebody else's agent.
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts", s.handleListAccounts)
 	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts", s.handleCreateAccount)
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts/{id}", s.handleGetAccount)

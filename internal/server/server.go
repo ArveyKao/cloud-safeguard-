@@ -226,6 +226,22 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("server: read bootstrap time: %w", err)
 	}
 
+	// Record what an upgrade migration changed (the deleted admin token and
+	// revoked agents, for one) before anything can stop the start: the
+	// report exists only for the process that ran the upgrade.
+	if err := auditMigrationReport(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: record the schema upgrade: %w", err)
+	}
+	// Without a supervisor nobody can sign in, add people or connect a cloud
+	// account, and there is no other credential: an install upgraded from a
+	// version that had only the admin token is in this state. Refuse to run
+	// rather than serve a console nobody can enter.
+	if err := requireSupervisor(context.Background(), db, cfg.DataDir); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	s := &Server{
 		cfg:           cfg,
 		db:            db,
@@ -263,18 +279,13 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.mockCloud = mockcloud.NewHandler(mockcloud.Deps{Store: db, SigningKey: s.signingKey})
 	s.handler = s.buildHandler()
-	// Record what an upgrade migration changed (revoked agents, for one), so
-	// it is attributable in the audit chain.
-	if err := auditMigrationReport(context.Background(), db); err != nil {
-		s.logf("audit schema migration: %v", err)
-	}
 	if err := s.revokeUnsupportedLeases(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("server: revoke leases that are no longer supported: %w", err)
 	}
 	// Re-check every pending and active lease once at startup. Authority can
 	// change while the server is down or in a crash between a status change
-	// and its sweep: local recovery resets a person, an operator edits the
+	// and its sweep: local recovery resets a person, someone edits the
 	// database. Whatever is no longer authorized is revoked before serving.
 	if _, err := s.revalidateLeasesAs(context.Background(), store.LeaseFilter{},
 		"no longer authorized (startup check)", map[string]any{"caused_by": "startup check"}); err != nil {
@@ -283,6 +294,28 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.startSweeper()
 	return s, nil
+}
+
+// ErrNoSupervisor is returned by New when no person holds the supervisor
+// flag.
+var ErrNoSupervisor = errors.New("server: no supervisor exists")
+
+// requireSupervisor fails when no person holds the supervisor flag, whatever
+// their status: a pending one still has a setup code, and the last active
+// one can never be removed through the API.
+func requireSupervisor(ctx context.Context, db *store.DB, dataDir string) error {
+	people, err := db.ListPersons(ctx)
+	if err != nil {
+		return fmt.Errorf("server: list people: %w", err)
+	}
+	for _, p := range people {
+		if p.Supervisor {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w in %q, so nobody could sign in (the admin token of older versions no longer exists). "+
+		"Create the first supervisor on this machine with: csg supervisor recover --username NAME --data-dir %s",
+		ErrNoSupervisor, dataDir, dataDir)
 }
 
 // notInitializedErr builds the clear bootstrap error required by CONTRACT §11.

@@ -296,9 +296,11 @@ func (s *Server) handlePutBinding(w http.ResponseWriter, r *http.Request) {
 		"person_id": person.ID, "username": person.Username, "role": string(in.Role), "previous_role": previous,
 		"self": person.ID == actor.person.ID,
 	})
-	if previous != "" && model.Role(previous).Rank() > in.Role.Rank() {
-		s.afterBindingReduced(ctx, actor.person, person.ID, provider.ID)
-	}
+	// Always re-check the person's agents after a role is written, not only
+	// when this request saw a higher role before: two changes at once can
+	// each read the other's "before", and the one that lowers the role would
+	// then skip the sweep. The re-check revokes nothing the new role allows.
+	s.afterBindingReduced(ctx, actor.person, person.ID, provider.ID)
 	stored, err := s.db.GetBinding(ctx, person.ID, provider.ID)
 	if err != nil {
 		s.internalError(w, "reload binding", err)

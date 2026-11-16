@@ -206,7 +206,7 @@ func TestAssumeRoleAgainstFakeSTS(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"AccessKeyId":"STS.LTAI5tMinted","AccessKeySecret":"minted-secret","SecurityToken":"minted-token","Expiration":"2026-11-08T01:00:00Z","RequestId":"req-123"}`)
+		fmt.Fprint(w, `{"RequestId":"req-123","AssumedRoleUser":{"AssumedRoleId":"3000000000000000:csg","Arn":"acs:ram::1234567890123456:role/csg/csg"},"Credentials":{"AccessKeyId":"STS.LTAI5tMinted","AccessKeySecret":"minted-secret","SecurityToken":"minted-token","Expiration":"2026-11-08T01:00:00Z"}}`)
 	}))
 	defer srv.Close()
 	stsEndpoint = srv.URL + "/"
@@ -283,7 +283,7 @@ func TestAssumeRolePolicyIsCompacted(t *testing.T) {
 	var gotPolicy string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPolicy = r.URL.Query().Get("Policy")
-		fmt.Fprint(w, `{"AccessKeyId":"a","AccessKeySecret":"b","SecurityToken":"c","Expiration":"2026-11-08T01:00:00Z"}`)
+		fmt.Fprint(w, `{"Credentials":{"AccessKeyId":"a","AccessKeySecret":"b","SecurityToken":"c","Expiration":"2026-11-08T01:00:00Z"}}`)
 	}))
 	defer srv.Close()
 	stsEndpoint = srv.URL + "/"
@@ -421,58 +421,103 @@ func TestSTSContextCancelled(t *testing.T) {
 	}
 }
 
-func TestGetCallerIdentityAgainstFakeSTS(t *testing.T) {
+// The connection test proves both halves: the broker AccessKey is valid
+// (GetCallerIdentity) and it can assume the role (one throwaway AssumeRole).
+func TestConnectionTestAgainstFakeSTS(t *testing.T) {
 	oldEndpoint := stsEndpoint
 	defer func() { stsEndpoint = oldEndpoint }()
 
-	var gotQuery url.Values
+	queries := map[string]url.Values{}
+	var order []string
+	denyAssume := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.Query()
-		fmt.Fprint(w, `{"AccountId":"1234567890123456","Arn":"acs:ram::1234567890123456:user/csg","RequestId":"req"}`)
+		q := r.URL.Query()
+		queries[q.Get("Action")] = q
+		order = append(order, q.Get("Action"))
+		switch q.Get("Action") {
+		case "GetCallerIdentity":
+			fmt.Fprint(w, `{"AccountId":"1234567890123456","Arn":"acs:ram::1234567890123456:user/csg","RequestId":"req"}`)
+		case "AssumeRole":
+			if denyAssume {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `{"Code":"NoPermission","Message":"You are not authorized to do this action.","RequestId":"r"}`)
+				return
+			}
+			fmt.Fprintf(w, `{"Credentials":{"AccessKeyId":"STS.probe","AccessKeySecret":"probe-secret","SecurityToken":"probe-token","Expiration":%q},"RequestId":"req"}`,
+				time.Now().Add(15*time.Minute).UTC().Format(time.RFC3339))
+		default:
+			t.Errorf("unexpected action %q", q.Get("Action"))
+		}
 	}))
 	defer srv.Close()
 	stsEndpoint = srv.URL + "/"
 
 	minter, _ := New(model.ModeSTS)
-	err := minter.Test(context.Background(), MintRequest{
-		Provider:              model.Provider{ID: "prv", RoleARN: "acs:ram::1:role/r"},
+	req := MintRequest{
+		Provider:              model.Provider{ID: "prv", RoleARN: "acs:ram::1234567890123456:role/cloud-safeguard"},
 		BrokerAccessKeyID:     "LTAI5tBroker",
 		BrokerAccessKeySecret: "secret",
-	})
-	if err != nil {
+		// What the server passes; the probe must not use it.
+		PolicyJSON:      []byte(`{"Version":"1","Statement":[{"Effect":"Allow","Action":"ecs:*","Resource":"*"}]}`),
+		DurationSeconds: 3600,
+	}
+	if err := minter.Test(context.Background(), req); err != nil {
 		t.Fatalf("Test() error = %v", err)
 	}
-	if got := gotQuery.Get("Action"); got != "GetCallerIdentity" {
-		t.Errorf("Action = %q, want GetCallerIdentity", got)
+	if strings.Join(order, ",") != "GetCallerIdentity,AssumeRole" {
+		t.Fatalf("calls = %v", order)
 	}
-	if got := gotQuery.Get("Version"); got != "2015-04-01" {
-		t.Errorf("Version = %q, want 2015-04-01", got)
-	}
-	if got := gotQuery.Get("AccessKeyId"); got != "LTAI5tBroker" {
-		t.Errorf("AccessKeyId = %q", got)
-	}
-	if got := gotQuery.Get("Signature"); got == "" {
-		t.Error("Signature missing from GetCallerIdentity request")
+	identity := queries["GetCallerIdentity"]
+	if identity.Get("Version") != "2015-04-01" || identity.Get("AccessKeyId") != "LTAI5tBroker" || identity.Get("Signature") == "" {
+		t.Errorf("GetCallerIdentity request = %v", identity)
 	}
 	for _, unwanted := range []string{"Policy", "RoleArn", "DurationSeconds", "RoleSessionName"} {
-		if got := gotQuery.Get(unwanted); got != "" {
+		if got := identity.Get(unwanted); got != "" {
 			t.Errorf("%s = %q, want absent for GetCallerIdentity", unwanted, got)
 		}
 	}
+	// The probe asks for the shortest period and a policy that allows
+	// nothing but asking who it is, whatever the caller passed.
+	assume := queries["AssumeRole"]
+	if assume.Get("RoleArn") != req.Provider.RoleARN || assume.Get("DurationSeconds") != "900" ||
+		assume.Get("RoleSessionName") != "csg-connection-test" || assume.Get("Signature") == "" {
+		t.Errorf("AssumeRole probe = %v", assume)
+	}
+	if policy := assume.Get("Policy"); !strings.Contains(policy, "sts:GetCallerIdentity") || strings.Contains(policy, "ecs:") {
+		t.Errorf("probe policy = %s", policy)
+	}
 
-	// A provider error must be returned as a sanitized error.
+	// A valid AccessKey that may not assume the role fails the test.
+	denyAssume = true
+	err := minter.Test(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "cannot assume the role") || !strings.Contains(err.Error(), "NoPermission") {
+		t.Fatalf("Test() with AssumeRole denied = %v", err)
+	}
+	if strings.Contains(err.Error(), "LTAI5tBroker") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error leaks the broker key: %v", err)
+	}
+	// No role ARN: nothing to assume.
+	noRole := req
+	noRole.Provider.RoleARN = ""
+	if err := minter.Test(context.Background(), noRole); err == nil {
+		t.Fatal("Test() without a role ARN passed")
+	}
+
+	// An invalid AccessKey fails at the first call, with a sanitized error.
+	order = nil
 	srvErr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		order = append(order, r.URL.Query().Get("Action"))
 		w.WriteHeader(http.StatusForbidden)
 		fmt.Fprint(w, `{"Code":"InvalidAccessKeyId.NotFound","Message":"not found","RequestId":"r"}`)
 	}))
 	defer srvErr.Close()
 	stsEndpoint = srvErr.URL + "/"
-	err = minter.Test(context.Background(), MintRequest{
-		BrokerAccessKeyID:     "LTAI5tBroker",
-		BrokerAccessKeySecret: "secret",
-	})
+	err = minter.Test(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "InvalidAccessKeyId.NotFound") {
 		t.Fatalf("Test() error = %v, want provider error code", err)
+	}
+	if len(order) != 1 {
+		t.Fatalf("calls after an invalid key = %v, want only GetCallerIdentity", order)
 	}
 }
 
@@ -568,5 +613,30 @@ func TestAssumeRoleUnparseableResponse(t *testing.T) {
 	}
 	if !json.Valid([]byte(`{"Version":"1"}`)) {
 		t.Fatal("test bug")
+	}
+}
+
+// Alibaba Cloud nests the credential under "Credentials". A body with the
+// fields at the top level is not an AssumeRole response and yields nothing.
+func TestAssumeRoleNeedsNestedCredentials(t *testing.T) {
+	oldEndpoint := stsEndpoint
+	defer func() { stsEndpoint = oldEndpoint }()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"AccessKeyId":"STS.flat","AccessKeySecret":"flat-secret","SecurityToken":"flat-token","Expiration":"2026-11-08T01:00:00Z","RequestId":"r"}`)
+	}))
+	defer srv.Close()
+	stsEndpoint = srv.URL + "/"
+
+	minter, _ := New(model.ModeSTS)
+	cred, err := minter.Mint(context.Background(), MintRequest{
+		LeaseID:               "lea_x",
+		Provider:              model.Provider{ID: "prv", RoleARN: "acs:ram::1:role/r"},
+		BrokerAccessKeyID:     "ak",
+		BrokerAccessKeySecret: "sk",
+		PolicyJSON:            []byte(`{"Version":"1"}`),
+		DurationSeconds:       900,
+	})
+	if err == nil || !strings.Contains(err.Error(), "InvalidResponse") || cred.AccessKeyID != "" {
+		t.Fatalf("Mint() = %+v, %v; want InvalidResponse", cred.AccessKeyID, err)
 	}
 }

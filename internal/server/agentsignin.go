@@ -200,9 +200,10 @@ func (s *Server) handleAgentSignInToken(w http.ResponseWriter, r *http.Request) 
 		s.internalError(w, "generate token", err)
 		return
 	}
-	// An owned agent has no role or grants of its own: what it may do comes
-	// from its owner's role on each cloud account (§17.2). Guest with no
-	// grants means the §16 request path gives it nothing.
+	// An agent has no role or grants of its own: what it may do comes from
+	// its owner's role on each cloud account (§17.2). The limits stored on
+	// the agent are a record of the settings at sign-in; the current
+	// settings are what is enforced.
 	agent := model.Agent{
 		ID: agentID, Name: signIn.AgentName, Description: signIn.Description,
 		Status: model.AgentActive, Role: model.RoleGuest, Grants: []string{},
@@ -352,12 +353,12 @@ func (s *Server) handleRevokeMyAgent(w http.ResponseWriter, r *http.Request) {
 	s.writeData(w, http.StatusOK, agent)
 }
 
-// agentOwnerProblem reports why an owned agent may not act: its owner is
-// missing or not active (§17.1). Agents without an owner (created before
-// people existed) are not affected.
+// agentOwnerProblem reports why an agent may not act: it has no owner, or
+// its owner is missing or not active (§17.1). Every agent belongs to a
+// person; one without an owner is left over from the removed agent model.
 func (s *Server) agentOwnerProblem(ctx context.Context, ag model.Agent) (string, error) {
 	if ag.OwnerID == "" {
-		return "", nil
+		return "agent has no owner; sign it in again with csg login", nil
 	}
 	owner, err := s.db.GetPerson(ctx, ag.OwnerID)
 	if errors.Is(err, store.ErrNotFound) {

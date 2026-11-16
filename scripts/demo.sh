@@ -14,10 +14,15 @@
 #      non-zero if any scenario failed
 #
 # Usage: ./scripts/demo.sh [--port 18787] [--data-dir .demo/data]
+# Needs go, curl and python3.
 #
 # The demo runs entirely in mock mode: no real cloud account or credentials are
 # used. Setup codes, passwords, tokens and credentials are never echoed.
 set -u -o pipefail
+
+for tool in go curl python3; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "demo: $tool is required" >&2; exit 2; }
+done
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -120,14 +125,31 @@ fi
 echo "built $BIN"
 echo
 
-# The demo always starts from a clean, throwaway data directory.
+# The demo always starts from a clean, throwaway data directory. It deletes
+# only a directory that a demo instance lives in: one under this repository's
+# .demo/, or one that holds nothing but an instance's own files. Anything
+# else is refused, never removed.
 if [ -e "$DATA_DIR" ]; then
-  if [ "$DATA_DIR" = "/" ] || [ "$DATA_DIR" = "$ROOT" ]; then
-    echo "demo: refusing to remove unsafe data dir: $DATA_DIR" >&2
+  REMOVABLE=0
+  case "$DATA_DIR" in
+    "$ROOT"/.demo/?*)
+      case "$DATA_DIR" in *..*) : ;; *) REMOVABLE=1 ;; esac
+      ;;
+  esac
+  if [ "$REMOVABLE" -ne 1 ] && [ -d "$DATA_DIR" ] && [ ! -L "$DATA_DIR" ]; then
+    OTHER=$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
+      ! -name master.key ! -name csg.db ! -name csg.db-wal ! -name csg.db-shm ! -name server.log | head -1)
+    if [ -z "$OTHER" ] && [ -f "$DATA_DIR/csg.db" ]; then
+      REMOVABLE=1
+    fi
+  fi
+  if [ "$REMOVABLE" -ne 1 ]; then
+    echo "demo: $DATA_DIR exists and is not a demo data directory; refusing to delete it." >&2
+    echo "demo: use a path under $ROOT/.demo/ or a directory that does not exist yet." >&2
     exit 2
   fi
-  echo "removing existing data dir: $DATA_DIR"
-  rm -rf "$DATA_DIR"
+  echo "removing existing demo data dir: $DATA_DIR"
+  rm -rf -- "$DATA_DIR"
 fi
 mkdir -p "$(dirname "$DATA_DIR")" || { echo "demo: cannot create parent of $DATA_DIR" >&2; exit 1; }
 

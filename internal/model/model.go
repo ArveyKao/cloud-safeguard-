@@ -59,8 +59,9 @@ func (r RiskTier) Rank() int {
 	return 0
 }
 
-// AgentRole is the coarse-grained role of an agent identity (CONTRACT §16.1).
-// Roles apply to agents only: the operator/admin token is not a role.
+// AgentRole is the guest < member < administrator ladder. It is a person's
+// role on a cloud account (CONTRACT §17.2, where it is called Role); agents
+// inherit their owner's and have none of their own.
 //
 // A role permits a set of capability access levels:
 //
@@ -234,7 +235,7 @@ type Provider struct {
 	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
-// CreateProviderInput is the admin request body for POST /admin/providers.
+// CreateProviderInput is the request body of POST /supervisor/accounts.
 type CreateProviderInput struct {
 	Name            string       `json:"name"`
 	Type            ProviderType `json:"type"`
@@ -245,7 +246,7 @@ type CreateProviderInput struct {
 	AccessKeySecret string       `json:"access_key_secret"`
 }
 
-// UpdateProviderInput is the admin request body for PATCH /admin/providers/{id}.
+// UpdateProviderInput is the request body of PATCH /supervisor/accounts/{id}.
 // Nil fields are left unchanged.
 type UpdateProviderInput struct {
 	Name    *string         `json:"name,omitempty"`
@@ -320,20 +321,19 @@ type Agent struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	Status      AgentStatus `json:"status"`
-	// Role is the agent's role. It bounds which capability access levels the
-	// agent may hold and request (CONTRACT §16.1).
-	Role AgentRole `json:"role"`
-	// Grants are capability IDs this agent may request. They are always a subset
-	// of the capabilities the role permits.
-	Grants []string `json:"grants"`
-	// MaxTTLSeconds caps any single lease this agent may hold.
-	MaxTTLSeconds int `json:"max_ttl_seconds"`
-	// MaxConcurrentLeases caps simultaneously active leases.
+	// Role and Grants are left over from the removed agent model and mean
+	// nothing: an agent inherits its owner's role on each cloud account.
+	// They are always "guest" and empty.
+	Role   AgentRole `json:"role"`
+	Grants []string  `json:"grants"`
+	// MaxTTLSeconds and MaxConcurrentLeases record the platform limits when
+	// the agent signed in. The supervisor's current settings are what is
+	// enforced.
+	MaxTTLSeconds       int `json:"max_ttl_seconds"`
 	MaxConcurrentLeases int `json:"max_concurrent_leases"`
 	// OwnerID is the person this agent belongs to (CONTRACT §17.1). It is set
-	// when the agent signs in and never changes. It is empty for agents
-	// created through the legacy admin API (§16), which stays available
-	// until §17 replaces it; those agents are not tied to any person.
+	// when the agent signs in and never changes. An agent without one is
+	// left over from the removed agent model and is refused everywhere.
 	OwnerID string `json:"owner_id,omitempty"`
 	// TokenPrefix is a display-only hint (e.g. "csg_agt_7f3a").
 	TokenPrefix string     `json:"token_prefix"`
@@ -453,14 +453,14 @@ type CreateLeaseInput struct {
 	BreakGlass bool `json:"break_glass,omitempty"`
 }
 
-// ApproveLeaseInput is the admin request body for POST /admin/leases/{id}/approve.
+// ApproveLeaseInput is the request body of POST /me/requests/{id}/approve.
 type ApproveLeaseInput struct {
 	// TTLSeconds 0 means "use the lease's requested/effective TTL".
 	TTLSeconds int    `json:"ttl_seconds,omitempty"`
 	Note       string `json:"note,omitempty"`
 }
 
-// DenyLeaseInput is the admin request body for POST /admin/leases/{id}/deny.
+// DenyLeaseInput is the request body of POST /supervisor/leases/{id}/deny.
 type DenyLeaseInput struct {
 	Reason string `json:"reason"`
 }
@@ -517,7 +517,7 @@ type AuditEvent struct {
 	Hash       string         `json:"hash"`
 }
 
-// AuditVerifyResult is returned by GET /admin/audit/verify.
+// AuditVerifyResult is returned by GET /supervisor/audit/verify.
 type AuditVerifyResult struct {
 	OK              bool   `json:"ok"`
 	Events          int64  `json:"events"`

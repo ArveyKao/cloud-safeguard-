@@ -161,6 +161,9 @@ type MigrationReport struct {
 	// RevokedAgents lists the agents without an owner that the schema-8
 	// migration revoked.
 	RevokedAgents []string `json:"revoked_agents,omitempty"`
+	// DeletedAdminToken is true when the schema-8 migration deleted the
+	// admin token of an older version.
+	DeletedAdminToken bool `json:"deleted_admin_token,omitempty"`
 }
 
 // AgentMigration is one agent's outcome in the schema-2 role migration.

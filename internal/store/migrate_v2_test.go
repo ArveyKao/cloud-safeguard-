@@ -268,16 +268,27 @@ func TestMigrateV1DatabaseToSchema2(t *testing.T) {
 		t.Fatalf("agents after migration = %d, want %d", len(storedAgents), len(wantAgents))
 	}
 	for _, ag := range storedAgents {
-		want, ok := wantAgents[ag.ID]
+		_, ok := wantAgents[ag.ID]
 		if !ok {
 			t.Errorf("unexpected agent %s after migration", ag.ID)
 			continue
 		}
-		if ag.Role != want.role {
-			t.Errorf("%s: role = %q, want %q", ag.ID, ag.Role, want.role)
+		// The schema-8 step then removes the old agent model: no agent keeps
+		// a role or grants of its own, and these agents, which have no
+		// owner, are revoked. The roles schema 2 derived are in the report.
+		if ag.Role != model.RoleGuest || len(ag.Grants) != 0 || ag.Status != model.AgentRevoked {
+			t.Errorf("%s after the full upgrade: role %q, grants %v, status %q; want guest, none, revoked", ag.ID, ag.Role, ag.Grants, ag.Status)
 		}
-		if strings.Join(ag.Grants, ",") != strings.Join(want.grants, ",") {
-			t.Errorf("%s: grants = %v, want %v", ag.ID, ag.Grants, want.grants)
+	}
+	derived := map[string]model.AgentRole{}
+	if r := db.MigrationReport(); r != nil {
+		for _, entry := range r.Agents {
+			derived[entry.AgentID] = entry.Role
+		}
+	}
+	for id, want := range wantAgents {
+		if derived[id] != want.role {
+			t.Errorf("%s: schema 2 derived role %q, want %q", id, derived[id], want.role)
 		}
 	}
 

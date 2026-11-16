@@ -2,6 +2,8 @@ package capcatalog
 
 import (
 	"encoding/json"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -243,6 +245,58 @@ func TestReservedIDWithLooserParamsIsRefused(t *testing.T) {
 		err := ValidateParams(tpl.Capability, map[string]string{ResourceNameParam: name})
 		if (err == nil) != ok {
 			t.Errorf("instance id of %d characters: %v", len(name), err)
+		}
+	}
+}
+
+// The role policy the console and the quickstart tell a supervisor to attach
+// must allow exactly what the access templates can ask for: an action missing
+// there fails in the cloud, and an extra one widens what a leaked broker key
+// could reach.
+func TestDocumentedRolePolicyMatchesTheTemplates(t *testing.T) {
+	want := map[string]bool{"sts:GetCallerIdentity": true} // the connection test
+	for _, spec := range resourceSpecs {
+		for _, list := range [][]string{spec.read, spec.write, spec.full} {
+			for _, action := range list {
+				want[action] = true
+			}
+		}
+	}
+	quoted := regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram):[A-Za-z*]+)["']`)
+	for _, file := range []string{"../../web/src/app/rolePolicy.ts", "../../docs/QUICKSTART.md"} {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(raw)
+		// Only the role's Allow list: it starts with ecs:Describe* and ends
+		// with the connection test's action.
+		start := strings.Index(text, "ecs:Describe*")
+		end := strings.Index(text, "sts:GetCallerIdentity")
+		if start < 0 || end < start {
+			t.Fatalf("%s: cannot find the role's permission policy", file)
+		}
+		end += len("sts:GetCallerIdentity") + 1
+		got := map[string]bool{}
+		for _, m := range quoted.FindAllStringSubmatch(text[start-1:end], -1) {
+			got[m[1]] = true
+		}
+		for action := range want {
+			if !got[action] {
+				t.Errorf("%s: the role policy does not allow %s, which a template can ask for", file, action)
+			}
+		}
+		for action := range got {
+			if !want[action] {
+				t.Errorf("%s: the role policy allows %s, which no template asks for", file, action)
+			}
+			if strings.HasSuffix(action, ":*") {
+				t.Errorf("%s: the role policy has the wildcard %s", file, action)
+			}
+		}
+		deny := regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']ram:\*["'],\s*["']sts:AssumeRole["']\]`)
+		if !deny.MatchString(text) {
+			t.Errorf("%s: the role policy does not deny ram:* and sts:AssumeRole", file)
 		}
 	}
 }

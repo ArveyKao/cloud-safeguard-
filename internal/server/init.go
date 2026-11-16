@@ -1,9 +1,7 @@
 package server
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,19 +55,37 @@ const (
 // cloud account. It never touches an existing install: upgrades happen when
 // `csg serve` opens the database, and a locked-out supervisor is recovered
 // with RecoverSupervisor.
-func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
+func Init(ctx context.Context, opts InitOptions) (result InitResult, err error) {
 	if opts.DataDir == "" {
 		return InitResult{}, errors.New("server: data dir is required")
+	}
+	// Everything that can be refused is refused before anything is written.
+	supervisorName := opts.SupervisorUsername
+	if strings.TrimSpace(supervisorName) == "" {
+		supervisorName = DefaultSupervisorUsername
+	}
+	if _, ok := normalizeUsername(supervisorName); !ok {
+		return InitResult{}, fmt.Errorf("server: invalid supervisor username %q", supervisorName)
+	}
+	if len(opts.MasterKey) > 0 && len(opts.MasterKey) != 32 {
+		return InitResult{}, vault.ErrInvalidKey
 	}
 	dir := opts.DataDir
 	keyPath := filepath.Join(dir, "master.key")
 	dbPath := filepath.Join(dir, store.DBFileName)
 
-	keyPresent := fileExists(keyPath)
-	dbPresent := fileExists(dbPath)
-	if keyPresent || dbPresent {
+	switch keyPresent, dbPresent := fileExists(keyPath), fileExists(dbPath); {
+	case keyPresent && dbPresent:
 		return InitResult{}, fmt.Errorf(
 			"data directory %q is already initialized; refusing to touch it (`csg serve` upgrades it, and `csg supervisor recover` issues a new setup code)",
+			dir)
+	case keyPresent:
+		return InitResult{}, fmt.Errorf(
+			"data directory %q holds a master.key but no database: it is the remains of an interrupted setup or of a lost database; refusing to touch it. Restore %s, or remove master.key if nothing was ever stored with it, then run csg init again",
+			dir, store.DBFileName)
+	case dbPresent:
+		return InitResult{}, fmt.Errorf(
+			"data directory %q holds a database but no master.key; refusing to touch it. Restore master.key (or set CSG_MASTER_KEY); without the key the stored secrets cannot be read",
 			dir)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -77,11 +93,23 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 	}
 	_ = os.Chmod(dir, 0o700) // best effort 0700
 
-	key, err := initMasterKey(opts, keyPath, keyPresent)
+	// From here on Init creates files. If it fails, it removes what it
+	// created, so a failed init never leaves a directory that looks
+	// initialized but has no supervisor.
+	var db *store.DB
+	defer func() {
+		if db != nil {
+			db.Close()
+		}
+		if err != nil {
+			for _, name := range []string{"master.key", store.DBFileName, store.DBFileName + "-wal", store.DBFileName + "-shm"} {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}()
+
+	key, err := initMasterKey(opts, keyPath)
 	if err != nil {
-		return InitResult{}, err
-	}
-	if _, err := vault.New(key); err != nil {
 		return InitResult{}, err
 	}
 	v, err := vault.New(key)
@@ -89,11 +117,10 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		return InitResult{}, err
 	}
 
-	db, err := store.Open(ctx, dir)
+	db, err = store.Open(ctx, dir)
 	if err != nil {
 		return InitResult{}, err
 	}
-	defer db.Close()
 	if err := ensureVaultKeyCheck(ctx, db, v); err != nil {
 		return InitResult{}, err
 	}
@@ -131,12 +158,15 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 		return InitResult{}, err
 	}
 
+	if err := bootstrapHook(); err != nil {
+		return InitResult{}, err
+	}
 	supervisor, err := bootstrapSupervisor(ctx, db, opts.SupervisorUsername, now)
 	if err != nil {
 		return InitResult{}, err
 	}
 
-	result := InitResult{Supervisor: supervisor, DataDir: dir, ProviderIDs: []string{}}
+	result = InitResult{Supervisor: supervisor, DataDir: dir, ProviderIDs: []string{}}
 
 	if opts.Demo {
 		providerID, err := seedDemoProvider(ctx, db, v, now)
@@ -151,42 +181,11 @@ func Init(ctx context.Context, opts InitOptions) (InitResult, error) {
 	return result, nil
 }
 
-// initMasterKey resolves the master key for Init, reusing an existing key file
-// so --force never orphans encrypted data.
-func initMasterKey(opts InitOptions, keyPath string, keyPresent bool) ([]byte, error) {
-	// An environment override must agree with an existing key file, otherwise a
-	// later serve would decrypt with a different key than the data was written
-	// with.
-	if keyPresent && len(opts.MasterKey) == 0 {
-		if raw := strings.TrimSpace(os.Getenv("CSG_MASTER_KEY")); raw != "" {
-			envKey, err := base64.StdEncoding.DecodeString(raw)
-			if err != nil {
-				return nil, fmt.Errorf("server: CSG_MASTER_KEY is not valid base64: %w", err)
-			}
-			existing, err := os.ReadFile(keyPath)
-			if err != nil {
-				return nil, fmt.Errorf("server: read existing master key: %w", err)
-			}
-			if !bytes.Equal(existing, envKey) {
-				return nil, errors.New("server: CSG_MASTER_KEY does not match the existing data directory master key")
-			}
-		}
-	}
+// initMasterKey writes the master key of a new data directory: the one
+// supplied, or $CSG_MASTER_KEY, or a freshly generated one.
+func initMasterKey(opts InitOptions, keyPath string) ([]byte, error) {
 	if len(opts.MasterKey) > 0 {
-		if len(opts.MasterKey) != 32 {
-			return nil, vault.ErrInvalidKey
-		}
 		key := append([]byte(nil), opts.MasterKey...)
-		if keyPresent {
-			existing, err := os.ReadFile(keyPath)
-			if err != nil {
-				return nil, fmt.Errorf("server: read existing master key: %w", err)
-			}
-			if !bytes.Equal(existing, key) {
-				return nil, errors.New("server: supplied master key does not match the existing data directory master key")
-			}
-			return key, nil
-		}
 		if err := os.WriteFile(keyPath, key, 0o600); err != nil {
 			return nil, fmt.Errorf("server: write master key: %w", err)
 		}
@@ -205,7 +204,7 @@ func seedDemoProvider(ctx context.Context, db *store.DB, v *vault.Vault, now tim
 	}
 	for _, p := range providers {
 		if p.Name == demoProviderName {
-			return "", nil // data intact on --force
+			return "", nil
 		}
 	}
 	id, err := newID("prv_")
@@ -288,6 +287,10 @@ func auditMigrationReport(ctx context.Context, db *store.DB) error {
 	})
 }
 
+// bootstrapHook runs just before the first supervisor is created; tests
+// replace it to make Init fail after it has created files.
+var bootstrapHook = func() error { return nil }
+
 // DefaultSupervisorUsername is the first supervisor's username when Init is
 // not given one.
 const DefaultSupervisorUsername = "admin"
@@ -369,6 +372,11 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 	}
 	defer db.Close()
 	if err := verifyVaultKey(ctx, db, v); err != nil {
+		return zero, err
+	}
+	// Recovery may be the first command to open an older database, which
+	// upgrades it: record that here, since `csg serve` will see no upgrade.
+	if err := auditMigrationReport(ctx, db); err != nil {
 		return zero, err
 	}
 

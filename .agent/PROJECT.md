@@ -96,6 +96,16 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   Supervisors are Administrator on every cloud account (owner's decision, 2026-11-14).
   `scripts/demo.sh` now runs nine scenarios through `scripts/demo/` (people over HTTP, the
   agent through the real `csg`). Verified locally; awaiting commit and independent review.
+- **Review of a936962 (2026-11-16):** one blocker and eight majors, all fixed. The server now
+  refuses to start without a supervisor (an upgraded v0.1 install has none) and says to run
+  `csg supervisor recover`; `csg init` validates first and removes what it created when it
+  fails; limits are the supervisor's current settings, not a copy made at agent sign-in; an
+  agent without an owner is refused everywhere; every role write re-checks the person's
+  agents; the connection test also assumes the role; the console wizard, QUICKSTART and the
+  access templates share one role policy (tested); the demo script deletes only demo
+  directories. Found on the way: the STS client read the AssumeRole credential from the top
+  level of the response, but Alibaba Cloud nests it under `Credentials`, so real mode could
+  never have issued anything. Fixed; still unverified against a live account.
 - **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
   for everything except adding a cloud account, which stays console-only; (2) remote MCP over
   HTTPS with OAuth-style sign-in so an agent connects with just a URL.

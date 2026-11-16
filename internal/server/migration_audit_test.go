@@ -168,6 +168,21 @@ func TestUpgradeRemovesTheAdminTokenAndTheOldAgentModel(t *testing.T) {
 		if err != nil || len(migrated) != 1 {
 			t.Fatalf("start %d: schema.migrated events = %d, %v", start, len(migrated), err)
 		}
+		if migrated[0].Metadata["deleted_admin_token"] != true {
+			t.Fatalf("schema.migrated does not say the admin token was deleted: %+v", migrated[0].Metadata)
+		}
+		// No agent keeps a role or grants of its own.
+		for _, id := range []string{"agt_old_active", "agt_owned"} {
+			if ag, _ := srv.db.GetAgent(ctx, id); ag.Role != model.RoleGuest || len(ag.Grants) != 0 {
+				t.Fatalf("agent %s keeps role %q and grants %v", id, ag.Role, ag.Grants)
+			}
+		}
+		// The startup revocations name the agent.
+		for _, ev := range srv.listAuditFor(t, "lease.revoked") {
+			if ev.Metadata["agent_id"] != "agt_old_active" {
+				t.Fatalf("startup revocation does not name the agent: %+v", ev.Metadata)
+			}
+		}
 		revokedAgents, _ := migrated[0].Metadata["revoked_agents"].([]any)
 		if len(revokedAgents) != 2 || revokedAgents[0] != "agt_old_active" || revokedAgents[1] != "agt_old_suspended" {
 			t.Fatalf("schema.migrated does not list the revoked agents: %+v", migrated[0].Metadata)

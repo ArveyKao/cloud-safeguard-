@@ -60,7 +60,7 @@ Agent   → asks: cloud account + resource (ecs/dns/oss) + permission (read/writ
 
 | Who | What they can do |
 | --- | --- |
-| Supervisor | Manages cloud accounts, people, roles and limits. Administrator on every cloud account. Can stop any request or credential, never approve one. |
+| Supervisor | Manages cloud accounts, people, roles and limits. Administrator on every cloud account. Can stop any request or credential, and can approve only their own agents' requests. |
 | Person | Has a role per cloud account: Guest (read), Member (read, write), Administrator (read, write, full). Approves their own agents' requests. |
 | Agent | Belongs to one person and can never get more than that person's role allows. |
 
@@ -111,7 +111,7 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | Agents sign in with a short code a person approves; no token is copied by hand | ✅ |
 | Access requests: cloud account, resource type (ECS, DNS, OSS), read / write / full, validity, optional resource name | ✅ |
 | Approval modes per person (Read, Write, Full) and a highest automatic level per cloud account | ✅ |
-| Only the agent's owner approves; supervisors can deny or revoke anything | ✅ |
+| Only the agent's owner approves; supervisors can deny or revoke anything, never approve for someone else | ✅ |
 | STS credentials with a policy scoped to the request; RAM management always denied | ✅ |
 | Deadlines, a background sweeper, and revocation when a role is lowered, a person is suspended or an account is disabled | ✅ |
 | AES-256-GCM vault for the broker AccessKey and issued credentials; one-place key replacement | ✅ |

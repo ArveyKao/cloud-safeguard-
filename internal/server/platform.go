@@ -83,7 +83,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	// Roles and requests are bound to the cloud account the role lives in; an
 	// account without one could never issue anything.
 	if model.CloudAccountIDFromRoleARN(in.Type, in.RoleARN) == "" {
-		s.badRequest(w, "role_arn must be a RAM role ARN such as acs:ram::1234567890123456:role/csg-broker")
+		s.badRequest(w, "role_arn must be a RAM role ARN such as acs:ram::1234567890123456:role/cloud-safeguard")
 		return
 	}
 
@@ -200,7 +200,46 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	if in.RoleARN != nil && prov.RoleARN != *in.RoleARN {
 		// People's roles are bound to this provider. Pointing it at a role in
 		// another cloud account would silently move those roles there.
-		if model.CloudAccountIDFromRoleARN(prov.Type, *in.RoleARN) != prov.CloudAccountID {
+		account := model.CloudAccountIDFromRoleARN(prov.Type, *in.RoleARN)
+		switch {
+		case account == "":
+			s.badRequest(w, "role_arn must be a RAM role ARN such as acs:ram::1234567890123456:role/cloud-safeguard")
+			return
+		case prov.CloudAccountID == "":
+			// Left without a cloud account by an upgrade (its role ARN was
+			// not a role, or another provider already had the account). It
+			// cannot issue anything until it gets one; the unique index
+			// refuses an account that is already connected.
+			// Roles given on it while it had no account did nothing. They
+			// must not start to count for an account nobody chose them for:
+			// remove them first; the supervisor gives roles again.
+			stale, err := s.db.ListBindings(r.Context(), "", prov.ID)
+			if err != nil {
+				s.writeHandlerError(w, err)
+				return
+			}
+			removed := []string{}
+			for _, b := range stale {
+				if err := s.db.DeleteBinding(r.Context(), b.PersonID, prov.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+					s.writeHandlerError(w, err)
+					return
+				}
+				removed = append(removed, b.PersonID)
+			}
+			values["removed_role_bindings"] = map[string]string{"from": strings.Join(removed, ","), "to": ""}
+			if err := s.db.AdoptProviderCloudAccountID(r.Context(), prov.ID, *in.RoleARN, account, s.nowUTC()); err != nil {
+				if errors.Is(err, store.ErrConflict) {
+					s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
+						"cloud account "+account+" is already connected; disable this duplicate instead")
+					return
+				}
+				s.writeHandlerError(w, err)
+				return
+			}
+			prov.CloudAccountID = account
+			values["cloud_account_id"] = map[string]string{"from": "", "to": account}
+			changed = append(changed, "cloud_account_id")
+		case account != prov.CloudAccountID:
 			s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
 				"role_arn must stay in the same cloud account; connect the other account as a new provider")
 			return
@@ -306,7 +345,7 @@ func (s *Server) handleRotateAccount(w http.ResponseWriter, r *http.Request) {
 	s.writeData(w, http.StatusOK, prov)
 }
 
-// providerTestResult is the success payload of POST /admin/providers/{id}/test.
+// providerTestResult is the success payload of POST /supervisor/accounts/{id}/test.
 type providerTestResult struct {
 	OK       bool      `json:"ok"`
 	Message  string    `json:"message"`

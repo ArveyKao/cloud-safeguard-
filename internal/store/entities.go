@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -114,6 +115,30 @@ func (db *DB) UpdateProvider(ctx context.Context, p model.Provider) error {
 		return mapErr(err)
 	}
 	return affectedOrNotFound(res)
+}
+
+// AdoptProviderCloudAccountID gives a provider that has no cloud account ID
+// one, together with the role ARN it comes from. It writes only while the ID
+// is still empty; ErrConflict when another provider already has that ID or
+// this one got an ID meanwhile.
+func (db *DB) AdoptProviderCloudAccountID(ctx context.Context, id, roleARN, cloudAccountID string, now time.Time) error {
+	if cloudAccountID == "" {
+		return errors.New("store: cloud account ID is required")
+	}
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE providers SET role_arn = ?, cloud_account_id = ?, updated_at = ?
+		 WHERE id = ? AND cloud_account_id = ''`, roleARN, cloudAccountID, toMillis(now), id)
+	if err != nil {
+		return mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return mapErr(err)
+	}
+	if n == 0 {
+		return ErrConflict
+	}
+	return nil
 }
 
 // UpdateProviderCredential replaces the encrypted broker credential blob.
