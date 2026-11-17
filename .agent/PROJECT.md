@@ -113,6 +113,14 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   giving an account its ID and removing its old roles is one transaction; approvals hold
   the agent's lock, so parallel approvals cannot exceed the limit; startup and recovery
   revocations name the agent and owner. Awaiting the third round.
+- **Third review round, of 478e3c0 (2026-11-16):** round two confirmed fixed except one new
+  blocker from my own fix: `csg serve` with a wrong `$CSG_MASTER_KEY` on an old directory
+  wrote the key check with that key and locked the right one out. Fixed: a supplied key
+  must equal `master.key` when the file exists, and a key that exists only in the
+  environment is written into the key check only when the server is about to serve. The
+  upgrade report is now kept in the database until it is audited. Minor items fixed too
+  (deterministic parallel-approval test, demo delete race, `-wal`/`-shm` remnants, owner
+  revocation attribution). Awaiting the fourth round.
 - **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
   for everything except adding a cloud account, which stays console-only; (2) remote MCP over
   HTTPS with OAuth-style sign-in so an agent connects with just a URL.

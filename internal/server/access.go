@@ -493,6 +493,7 @@ func (s *Server) handleRevokeMyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	revoked, err := s.revokeLeaseWithCause(ctx, lease, "revoked by the agent's owner", map[string]any{
 		"cause": "owner_revoked", "owner_id": actor.person.ID, "agent_id": ag.ID,
+		"caused_by": "person:" + actor.person.ID, "caused_by_username": actor.person.Username,
 	})
 	if err != nil {
 		s.writeHandlerError(w, err)

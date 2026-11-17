@@ -3,16 +3,19 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
+	"github.com/arveykao/cloud-safeguard/internal/provider"
 	"github.com/arveykao/cloud-safeguard/internal/store"
 	"github.com/arveykao/cloud-safeguard/internal/token"
 )
@@ -444,6 +447,11 @@ func TestEmptyV01InstallCanBeRecoveredEitherWay(t *testing.T) {
 						t.Fatalf("attempt %d: New = %v, want ErrNoSupervisor", attempt, err)
 					}
 				}
+				// Serving with the directory's own key wrote the key check,
+				// although it then refused to start.
+				if !keyCheckExists(t, dir) {
+					t.Fatal("serve wrote no key check")
+				}
 			}
 			out, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"})
 			if err != nil || out.SetupCode == "" {
@@ -641,40 +649,57 @@ func TestRefusedRepairKeepsRolesAndUnconnectedAccountTakesNoRoles(t *testing.T) 
 }
 
 // Two approvals at once never put an agent above the limit on active
-// credentials, including a limit that was lowered after the requests were made.
+// credentials, including a limit that was lowered after the requests were
+// made. The second approval is started while the first is minting: it must
+// wait for the agent's lock, and then find the limit reached.
 func TestParallelApprovalsRespectTheLimit(t *testing.T) {
-	for round := 0; round < 5; round++ {
-		a := newAccessEnv(t, model.RoleMember)
-		settings := model.DefaultPolicySettings()
-		settings.MaxConcurrentLeasesPerAgent = 5
-		requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
-		a.request(accessInput("ecs", "read"))
-		a.request(accessInput("oss", "read"))
-		first := a.request(accessInput("ecs", "write"))
-		second := a.request(accessInput("oss", "write"))
-		settings.MaxConcurrentLeasesPerAgent = 3
-		requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+	a := newAccessEnv(t, model.RoleMember)
+	settings := model.DefaultPolicySettings()
+	settings.MaxConcurrentLeasesPerAgent = 5
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+	a.request(accessInput("ecs", "read"))
+	a.request(accessInput("oss", "read"))
+	first := a.request(accessInput("ecs", "write"))
+	second := a.request(accessInput("oss", "write"))
+	settings.MaxConcurrentLeasesPerAgent = 3
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
 
-		codes := make(chan int, 2)
-		start := make(chan struct{})
-		for _, id := range []string{first.ID, second.ID} {
-			go func() {
-				<-start
-				codes <- a.approve(a.mei, id).Code
-			}()
-		}
-		close(start)
-		x, y := <-codes, <-codes
-		if !((x == http.StatusOK && y == http.StatusConflict) || (x == http.StatusConflict && y == http.StatusOK)) {
-			t.Fatalf("round %d: approvals = %d, %d; want one 200 and one 409", round, x, y)
-		}
-		active, err := a.srv.db.CountActiveLeases(context.Background(), a.agent.ID)
-		if err != nil || active != 3 {
-			t.Fatalf("round %d: %d active credentials under a limit of 3 (%v)", round, active, err)
-		}
-		if n := a.minter.requestCount(); n != 3 {
-			t.Fatalf("round %d: minted %d times, want 3", round, n)
-		}
+	secondDone := make(chan int, 1)
+	finishedDuringMint := false
+	var once sync.Once
+	a.minter.onMint = func(provider.MintRequest) {
+		once.Do(func() {
+			// The first approval has counted the active credentials and is
+			// minting. Without the agent's lock the second one would count
+			// the same number now and mint as well.
+			result := make(chan int, 1)
+			go func() { result <- a.approve(a.mei, second.ID).Code }()
+			select {
+			case code := <-result:
+				finishedDuringMint = true
+				secondDone <- code
+			case <-time.After(300 * time.Millisecond):
+				go func() { secondDone <- <-result }()
+			}
+		})
+	}
+	firstCode := a.approve(a.mei, first.ID).Code
+	secondCode := <-secondDone
+	if finishedDuringMint {
+		t.Fatalf("the second approval finished (%d) while the first was still minting", secondCode)
+	}
+	if firstCode != http.StatusOK || secondCode != http.StatusConflict {
+		t.Fatalf("approvals = %d, %d; want 200 then 409", firstCode, secondCode)
+	}
+	active, err := a.srv.db.CountActiveLeases(context.Background(), a.agent.ID)
+	if err != nil || active != 3 {
+		t.Fatalf("%d active credentials under a limit of 3 (%v)", active, err)
+	}
+	if n := a.minter.requestCount(); n != 3 {
+		t.Fatalf("minted %d times, want 3", n)
+	}
+	if a.status(second.ID) != model.LeasePending {
+		t.Fatalf("the refused request is %s, want still pending", a.status(second.ID))
 	}
 }
 
@@ -760,4 +785,217 @@ func TestStartupAndRecoveryRevocationsNameAgentAndOwner(t *testing.T) {
 		t.Fatalf("credential after recovery = %s", got.Status)
 	}
 	env.verifyAudit()
+}
+
+// ---- regression tests for the third review round (commit 478e3c0) ----
+
+// emptyV01Dir is a v0.1 directory that never stored a secret: schema 1, no
+// key check, no cloud account, no person, an admin token. With envOnly the
+// key is not in master.key; it is returned base64-encoded for
+// $CSG_MASTER_KEY.
+func emptyV01Dir(t *testing.T, envOnly bool) (dir, envKey string) {
+	t.Helper()
+	dir = t.TempDir()
+	if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	downgradeToV1(t, dir)
+	rawExec(t, dir, `DELETE FROM persons`, `DELETE FROM audit`, `DELETE FROM meta WHERE key = 'vault_key_check'`,
+		`INSERT INTO meta(key, value) VALUES('admin_token_hash', 'abc'), ('admin_token_prefix', 'csg_adm_abc')`)
+	key, err := os.ReadFile(filepath.Join(dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envOnly {
+		if err := os.Remove(filepath.Join(dir, "master.key")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir, base64.StdEncoding.EncodeToString(key)
+}
+
+func keyCheckExists(t *testing.T, dir string) bool {
+	t.Helper()
+	raw, err := sql.Open("sqlite", filepath.Join(dir, store.DBFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var n int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM meta WHERE key = 'vault_key_check'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n == 1
+}
+
+// A wrong $CSG_MASTER_KEY given to `csg serve` or to recovery on such a
+// directory must not become its key: nothing is written, and the right key
+// still recovers and serves afterwards.
+func TestWrongKeyCannotLockOutAnOldDirectory(t *testing.T) {
+	ctx := context.Background()
+	wrong := base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	t.Run("key in master.key", func(t *testing.T) {
+		dir, _ := emptyV01Dir(t, false)
+		t.Setenv("CSG_MASTER_KEY", wrong)
+		if srv, err := New(Config{DataDir: dir}); !errors.Is(err, errWrongMasterKey) {
+			if srv != nil {
+				srv.Close()
+			}
+			t.Fatalf("serve with a wrong $CSG_MASTER_KEY = %v, want errWrongMasterKey", err)
+		}
+		if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"}); !errors.Is(err, errWrongMasterKey) {
+			t.Fatalf("recover with a wrong $CSG_MASTER_KEY = %v", err)
+		}
+		if keyCheckExists(t, dir) {
+			t.Fatal("a wrong key wrote the key check")
+		}
+		t.Setenv("CSG_MASTER_KEY", "")
+		// The right key: serve writes the check and refuses for want of a
+		// supervisor; recovery then works; then it serves.
+		if _, err := New(Config{DataDir: dir}); !errors.Is(err, ErrNoSupervisor) {
+			t.Fatalf("serve with the right key = %v, want ErrNoSupervisor", err)
+		}
+		if !keyCheckExists(t, dir) {
+			t.Fatal("serve with the directory's own key wrote no key check")
+		}
+		if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"}); err != nil {
+			t.Fatalf("recover with the right key: %v", err)
+		}
+		srv, err := New(Config{DataDir: dir})
+		if err != nil {
+			t.Fatalf("serve after recovery: %v", err)
+		}
+		defer srv.Close()
+		if migrated := srv.listAuditFor(t, "schema.migrated"); len(migrated) != 1 || migrated[0].Metadata["deleted_admin_token"] != true {
+			t.Fatalf("schema.migrated = %+v", migrated)
+		}
+	})
+
+	for _, order := range []string{"serve first", "recover first"} {
+		t.Run("key only in the environment, "+order, func(t *testing.T) {
+			dir, right := emptyV01Dir(t, true)
+			// A wrong key first: with no master.key it cannot be told from
+			// the right one, so it must leave nothing behind.
+			t.Setenv("CSG_MASTER_KEY", wrong)
+			if _, err := New(Config{DataDir: dir}); !errors.Is(err, ErrNoSupervisor) {
+				t.Fatalf("serve with a wrong key = %v, want ErrNoSupervisor", err)
+			}
+			if keyCheckExists(t, dir) {
+				t.Fatal("serve wrote a key check before it had a supervisor to serve")
+			}
+			t.Setenv("CSG_MASTER_KEY", right)
+			if order == "serve first" {
+				if _, err := New(Config{DataDir: dir}); !errors.Is(err, ErrNoSupervisor) {
+					t.Fatalf("serve with the right key = %v, want ErrNoSupervisor", err)
+				}
+			}
+			out, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"})
+			if err != nil || out.SetupCode == "" {
+				t.Fatalf("recover with the right key: %v", err)
+			}
+			if keyCheckExists(t, dir) {
+				t.Fatal("recovery wrote a key check with a key it cannot verify")
+			}
+			srv, err := New(Config{DataDir: dir})
+			if err != nil {
+				t.Fatalf("serve after recovery: %v", err)
+			}
+			if migrated := srv.listAuditFor(t, "schema.migrated"); len(migrated) != 1 || migrated[0].Metadata["deleted_admin_token"] != true {
+				t.Fatalf("schema.migrated = %+v", migrated)
+			}
+			srv.Close()
+			// Serving took the key as the directory's: now a wrong one is refused.
+			if !keyCheckExists(t, dir) {
+				t.Fatal("serving wrote no key check")
+			}
+			t.Setenv("CSG_MASTER_KEY", wrong)
+			if _, err := New(Config{DataDir: dir}); !errors.Is(err, errWrongMasterKey) {
+				t.Fatalf("serve with a wrong key after the check exists = %v", err)
+			}
+			if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"}); !errors.Is(err, errWrongMasterKey) {
+				t.Fatalf("recover with a wrong key after the check exists = %v", err)
+			}
+		})
+	}
+}
+
+// The upgrade record survives a command that stops before it can write it:
+// here a recovery refused for a wrong key runs the upgrade, and the next
+// command with the right key records it, once.
+func TestUpgradeRecordSurvivesARefusedCommand(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if _, err := Init(ctx, InitOptions{DataDir: dir, Demo: true}); err != nil {
+		t.Fatal(err)
+	}
+	rawExec(t, dir, `UPDATE meta SET value = '7' WHERE key = 'schema_version'`,
+		`INSERT INTO meta(key, value) VALUES('admin_token_hash', 'abc')`)
+	// The key check exists, so a wrong key is refused after the database
+	// was opened and upgraded. master.key is moved away so the refusal
+	// comes from the key check, not from the file.
+	key, err := os.ReadFile(filepath.Join(dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "master.key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "admin", MasterKey: make([]byte, 32)}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("recover with a wrong key = %v", err)
+	}
+	db, err := store.Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if events, _, _ := db.ListAudit(ctx, store.AuditFilter{Action: "schema.migrated", Limit: 10}); len(events) != 0 {
+		t.Fatalf("a command refused for a wrong key wrote %d audit events", len(events))
+	}
+	if version, _ := db.GetMeta(ctx, store.MetaSchemaVersion); version != "8" {
+		t.Fatalf("schema version = %s", version)
+	}
+	db.Close()
+
+	for start := 1; start <= 2; start++ {
+		srv, err := New(Config{DataDir: dir, MasterKey: key})
+		if err != nil {
+			t.Fatalf("start %d: %v", start, err)
+		}
+		migrated := srv.listAuditFor(t, "schema.migrated")
+		if len(migrated) != 1 || migrated[0].Metadata["deleted_admin_token"] != true || migrated[0].Metadata["from_version"] != float64(7) {
+			t.Fatalf("start %d: schema.migrated = %+v", start, migrated)
+		}
+		srv.Close()
+	}
+}
+
+// A leftover -wal or -shm file is the remains of a database: init refuses
+// and leaves it alone.
+func TestInitRefusesDatabaseRemnants(t *testing.T) {
+	for _, name := range []string{store.DBFileName + "-wal", store.DBFileName + "-shm"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("remnant"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err == nil || !strings.Contains(err.Error(), "database") {
+			t.Fatalf("Init with a %s present = %v", name, err)
+		}
+		entries, _ := os.ReadDir(dir)
+		if data, err := os.ReadFile(path); err != nil || string(data) != "remnant" || len(entries) != 1 {
+			t.Fatalf("Init changed a directory holding %s: %d entries, %v", name, len(entries), err)
+		}
+	}
+}
+
+// When the owner takes a credential back, the event says who did it.
+func TestOwnerRevocationNamesTheOwner(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	req := a.request(accessInput("ecs", "read"))
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/requests/"+req.ID+"/revoke", nil), http.StatusOK)
+	m := a.lastEvent("lease.revoked").Metadata
+	if m["caused_by"] != "person:"+a.mei.person.ID || m["caused_by_username"] != "mei" || m["cause"] != "owner_revoked" ||
+		m["agent_id"] != a.agent.ID || m["owner_id"] != a.mei.person.ID {
+		t.Fatalf("owner revocation metadata = %+v", m)
+	}
 }

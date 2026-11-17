@@ -10,6 +10,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -229,26 +230,32 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("server: read bootstrap time: %w", err)
 	}
 
-	// Record what an upgrade migration changed (the deleted admin token and
-	// revoked agents, for one) before anything can stop the start: the
-	// report exists only for the process that ran the upgrade.
+	// Refuse to run with a master key other than the one this data
+	// directory was encrypted with. A directory from before the key check
+	// that never stored a secret gets its check here only when the key is
+	// its own master.key; a key from the environment is not written yet (see
+	// checkVaultKey), so a wrong one cannot lock the right one out.
+	if err := checkVaultKey(context.Background(), db, v, cfg.DataDir, key, false); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Record what an upgrade changed (the deleted admin token and revoked
+	// agents, for one) before the check below can stop the start.
 	if err := auditMigrationReport(context.Background(), db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("server: record the schema upgrade: %w", err)
-	}
-	// Refuse to run with a master key other than the one this data
-	// directory was encrypted with. A directory from before the key check
-	// gets its check here, before anything can stop the start, so that
-	// `csg supervisor recover` can verify the key afterwards.
-	if err := ensureVaultKeyCheck(context.Background(), db, v); err != nil {
-		db.Close()
-		return nil, err
 	}
 	// Without a supervisor nobody can sign in, add people or connect a cloud
 	// account, and there is no other credential: an install upgraded from a
 	// version that had only the admin token is in this state. Refuse to run
 	// rather than serve a console nobody can enter.
 	if err := requireSupervisor(context.Background(), db, cfg.DataDir); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// About to serve: a directory with no master.key and nothing encrypted
+	// takes the key it is started with as its key from now on.
+	if err := checkVaultKey(context.Background(), db, v, cfg.DataDir, key, true); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -333,6 +340,26 @@ func notInitializedErr(dataDir string) error {
 
 // loadMasterKeyForServe loads the master key without creating one.
 func loadMasterKeyForServe(cfg Config) ([]byte, error) {
+	key, err := resolveMasterKey(cfg)
+	if err != nil {
+		return nil, err
+	}
+	// A key from the configuration or the environment must be the one in
+	// the directory's master.key when that file exists. Otherwise a mistyped
+	// $CSG_MASTER_KEY could be taken for the directory's key.
+	stored, err := os.ReadFile(filepath.Join(cfg.DataDir, "master.key"))
+	switch {
+	case err == nil:
+		if len(stored) != len(key) || subtle.ConstantTimeCompare(stored, key) != 1 {
+			return nil, fmt.Errorf("%w: the key supplied is not the one in its master.key", errWrongMasterKey)
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("server: read master key: %w", err)
+	}
+	return key, nil
+}
+
+func resolveMasterKey(cfg Config) ([]byte, error) {
 	if len(cfg.MasterKey) > 0 {
 		if len(cfg.MasterKey) != 32 {
 			return nil, vault.ErrInvalidKey

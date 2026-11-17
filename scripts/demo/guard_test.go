@@ -62,7 +62,7 @@ func TestDemoScriptRefusesToDeleteOtherDirectories(t *testing.T) {
 		if !strings.Contains(string(out), "refusing to delete") {
 			t.Errorf("--data-dir %s: no refusal: %s", target, out)
 		}
-		if strings.Contains(string(out), "removing existing") || strings.Contains(string(out), "== build ==") {
+		if strings.Contains(string(out), "emptying existing") || strings.Contains(string(out), "== build ==") {
 			t.Errorf("--data-dir %s: the demo got past the guard: %s", target, out)
 		}
 	}

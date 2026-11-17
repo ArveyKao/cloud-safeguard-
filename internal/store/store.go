@@ -179,7 +179,8 @@ type AgentMigration struct {
 	ReplacedRetiredGrant bool `json:"replaced_retired_grant,omitempty"`
 }
 
-// MigrationReport returns what migrations changed during Open, or nil.
+// MigrationReport returns what an upgrade changed and has not been written to
+// the audit log yet, or nil. It survives restarts until ClearMigrationReport.
 func (db *DB) MigrationReport() *MigrationReport { return db.migration }
 
 // DBFileName is the SQLite database file inside the data directory.

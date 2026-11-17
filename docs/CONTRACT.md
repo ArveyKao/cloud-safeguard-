@@ -1039,14 +1039,21 @@ Agent CLI, same flow from a terminal:
 - Upgrade (schema version 8). The migration deletes the admin token, revokes every agent
   without an owner and clears the role and grants stored on every agent; the
   `schema.migrated` audit event says whether an admin token was deleted
-  (`deleted_admin_token`, true or false) and lists the revoked agents. It is written by
-  whichever command opens the database first, `csg serve` or `csg supervisor recover`,
-  before that command can stop for any other reason. At every start the server revokes each pending or active lease
+  (`deleted_admin_token`, true or false) and lists the revoked agents. The report is kept
+  in the database until it has been written to the audit log, so it is recorded exactly
+  once by the first command that gets past the master-key check, `csg serve` or
+  `csg supervisor recover`, even if an earlier command ran the upgrade and then stopped.
+  At every start the server revokes each pending or active lease
   that is not an access request, with one `lease.revoked` event each. People sign their
   agents in again with `csg login`. An install that never had a supervisor does not start
-  until `csg supervisor recover --username NAME` creates one. Recovery works on a directory
-  that never stored a secret (it then writes the key check with the directory's own
-  `master.key`; a key supplied from outside is still refused until `csg serve` has run once).
+  until `csg supervisor recover --username NAME` creates one.
+- The master key. A key given in `$CSG_MASTER_KEY` must equal the directory's `master.key`
+  when that file exists; otherwise the command is refused before anything is written. A
+  directory that never stored a secret has no key check to test a key against. Its check
+  is written with the directory's own `master.key` by the first command that opens it. If
+  the key exists only in the environment, nothing is written until `csg serve` is about to
+  serve (a supervisor exists): a mistyped key on a failed start or a recovery therefore
+  cannot become the directory's key, and recovery works with the key from the environment.
 - Supervisors are Administrator on every cloud account (§17.1). A cloud account must be
   added with a RAM role ARN; a request without one is refused. A provider an older upgrade
   left without a cloud account ID can be given one by setting a role ARN in an account that

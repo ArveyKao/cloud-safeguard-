@@ -1,6 +1,6 @@
-// Package token generates and hashes opaque bearer tokens for agent and admin
-// identities. Only the SHA-256 hash of a token is ever stored; the plaintext is
-// returned exactly once, at creation or rotation time.
+// Package token generates and hashes the opaque bearer tokens of agents. Only
+// the SHA-256 hash of a token is ever stored; the plaintext is returned
+// exactly once, to the agent, when a person approves its sign-in.
 package token
 
 import (

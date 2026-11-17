@@ -382,7 +382,68 @@ func (db *DB) applyMigrations(ctx context.Context) error {
 			return fmt.Errorf("store: commit migration %d: %w", v+1, err)
 		}
 	}
+	// The report must outlive this process: the command that ran the
+	// upgrade may stop (a wrong master key, for one) before it can write the
+	// audit event. It is kept in the database until ClearMigrationReport.
+	pending, err := db.pendingMigrationReport(ctx)
+	if err != nil {
+		return err
+	}
+	switch {
+	case report != nil && pending != nil:
+		// An earlier upgrade was never recorded: one report for both.
+		report.FromVersion = pending.FromVersion
+		report.DisabledCapabilities = append(pending.DisabledCapabilities, report.DisabledCapabilities...)
+		report.Agents = append(pending.Agents, report.Agents...)
+		report.RevokedAgents = append(pending.RevokedAgents, report.RevokedAgents...)
+		report.DeletedAdminToken = report.DeletedAdminToken || pending.DeletedAdminToken
+	case report == nil:
+		report = pending
+	}
+	if report != nil {
+		raw, err := json.Marshal(report)
+		if err != nil {
+			return fmt.Errorf("store: encode migration report: %w", err)
+		}
+		if _, err := db.sql.ExecContext(ctx,
+			`INSERT INTO meta(key, value) VALUES(?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaPendingMigrationReport, string(raw)); err != nil {
+			return fmt.Errorf("store: keep migration report: %w", err)
+		}
+	}
 	db.migration = report
+	return nil
+}
+
+// metaPendingMigrationReport holds the report of an upgrade that has not
+// been written to the audit log yet.
+const metaPendingMigrationReport = "pending_migration_report"
+
+// pendingMigrationReport reads a kept report; nil when there is none or the
+// database is fresh.
+func (db *DB) pendingMigrationReport(ctx context.Context) (*MigrationReport, error) {
+	var raw string
+	err := db.sql.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, metaPendingMigrationReport).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read migration report: %w", err)
+	}
+	var report MigrationReport
+	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		return nil, fmt.Errorf("store: corrupt migration report: %w", err)
+	}
+	return &report, nil
+}
+
+// ClearMigrationReport forgets the kept report, once the caller has written
+// it to the audit log.
+func (db *DB) ClearMigrationReport(ctx context.Context) error {
+	if _, err := db.sql.ExecContext(ctx, `DELETE FROM meta WHERE key = ?`, metaPendingMigrationReport); err != nil {
+		return mapErr(err)
+	}
+	db.migration = nil
 	return nil
 }
 

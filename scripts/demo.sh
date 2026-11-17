@@ -130,8 +130,15 @@ if [ -e "$DATA_DIR" ] || [ -L "$DATA_DIR" ]; then
       exit 2
       ;;
   esac
-  echo "removing existing demo data dir: $REAL"
-  rm -rf -- "$REAL"
+  # Empty it from inside: after cd -P the shell is in the directory that was
+  # checked, whatever happens to the path afterwards, and find never leaves
+  # it or follows a symlink out of it.
+  echo "emptying existing demo data dir: $REAL"
+  (
+    cd -P -- "$DATA_DIR" || exit 1
+    [ "$(pwd -P)" = "$REAL" ] || { echo "demo: $DATA_DIR changed while it was being checked" >&2; exit 1; }
+    find . -mindepth 1 -delete
+  ) || exit 2
 fi
 
 echo "Cloud Safeguard demo (mock provider; no real cloud credentials)"

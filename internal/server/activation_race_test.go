@@ -207,13 +207,18 @@ func TestConcurrentApprovalsMintOnceAndKeepWinnerCredential(t *testing.T) {
 	}
 }
 
-// A request that would be issued automatically is decided by someone else
+// A request that would be issued automatically, and someone acting on it
 // after its pending row is written but before the automatic issue takes the
-// lock. The automatic issue must not mint over that decision.
-func TestAutomaticIssueSkipsARequestDecidedBeforeItsLock(t *testing.T) {
+// lease's lock.
+//   - The owner's approval is kept out by the agent's lock: it waits, then
+//     finds the request already issued (the first subtest).
+//   - A supervisor's deny does not wait: the automatic issue must see that
+//     the request is no longer pending and not mint over the decision (the
+//     second subtest; it fails without the status check under the lock).
+func TestAutomaticIssueAndADecisionBeforeItsLock(t *testing.T) {
 	// The owner cannot get in between: an approval waits for the agent's
 	// request in flight, then finds the request already issued.
-	t.Run("the owner tries to approve it", func(t *testing.T) {
+	t.Run("the owner's approval waits for the agent's lock", func(t *testing.T) {
 		a := newAccessEnv(t, model.RoleGuest)
 		approval := make(chan int, 1)
 		a.srv.hookBeforeAutoLock = func(leaseID string) {
@@ -242,7 +247,7 @@ func TestAutomaticIssueSkipsARequestDecidedBeforeItsLock(t *testing.T) {
 		}
 		requireStatus(t, a.credential(leaseID), http.StatusOK)
 	})
-	t.Run("a supervisor denied it", func(t *testing.T) {
+	t.Run("a supervisor's deny is not minted over", func(t *testing.T) {
 		a := newAccessEnv(t, model.RoleGuest)
 		a.srv.hookBeforeAutoLock = func(leaseID string) {
 			rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+leaseID+"/deny", model.DenyLeaseInput{Reason: "stop"})

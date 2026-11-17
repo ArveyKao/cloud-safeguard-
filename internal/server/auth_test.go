@@ -674,24 +674,29 @@ func TestWrongMasterKeyIsRefusedWithoutProviders(t *testing.T) {
 	}
 	empty := newTestEnv(t, false)
 	deleteKeyCheck(empty)
-	// A key supplied from outside cannot be verified, right or wrong, and
-	// nothing is written.
+	// With nothing encrypted to test against, the directory's master.key
+	// still tells a wrong key from the right one, and a wrong key writes
+	// nothing.
 	rightKey, err := os.ReadFile(filepath.Join(empty.dir, "master.key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, key := range map[string][]byte{"wrong": wrongKey, "right but supplied": rightKey} {
-		if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin", MasterKey: key}); !errors.Is(err, errVaultKeyUnverifiable) {
-			t.Fatalf("nothing to verify against, %s key: %v", name, err)
-		}
-		if _, err := empty.srv.db.GetMeta(ctx, store.MetaVaultKeyCheck); !errors.Is(err, store.ErrNotFound) {
-			t.Fatalf("%s key: a key check was written: %v", name, err)
-		}
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin", MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("nothing to verify against, wrong key: %v", err)
 	}
-	// The directory's own master.key is the right key by definition: the
-	// check is written with it, and a wrong key is refused from then on.
-	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin"}); err != nil {
+	if _, err := New(Config{DataDir: empty.dir, MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("serve, nothing to verify against, wrong key: %v", err)
+	}
+	if _, err := empty.srv.db.GetMeta(ctx, store.MetaVaultKeyCheck); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a wrong key wrote a key check: %v", err)
+	}
+	// The directory's own key, supplied or read from the file: the check is
+	// written with it, and a wrong key is refused from then on too.
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin", MasterKey: rightKey}); err != nil {
 		t.Fatalf("nothing to verify against, the directory's own key: %v", err)
+	}
+	if _, err := empty.srv.db.GetMeta(ctx, store.MetaVaultKeyCheck); err != nil {
+		t.Fatalf("the directory's own key wrote no key check: %v", err)
 	}
 	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin", MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
 		t.Fatalf("after the key check was written, wrong key: %v", err)
