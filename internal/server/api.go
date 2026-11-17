@@ -47,6 +47,7 @@ func (s *Server) buildHandler() http.Handler {
 	agentMux.HandleFunc("POST /api/v1/agent/access-requests", s.handleAgentCreateAccessRequest)
 	agentMux.HandleFunc("GET /api/v1/agent/access-requests/{id}", s.handleAgentGetAccessRequest)
 	agentMux.HandleFunc("/", s.handleUnknownAPI)
+	s.agentAPI = agentMux
 
 	// Human sign-in (CONTRACT §17.3). Setup and login are unauthenticated.
 	authMux := http.NewServeMux()
@@ -79,6 +80,9 @@ func (s *Server) buildHandler() http.Handler {
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/approve", s.consoleOnly(s.handleApproveCLISignIn))
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/deny", s.handleDenyCLISignIn)
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/cancel", s.handleCancelCLISignIn)
+	meMux.HandleFunc("GET /api/v1/me/mcp-connections/{key}", s.handleGetMCPConnection)
+	meMux.HandleFunc("POST /api/v1/me/mcp-connections/{key}/approve", s.consoleOnly(s.handleApproveMCPConnection))
+	meMux.HandleFunc("POST /api/v1/me/mcp-connections/{key}/deny", s.handleDenyMCPConnection)
 	meMux.HandleFunc("GET /api/v1/me/cli-sessions", s.handleListCLISessions)
 	meMux.HandleFunc("POST /api/v1/me/cli-sessions/{id}/revoke", s.handleRevokeCLISession)
 	meMux.HandleFunc("POST /api/v1/me/requests/{id}/deny", s.handleDenyMyRequest)
@@ -126,6 +130,15 @@ func (s *Server) buildHandler() http.Handler {
 	root.Handle("/api/v1/me/", s.requireSession(meMux))
 	root.Handle("/api/v1/supervisor/", s.requireSession(s.requireSupervisor(supervisorMux)))
 	root.Handle("/api/v1/agent/", s.requireAgent(agentMux))
+	// Remote MCP and its OAuth sign-in (CONTRACT §17.10).
+	root.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
+	root.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleProtectedResourceMetadata)
+	root.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthorizationServerMetadata)
+	root.HandleFunc("POST /oauth/register", s.handleOAuthRegister)
+	root.HandleFunc("GET /oauth/authorize", s.handleOAuthAuthorize)
+	root.HandleFunc("POST /oauth/token", s.handleOAuthToken)
+	root.Handle("/mcp", s.mcpGate(s.requireAgent(http.HandlerFunc(s.handleMCP))))
+	root.HandleFunc("POST "+credentialLinkPrefix+"{token}", s.handleCredentialLink)
 	root.HandleFunc("/mock-cloud/", s.handleMockCloud)
 	root.HandleFunc("/", s.handleStatic)
 
@@ -238,10 +251,11 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 }
 
 // logPath is the request path as written to the access log, the audit log
-// and panic messages. A sign-in user code (of an agent or of csg) is an
-// approval secret while the sign-in is pending, so it is masked.
+// and panic messages. A sign-in user code (of an agent or of csg) or an MCP
+// connection key is an approval secret while pending, and a credential link
+// is a secret until used, so they are masked.
 func logPath(path string) string {
-	for _, prefix := range []string{"/api/v1/me/signins/", "/api/v1/me/cli-signins/"} {
+	for _, prefix := range []string{"/api/v1/me/signins/", "/api/v1/me/cli-signins/", "/api/v1/me/mcp-connections/", credentialLinkPrefix} {
 		if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
 			if _, tail, found := strings.Cut(rest, "/"); found {
 				return prefix + "***/" + tail

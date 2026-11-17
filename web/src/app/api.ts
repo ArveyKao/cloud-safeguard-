@@ -3,7 +3,7 @@
  * CSRF token from /auth/me is kept in memory only and sent on every change.
  * No token is ever stored in localStorage.
  */
-import type { AccessRequest, Agent, AgentSignIn, ApprovalMode, AuditEvent, List, Person, PersonAccount, PersonWithSetupCode, PolicySettings, Provider, Role, RoleBinding, SessionInfo, SetupBeginResult, CLISignIn, CLISession } from './types'
+import type { AccessRequest, Agent, AgentSignIn, ApprovalMode, AuditEvent, List, Person, PersonAccount, PersonWithSetupCode, PolicySettings, Provider, Role, RoleBinding, SessionInfo, SetupBeginResult, CLISignIn, CLISession, MCPConnection } from './types'
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -80,6 +80,9 @@ export const api = {
   signIn: (code: string) => call<AgentSignIn>('GET', `/me/signins/${enc(code)}`),
   approveSignIn: (code: string) => call<AgentSignIn>('POST', `/me/signins/${enc(code)}/approve`, {}),
   denySignIn: (code: string) => call<AgentSignIn>('POST', `/me/signins/${enc(code)}/deny`, {}),
+  mcpConnection: (id: string) => call<MCPConnection>('GET', `/me/mcp-connections/${enc(id)}`),
+  approveMCPConnection: (id: string, agentName: string) => call<{ redirect_url: string }>('POST', `/me/mcp-connections/${enc(id)}/approve`, { agent_name: agentName }),
+  denyMCPConnection: (id: string) => call<{ redirect_url: string }>('POST', `/me/mcp-connections/${enc(id)}/deny`, {}),
   cliSignIn: (code: string) => call<CLISignIn>('GET', `/me/cli-signins/${enc(code)}`),
   approveCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/approve`, {}),
   denyCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/deny`, {}),

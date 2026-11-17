@@ -1,11 +1,11 @@
-// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S10)
+// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S11)
 // against a running control plane in mock mode. scripts/demo.sh builds csg,
 // bootstraps a throwaway data directory, starts the server and runs this.
 //
 // People act through the same HTTP API the console uses (setup, sign-in with
 // an authenticator code, approvals); the agent acts through the real csg
 // binary. No secret is printed: setup codes, passwords, tokens and
-// credentials stay in memory, and S10 checks that none of them reached the
+// credentials stay in memory, and S11 checks that none of them reached the
 // server log or this program's own output.
 package main
 
@@ -13,6 +13,8 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -86,7 +88,8 @@ func main() {
 		{"S7 lowering the role revokes the credential at once", d.s7},
 		{"S8 a supervisor can stop anything; the admin token is gone", d.s8},
 		{"S9 a supervisor on the command line: raising access needs a code, approving stays in the console", d.s9person},
-		{"S10 audit chain verifies and no secret leaked", d.s9},
+		{"S10 an MCP client connects by URL: the owner approves in the console, the credential reaches a shell through a one-time link", d.s10remote},
+		{"S11 audit chain verifies and no secret leaked", d.s9},
 	}
 	failed := 0
 	for _, s := range scenarios {
@@ -103,7 +106,7 @@ func main() {
 	}
 }
 
-// say prints and remembers what was printed, for the leak check in S10.
+// say prints and remembers what was printed, for the leak check in S11.
 func (d *demo) say(format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
 	d.printed.WriteString(text)
@@ -589,7 +592,8 @@ func (d *demo) s9() error {
 		seen[ev.Action] = true
 	}
 	for _, action := range []string{"person.created", "agent_signin.approved", "lease.requested", "lease.auto_approved",
-		"lease.approved", "lease.denied", "lease.revoked", "lease.credential_fetched", "binding.set"} {
+		"lease.approved", "lease.denied", "lease.revoked", "lease.credential_fetched", "binding.set",
+		"mcp_signin.approved", "mcp_signin.completed", "lease.credential_link_created"} {
 		if !seen[action] {
 			return fmt.Errorf("the audit log has no %s event", action)
 		}
@@ -725,5 +729,169 @@ func (d *demo) s9person() error {
 	if _, _, code := d.agent(nil, "person", "whoami"); code != 3 {
 		return errors.New("the session still works after logout")
 	}
+	return nil
+}
+
+// s10remote is a remote MCP client that knows only the server's URL: it
+// discovers the sign-in, registers, mei approves in the console, and the
+// credential reaches a shell through a one-time link.
+func (d *demo) s10remote() error {
+	plain := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	send := func(method, target, contentType, token string, body []byte) (*http.Response, []byte, error) {
+		req, err := http.NewRequest(method, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, nil, err
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := plain.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return resp, raw, nil
+	}
+	// Discovery from the URL alone.
+	resp, _, err := send(http.MethodPost, d.server+"/mcp", "application/json", "", []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	if err != nil {
+		return err
+	}
+	challenge := resp.Header.Get("WWW-Authenticate")
+	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(challenge, "/.well-known/oauth-protected-resource") {
+		return fmt.Errorf("/mcp without a token answered %d %q", resp.StatusCode, challenge)
+	}
+	var meta struct {
+		Authorize string `json:"authorization_endpoint"`
+		Token     string `json:"token_endpoint"`
+		Register  string `json:"registration_endpoint"`
+	}
+	_, raw, err := send(http.MethodGet, d.server+"/.well-known/oauth-authorization-server", "", "", nil)
+	if err != nil || json.Unmarshal(raw, &meta) != nil || meta.Register == "" {
+		return fmt.Errorf("no authorization server metadata: %v", err)
+	}
+	redirect := "http://127.0.0.1:53682/callback"
+	body, _ := json.Marshal(map[string]any{"client_name": "Demo MCP App", "redirect_uris": []string{redirect}})
+	var reg struct {
+		ClientID string `json:"client_id"`
+	}
+	if _, raw, err = send(http.MethodPost, meta.Register, "application/json", "", body); err != nil || json.Unmarshal(raw, &reg) != nil || reg.ClientID == "" {
+		return fmt.Errorf("registration failed: %v", err)
+	}
+	verifierBytes := make([]byte, 32)
+	_, _ = rand.Read(verifierBytes)
+	verifier := hex.EncodeToString(verifierBytes)
+	sum := sha256.Sum256([]byte(verifier))
+	q := url.Values{"response_type": {"code"}, "client_id": {reg.ClientID}, "redirect_uri": {redirect}, "state": {"demo-state"},
+		"code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}}
+	resp, _, err = send(http.MethodGet, meta.Authorize+"?"+q.Encode(), "", "", nil)
+	if err != nil {
+		return err
+	}
+	connID, ok := strings.CutPrefix(resp.Header.Get("Location"), "/?mcp-connect=")
+	if resp.StatusCode != http.StatusFound || !ok {
+		return fmt.Errorf("authorize answered %d to %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	d.secrets["the MCP connection id"] = connID
+
+	// mei sees where the sign-in goes and approves.
+	var view struct {
+		ClientName   string `json:"client_name"`
+		RedirectHost string `json:"redirect_host"`
+	}
+	if err := d.must(d.mei, http.MethodGet, "/api/v1/me/mcp-connections/"+connID, nil, &view, http.StatusOK); err != nil {
+		return err
+	}
+	if view.ClientName != "Demo MCP App" || view.RedirectHost != "127.0.0.1:53682" {
+		return fmt.Errorf("the console shows %+v", view)
+	}
+	var approved struct {
+		RedirectURL string `json:"redirect_url"`
+	}
+	if err := d.must(d.mei, http.MethodPost, "/api/v1/me/mcp-connections/"+connID+"/approve", map[string]string{"agent_name": "demo-mcp-app"}, &approved, http.StatusOK); err != nil {
+		return err
+	}
+	back, err := url.Parse(approved.RedirectURL)
+	if err != nil || back.Query().Get("state") != "demo-state" || back.Query().Get("code") == "" {
+		return fmt.Errorf("unexpected redirect back to the app")
+	}
+	code := back.Query().Get("code")
+	d.secrets["the MCP authorization code"] = code
+	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "client_id": {reg.ClientID}, "redirect_uri": {redirect}, "code_verifier": {verifier}}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if _, raw, err = send(http.MethodPost, meta.Token, "application/x-www-form-urlencoded", "", []byte(form.Encode())); err != nil || json.Unmarshal(raw, &tok) != nil || tok.AccessToken == "" {
+		return fmt.Errorf("token exchange failed: %v", err)
+	}
+	d.secrets["the MCP agent token"] = tok.AccessToken
+	if resp, _, _ := send(http.MethodPost, meta.Token, "application/x-www-form-urlencoded", "", []byte(form.Encode())); resp == nil || resp.StatusCode != http.StatusBadRequest {
+		return errors.New("an authorization code worked twice")
+	}
+
+	// The tools over HTTP.
+	tool := func(name string, args map[string]any) (string, error) {
+		msg, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": name, "arguments": args}})
+		resp, raw, err := send(http.MethodPost, d.server+"/mcp", "application/json", tok.AccessToken, msg)
+		if err != nil {
+			return "", err
+		}
+		var out struct {
+			Result struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+				IsError bool `json:"isError"`
+			} `json:"result"`
+		}
+		if resp.StatusCode != http.StatusOK || json.Unmarshal(raw, &out) != nil || len(out.Result.Content) != 1 {
+			return "", fmt.Errorf("%s answered %d", name, resp.StatusCode)
+		}
+		if out.Result.IsError {
+			return "", fmt.Errorf("%s: %s", name, out.Result.Content[0].Text)
+		}
+		return out.Result.Content[0].Text, nil
+	}
+	text, err := tool("request_access", map[string]any{"cloud_account_id": demoAccount, "resource": "ecs", "permission": "read", "ttl_seconds": 300})
+	if err != nil {
+		return err
+	}
+	var req struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if json.Unmarshal([]byte(text), &req) != nil || req.Status != "active" {
+		return fmt.Errorf("read access was not issued at once: %s", firstLine(text))
+	}
+	if text, err = tool("get_credential", map[string]any{"request_id": req.ID}); err != nil {
+		return err
+	}
+	var cred struct {
+		Run string `json:"run"`
+	}
+	if json.Unmarshal([]byte(text), &cred) != nil || !strings.HasPrefix(cred.Run, `eval "$(curl -fsS -X POST '`) {
+		return fmt.Errorf("get_credential gave no one-time link")
+	}
+	if i := strings.Index(cred.Run, "/credential-links/"); i >= 0 {
+		d.secrets["the one-time credential link"] = strings.TrimSuffix(cred.Run[i+len("/credential-links/"):], `')"`)
+	}
+	// The link sets the credential in a shell; the shell reports only
+	// which variables are set.
+	check := `; for v in ALIBABA_CLOUD_ACCESS_KEY_ID ALIBABA_CLOUD_ACCESS_KEY_SECRET CSG_LEASE_ID; do [ -n "${!v}" ] && printf '%s ' "$v"; done`
+	out, err := exec.Command("bash", "-c", cred.Run+check).Output()
+	if err != nil || strings.TrimSpace(string(out)) != "ALIBABA_CLOUD_ACCESS_KEY_ID ALIBABA_CLOUD_ACCESS_KEY_SECRET CSG_LEASE_ID" {
+		return fmt.Errorf("the link did not set the credential in the shell (%v): %q", err, out)
+	}
+	if out, _ := exec.Command("bash", "-c", cred.Run+check).Output(); strings.TrimSpace(string(out)) != "" {
+		return errors.New("a one-time link worked twice")
+	}
+	if _, err := tool("revoke", map[string]any{"request_id": req.ID}); err != nil {
+		return err
+	}
+	d.say("      an MCP app connected by URL as mei's agent demo-mcp-app; the credential went to a shell, not the model\n")
 	return nil
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cloud Safeguard end-to-end demo (scenarios S1-S10).
+# Cloud Safeguard end-to-end demo (scenarios S1-S11).
 #
 # What it does:
 #   1. builds build/csg and the demo driver from the current tree
@@ -7,7 +7,7 @@
 #      `csg init --demo --json` (a mock cloud account and the first
 #      supervisor's setup code)
 #   3. starts `csg serve` on the requested loopback port in the background
-#   4. runs scenarios S1-S10 (scripts/demo/main.go): people act through the
+#   4. runs scenarios S1-S11 (scripts/demo/main.go): people act through the
 #      console's HTTP API, the agent through the real csg binary and the
 #      mock cloud
 #   5. prints PASS/FAIL lines, stops the server via a cleanup trap, and exits
@@ -219,5 +219,5 @@ if [ "$DRIVER_RC" -ne 0 ]; then
   echo "demo: some scenarios failed" >&2
   exit 1
 fi
-echo "all S1-S10 scenarios passed"
+echo "all S1-S11 scenarios passed"
 exit 0

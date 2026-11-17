@@ -11,6 +11,7 @@ import { SetupPage } from './pages/Setup'
 import { InboxPage } from './pages/Inbox'
 import { SignInApprovalPage } from './pages/SignInApproval'
 import { CLISignInApprovalPage } from './pages/CLISignInApproval'
+import { MCPConnectApprovalPage } from './pages/MCPConnectApproval'
 import { AgentsPage } from './pages/Agents'
 import { AccountsPage } from './pages/Accounts'
 import { AddAccountPage } from './pages/AddAccount'
@@ -20,11 +21,11 @@ import { SettingsPage } from './pages/Settings'
 
 // A sign-in link survives the login screen, for as long as the code lives at
 // most, and is used once: /?signin=CODE for an agent, /?cli-signin=CODE for
-// csg signed in as the person.
+// csg signed in as the person, /?mcp-connect=ID for a remote MCP client.
 const SIGNIN_KEY = 'csg.pendingSignIn'
 const SIGNIN_TTL_MS = 10 * 60 * 1000
 
-export type SignInKind = 'agent' | 'cli'
+export type SignInKind = 'agent' | 'cli' | 'mcp'
 
 export function rememberSignIn(code: string, kind: SignInKind = 'agent') {
   try { sessionStorage.setItem(SIGNIN_KEY, JSON.stringify({ code, kind, at: Date.now() })) } catch { /* storage may be off */ }
@@ -36,14 +37,15 @@ export function takeSignIn(): { code: string; kind: SignInKind } | null {
     sessionStorage.removeItem(SIGNIN_KEY)
     const v = raw ? JSON.parse(raw) as { code?: string; kind?: string; at?: number } : null
     if (!v?.code || !v.at || Date.now() - v.at >= SIGNIN_TTL_MS) return null
-    return { code: v.code, kind: v.kind === 'cli' ? 'cli' : 'agent' }
+    return { code: v.code, kind: v.kind === 'cli' || v.kind === 'mcp' ? v.kind : 'agent' }
   } catch {
     return null
   }
 }
 
 function signInPath(link: { code: string; kind: SignInKind }): string {
-  return `${link.kind === 'cli' ? '/cli-signin' : '/signin'}?code=${encodeURIComponent(link.code)}`
+  const page = link.kind === 'cli' ? '/cli-signin' : link.kind === 'mcp' ? '/mcp-connect' : '/signin'
+  return `${page}?code=${encodeURIComponent(link.code)}`
 }
 
 export function App() {
@@ -61,7 +63,9 @@ export function App() {
   useEffect(() => {
     const agentCode = query.get('signin')
     const cliCode = query.get('cli-signin')
-    if (cliCode) rememberSignIn(cliCode, 'cli')
+    const mcpID = query.get('mcp-connect')
+    if (mcpID) rememberSignIn(mcpID, 'mcp')
+    else if (cliCode) rememberSignIn(cliCode, 'cli')
     else if (agentCode) rememberSignIn(agentCode, 'agent')
     setSignedOutHandler(() => { setCsrf(''); setSession(null) })
     api.me()
@@ -115,6 +119,7 @@ function SignedIn({ session, path, query, setSession }: {
   let page
   if (path === '/signin') page = <SignInApprovalPage code={query.get('code') ?? ''} />
   else if (path === '/cli-signin') page = <CLISignInApprovalPage code={query.get('code') ?? ''} person={person} />
+  else if (path === '/mcp-connect') page = <MCPConnectApprovalPage id={query.get('code') ?? ''} person={person} />
   else if (path === '/agents') page = <AgentsPage />
   else if (path === '/accounts/new' && person.supervisor) page = <AddAccountPage />
   else if (path.startsWith('/accounts')) page = <AccountsPage person={person} />

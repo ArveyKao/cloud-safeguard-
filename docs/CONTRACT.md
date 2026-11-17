@@ -1145,6 +1145,77 @@ showing one request by ID, changing a display name). `supervisor accounts rotate
 new secret from a pipe or file, never from the terminal.
 `csg supervisor recover` stays a local command on the server host.
 
+### 17.10 Remote MCP over HTTPS (decided 2026-11-17)
+
+An agent connects with just a URL: `https://<server>/mcp`. The server follows the MCP
+authorization specification (2025-06-18): OAuth 2.1 with PKCE, discovery and dynamic client
+registration. The owner chose that the credential is handed over through a one-time link.
+
+**Discovery.**
+- `/mcp` without a valid token answers 401 with
+  `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource"`.
+- `GET /.well-known/oauth-protected-resource` (also `…/mcp`): `{resource: "<origin>/mcp",
+  authorization_servers: ["<origin>"], bearer_methods_supported: ["header"]}`.
+- `GET /.well-known/oauth-authorization-server`: issuer, `/oauth/authorize`, `/oauth/token`,
+  `/oauth/register`; response type `code`, grant type `authorization_code`, PKCE `S256` only,
+  token endpoint authentication `none` (public clients).
+
+**Registration.** `POST /oauth/register` (RFC 7591), unauthenticated: a `client_name` and
+1-10 `redirect_uris`, each `https://…`, `http://` on a loopback host, or a private-use scheme
+such as `cursor://` (never `javascript:`, `data:`, `file:` and the like, never a fragment). It
+returns a `client_id` (`mcc_…`) for a public client (`token_endpoint_auth_method: none`).
+Registering grants nothing. At most 500 registrations that never led to a connection may be
+made in 24 hours, 20 from one address; such unused registrations are deleted after 24 hours.
+
+**Sign-in.**
+- `GET /oauth/authorize?response_type=code&client_id&redirect_uri&code_challenge&
+  code_challenge_method=S256&state[&resource][&scope]`. The redirect URI must be one the
+  client registered, exactly, except that the port of a loopback `http` URI may differ
+  (RFC 8252). An unknown client or redirect URI gets an error page, never a redirect; other
+  errors go back to the client. PKCE S256 is required; `resource`, when sent, must be this
+  server's `/mcp`. The server keeps the request for 10 minutes (at most 100 waiting, 10 from
+  one address) and sends the browser to the console with a random key
+  (`/?mcp-connect=KEY`), stored only as a hash; the link survives the console sign-in.
+- The person, signed in to the console, sees the client's name, **the host the sign-in is
+  sent to**, and an agent name to give it, and approves or denies
+  (`GET /api/v1/me/mcp-connections/{key}`, `POST …/approve {agent_name}` (console only),
+  `POST …/deny`). The answer is the `redirect_url` the console sends the browser to: the
+  redirect URI with a one-time `code` (valid 60 seconds) or `error=access_denied`, and `state`
+  and `iss`.
+- `POST /oauth/token` (form-encoded): `grant_type=authorization_code`, `code`, `redirect_uri`,
+  `client_id`, `code_verifier` (and optionally `resource`). The code works once, with the
+  right client, redirect URI (when sent) and verifier, while the approver is active; a code
+  presented with a wrong one is burned. The answer is `{access_token, token_type: "Bearer", scope: "mcp"}`: the
+  access token is the token of a new agent that belongs to the approver, exactly as after
+  `csg login` (a same-name agent of that person is replaced). It lasts until the agent is
+  revoked on the Agents page; there is no refresh token. Errors follow OAuth
+  (`invalid_request`, `invalid_client`, `invalid_grant`, `unsupported_grant_type`).
+- Suspending or resetting the approver ends approvals not yet exchanged.
+
+**The MCP endpoint.** `POST /mcp`, Streamable HTTP without server-sent events: one JSON-RPC
+message or a batch per request, answered as `application/json`; notifications get 202 and
+no body. `GET` and `DELETE` answer 405. A request whose `Origin` is not this server is
+refused (DNS rebinding); there is no CORS. Protocol versions 2025-06-18, 2025-03-26; an
+unknown `MCP-Protocol-Version` header is refused. 1 MiB per request. The tools are those of
+`csg mcp` (§17.7) and go through the agent API, with its rules, limits and audit:
+`list_accounts`, `request_access`, `check_status`, `revoke`, and `get_credential`, which
+returns a **one-time link** instead of the secret:
+
+- before making a link it checks that the request is the agent's and active; an agent has at
+  most 20 unused links;
+- the link is `<origin>/api/v1/credential-links/{token}`, valid for 60 seconds, usable once,
+  with `POST` only (so a link preview cannot use it up);
+- using it returns shell `export` lines (`ALIBABA_CLOUD_ACCESS_KEY_ID`, `…_SECRET`,
+  `…_SECURITY_TOKEN`, `CSG_LEASE_ID`, `CSG_SERVER`, `CSG_CAPABILITY`, values single-quoted)
+  and an `echo` to stderr saying until when it is valid, with `Cache-Control: no-store`; the
+  tool tells the agent to run `eval "$(curl -fsS -X POST '<link>')"` in the shell that runs
+  the cloud command, so the secret goes into that shell, not into the conversation; a link
+  that is unknown, used or expired gets 404 and only an `echo` to stderr;
+- the agent (active, owner active) and every release check of the credential endpoint are
+  checked again when the link is used, and the use is audited as a credential fetch; making
+  the link is audited too; the link token is stored only as a hash and masked in the logs,
+  like the connection key.
+
 ### 17.8 Implementation status
 
 | Part | Status |
@@ -1159,7 +1230,7 @@ new secret from a pipe or file, never from the terminal.
 | Supervisors are Administrator on every cloud account (§17.1) | implemented |
 | Removal of the admin token and the §16 agent model (§17.7a) | implemented, schema version 8 |
 | Person sign-in for `csg` with guarded sessions (§17.9) | implemented, schema version 9 |
-| Remote MCP over HTTPS | not started |
+| Remote MCP over HTTPS with OAuth sign-in (§17.10) | done; tested with a scripted OAuth client, not yet with Claude or Cursor |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
 | Console redesign (sign-in, Inbox, Agents, Cloud accounts, Activity, People, Settings) | implemented; the admin-token console is removed |

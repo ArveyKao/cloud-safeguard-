@@ -28,7 +28,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 9
+const CurrentSchemaVersion = 10
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -264,6 +264,47 @@ var migrations = []migration{
 				decided_at       INTEGER
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_cli_signins_status ON cli_signins(status, expires_at)`,
+		},
+	},
+	{ // version 9 -> 10: remote MCP with OAuth sign-in (CONTRACT §17.10)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS oauth_clients (
+				id            TEXT PRIMARY KEY,
+				client_name   TEXT NOT NULL,
+				redirect_uris TEXT NOT NULL,
+				remote_addr   TEXT NOT NULL DEFAULT '',
+				created_at    INTEGER NOT NULL,
+				last_used_at  INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_oauth_clients_created ON oauth_clients(created_at)`,
+			`CREATE TABLE IF NOT EXISTS oauth_requests (
+				id             TEXT PRIMARY KEY,
+				connect_hash   TEXT NOT NULL UNIQUE,
+				client_id      TEXT NOT NULL,
+				redirect_uri   TEXT NOT NULL,
+				code_challenge TEXT NOT NULL,
+				state          TEXT NOT NULL DEFAULT '',
+				status         TEXT NOT NULL,
+				person_id      TEXT NOT NULL DEFAULT '',
+				agent_name     TEXT NOT NULL DEFAULT '',
+				code_hash      TEXT NOT NULL DEFAULT '',
+				agent_id       TEXT NOT NULL DEFAULT '',
+				remote_addr    TEXT NOT NULL DEFAULT '',
+				created_at     INTEGER NOT NULL,
+				expires_at     INTEGER NOT NULL,
+				decided_at     INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_oauth_requests_status ON oauth_requests(status, expires_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_oauth_requests_code ON oauth_requests(code_hash) WHERE code_hash <> ''`,
+			`CREATE TABLE IF NOT EXISTS credential_links (
+				token_hash TEXT PRIMARY KEY,
+				lease_id   TEXT NOT NULL,
+				agent_id   TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				expires_at INTEGER NOT NULL,
+				used_at    INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_credential_links_expires ON credential_links(expires_at)`,
 		},
 	},
 }

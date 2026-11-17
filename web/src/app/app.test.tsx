@@ -10,6 +10,7 @@ import { SettingsPage } from './pages/Settings'
 import { SignInApprovalPage } from './pages/SignInApproval'
 import { rememberSignIn, takeSignIn } from './App'
 import { CLISignInApprovalPage } from './pages/CLISignInApproval'
+import { MCPConnectApprovalPage, redirect } from './pages/MCPConnectApproval'
 import type { Person } from './types'
 
 // A fake API: routes map "METHOD /path" to a payload or a function.
@@ -188,12 +189,38 @@ describe('agent sign-in', () => {
     expect(changes().map((c) => c.path)).toEqual(['/me/cli-signins/CLI-CODE/cancel'])
   })
 
+  it('connects an MCP client only after the destination is confirmed, then returns to it', async () => {
+    const id = 'k'.repeat(32)
+    routes[`GET /me/mcp-connections/${id}`] = { client_name: 'Claude Code', redirect_uri: 'http://127.0.0.1:40000/callback',
+      redirect_host: '127.0.0.1:40000', local: true, suggested_agent_name: 'claude-code', remote_addr: '10.0.0.9',
+      created_at: '', expires_at: new Date(Date.now() + 600_000).toISOString() }
+    routes[`POST /me/mcp-connections/${id}/approve`] = { redirect_url: 'http://127.0.0.1:40000/callback?code=C&state=S' }
+    const went: string[] = []
+    redirect.to = (url) => { went.push(url) }
+    const me = { id: 'per_1', username: 'mei', display_name: '', status: 'active', supervisor: false } as unknown as Person
+    wrap(<MCPConnectApprovalPage id={id} person={me} />)
+    const approve = await screen.findByRole('button', { name: 'Approve and connect' })
+    expect(screen.getAllByText('127.0.0.1:40000').length).toBeGreaterThan(0)
+    expect((screen.getByLabelText(/^Agent name/) as HTMLInputElement).value).toBe('claude-code')
+    expect((approve as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.change(screen.getByLabelText(/^Agent name/), { target: { value: 'x' } })
+    expect((approve as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText(/^Agent name/), { target: { value: 'laptop-claude' } })
+    fireEvent.click(approve)
+    await waitFor(() => expect(went).toEqual(['http://127.0.0.1:40000/callback?code=C&state=S']))
+    expect(changes()).toMatchObject([{ method: 'POST', path: `/me/mcp-connections/${id}/approve`, body: { agent_name: 'laptop-claude' } }])
+    await screen.findByText('Connected')
+  })
+
   it('remembers a sign-in link once, and only for ten minutes', () => {
     rememberSignIn('ABC-DEFG')
     expect(takeSignIn()).toEqual({ code: 'ABC-DEFG', kind: 'agent' })
     expect(takeSignIn()).toBeNull()
     rememberSignIn('CLI-CODE', 'cli')
     expect(takeSignIn()).toEqual({ code: 'CLI-CODE', kind: 'cli' })
+    rememberSignIn('mcp_1', 'mcp')
+    expect(takeSignIn()).toEqual({ code: 'mcp_1', kind: 'mcp' })
     const now = Date.now()
     rememberSignIn('OLD-CODE')
     vi.spyOn(Date, 'now').mockReturnValue(now + 11 * 60 * 1000)

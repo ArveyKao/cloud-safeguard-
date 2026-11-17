@@ -120,7 +120,7 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | Mock cloud and a scripted demo (no cloud account needed) | ✅ |
 | Real Alibaba Cloud `sts` mode | ✅ implemented, unit-tested against a fake STS endpoint; not yet run against a live account |
 | `csg` sign-in for people, with supervisor commands (raising access needs an authenticator code) | ✅ |
-| Remote MCP over HTTPS, so an agent connects with just a URL | 🔜 next |
+| Remote MCP over HTTPS: an agent connects with just a URL, signs in through the console (OAuth), and gets credentials through one-time links | ✅ tested with a scripted OAuth client; not yet with Claude or Cursor |
 | More clouds (AWS, GCP), SSO, chat approvals, credential-free proxy mode | 🔜 later |
 
 The rules are in [docs/CONTRACT.md](docs/CONTRACT.md) §17.
@@ -193,7 +193,7 @@ The step-by-step path, the MCP setup and the real-cloud setup are in
 | Agent sign-in | `csg login --server URL [--name NAME]` · `csg whoami` · `csg version` |
 | Agent | `csg accounts` · `csg access request --account ID --resource R --permission P --ttl 15m [--name N] [--reason ...] [--wait 5m]` · `csg access status ID` |
 | Agent | `csg exec --account ID --resource R --permission P --ttl 15m -- CMD` · `csg credential --lease ID [--export\|--json]` · `csg revoke --lease ID` · `csg leases mine` |
-| MCP | `csg mcp` (stdio; tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `revoke`) |
+| MCP | `https://SERVER/mcp` (remote, OAuth sign-in in the console) or `csg mcp` (stdio); tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `revoke` |
 | Person sign-in | `csg person login --server URL [--name NAME]` · `csg person whoami` · `csg person logout` |
 | Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode read\|write\|full [--for DUR]` · `csg me sessions` · `csg me end-session ID` |
 | Supervisor | `csg supervisor people [add\|suspend\|activate\|reset\|make-supervisor\|remove-supervisor] …` · `csg supervisor roles [set\|remove] …` · `csg supervisor accounts [show\|test\|enable\|disable\|rename\|set-region\|set-role-arn\|auto-level\|rotate] …` · `csg supervisor settings [set …]` · `csg supervisor audit [verify]` · `csg supervisor requests [deny\|revoke] …` |
@@ -256,7 +256,7 @@ cloud-safeguard/
 │   ├── token/          # bearer token generation and hashing
 │   └── cli/            # csg commands and the MCP server
 ├── web/                # React + Vite console, embedded into the binary
-├── scripts/demo.sh     # end-to-end demo (S1–S10), driven by scripts/demo/
+├── scripts/demo.sh     # end-to-end demo (S1–S11), driven by scripts/demo/
 ├── docs/               # SPEC, CONTRACT, PRODUCT, SECURITY, ARCHITECTURE, QUICKSTART, API, DECISIONS
 └── Makefile            # build / test / demo entry points
 ```
@@ -271,8 +271,9 @@ Current boundaries:
 - **Single-tenant.** People sign in with a password and an authenticator app; there is no
   SSO yet.
 - **Alibaba Cloud only**, with ECS, DNS and OSS as the resource types.
-- **No remote MCP yet.** Agents use `csg mcp` over stdio; a remote endpoint over HTTPS is
-  the next piece.
+- **Remote MCP answers JSON only.** `/mcp` serves POST without server-sent events, and
+  has no CORS, so browser-based MCP clients cannot call it directly. There are no refresh
+  tokens: the agent's token lasts until the agent is revoked on the Agents page.
 - **STS credentials still reach the agent.** The stronger design is a credential-free
   proxy where `csg` injects the cloud credential and agents never see one — that is a
   later direction. This bounds blast radius (TTL + inline policy + session name +
@@ -291,8 +292,8 @@ Current boundaries:
 - **No independent security audit, and no live-cloud run yet.** `sts` mode is implemented
   and unit-tested against a fake STS endpoint only.
 
-Roadmap: next, remote MCP over HTTPS; then a live Alibaba
-Cloud test, AWS and GCP, SSO, chat approvals and a credential-free proxy mode.
+Roadmap: next, a live Alibaba
+Cloud test and a check with real MCP clients (Claude, Cursor); then AWS and GCP, SSO, chat approvals and a credential-free proxy mode.
 
 ## Documentation
 

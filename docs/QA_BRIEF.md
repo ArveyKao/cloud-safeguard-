@@ -26,7 +26,7 @@ every problem as a GitHub issue.
 
 ```bash
 go build -o build/csg ./cmd/csg
-./scripts/demo.sh            # must end with "all S1-S10 scenarios passed"
+./scripts/demo.sh            # must end with "all S1-S11 scenarios passed"
 go test ./...                # must pass
 ./build/csg init --demo --data-dir ./build/qa-data
 ./build/csg serve --data-dir ./build/qa-data
@@ -58,6 +58,10 @@ is listed in CONTRACT §17.8; `docs/QUICKSTART.md` walks through the whole flow.
   `GET /api/v1/agent/capabilities`) answer 404, and the removed commands (`csg providers`,
   `agents`, `caps`, `policy`, `audit`, `request`) are unknown.
 - `csg mcp`: the five tools work, and `get_credential` never returns the secret.
+- Remote MCP (`<server>/mcp`): an MCP client connects with the URL alone, the person approves
+  in the console and sees where the sign-in goes; `get_credential` returns a one-time link
+  that sets the credential in a shell once, within 60 seconds. Try wrong verifiers, reused
+  codes, foreign redirect URIs, other origins, used or expired links, a revoked agent.
 - The audit log records every step, and the Activity page shows the chain as verified.
 
 ### A2. People on the command line (CONTRACT §17.9)

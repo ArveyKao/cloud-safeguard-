@@ -6,7 +6,7 @@ import { Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, ago, useAction,
 export function AgentsPage() {
   const agents = useLoad(() => api.myAgents(), [], 15000)
   const [connect, setConnect] = useState(false)
-  const [tab, setTab] = useState<'mcp' | 'cli'>('mcp')
+  const [tab, setTab] = useState<'url' | 'mcp' | 'cli'>('url')
   const [revoking, setRevoking] = useState<Agent | null>(null)
   const origin = window.location.origin
   const list = (agents.data?.items ?? []).filter((a) => a.status !== 'revoked')
@@ -16,11 +16,23 @@ export function AgentsPage() {
       <PageHead title="Your agents" lead="Every agent belongs to you and inherits your role on each cloud account."
         actions={<Button kind="primary" onClick={() => setConnect(!connect)}>+ Connect an agent</Button>} />
       {connect && (
-        <Card title="Connect an agent in two steps">
+        <Card title="Connect an agent">
           <div className="tabs" role="tablist">
-            <button role="tab" aria-selected={tab === 'mcp'} onClick={() => setTab('mcp')}>MCP (Claude, Cursor…)</button>
+            <button role="tab" aria-selected={tab === 'url'} onClick={() => setTab('url')}>MCP by URL (Claude, Cursor…)</button>
+            <button role="tab" aria-selected={tab === 'mcp'} onClick={() => setTab('mcp')}>MCP with csg</button>
             <button role="tab" aria-selected={tab === 'cli'} onClick={() => setTab('cli')}>Command line</button>
           </div>
+          {tab === 'url' ? (
+            <ol className="steps">
+              <li>Add a remote MCP server with this URL in the app, for example:
+                <pre>{`claude mcp add --transport http cloud-safeguard ${origin}/mcp`}</pre>
+                Nothing to install on that machine.
+              </li>
+              <li>The app opens this console in your browser. Check where the sign-in goes, name the agent and approve.
+                The agent gets list_accounts, request_access, check_status, get_credential and revoke; get_credential hands the secret to a shell through a one-time link, never to the model.
+              </li>
+            </ol>
+          ) : (
           <ol className="steps">
             <li>On the machine where the agent runs, sign it in:
               <pre>{`csg login --server ${origin} --name my-agent`}</pre>
@@ -37,6 +49,7 @@ export function AgentsPage() {
               </li>
             )}
           </ol>
+          )}
         </Card>
       )}
       <ErrorNote error={agents.error} />

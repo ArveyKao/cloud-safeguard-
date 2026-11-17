@@ -177,17 +177,42 @@ revocation and mock cloud call, with who caused it, and whether the hash chain v
 
 ## 1.12 Use it from Claude, Cursor or another agent (MCP)
 
-`csg mcp` is an MCP server over stdio with five tools: `list_accounts`, `request_access`,
-`check_status`, `get_credential` and `revoke`. After `csg login`, add it to the agent's MCP
-configuration:
+The agent's tools are `list_accounts`, `request_access`, `check_status`, `get_credential` and
+`revoke`, over either of two connections.
+
+**By URL (nothing to install where the agent runs).** Add a remote MCP server with the URL
+`<server>/mcp`, for example in Claude Code:
+
+```bash
+claude mcp add --transport http cloud-safeguard http://127.0.0.1:8787/mcp
+```
+
+The app opens the console in your browser (sign in if asked). The page shows the name the
+app gives itself and **where the sign-in goes**; check that it is the app you are
+connecting, name the agent, tick the box and approve. The browser returns to the app, which
+is now your agent; revoke it on the Agents page. A browser on another machine than the
+server needs the server's real URL (`csg serve --public-url`), and anything but localhost
+needs HTTPS in front of it.
+
+`get_credential` returns a one-time link instead of the secret, with the command to run in
+the shell that runs the cloud command:
+
+```bash
+eval "$(curl -fsS -X POST 'http://127.0.0.1:8787/api/v1/credential-links/…')"
+```
+
+It works once, within 60 seconds, and sets `ALIBABA_CLOUD_ACCESS_KEY_ID`, `…_SECRET` and
+`…_SECURITY_TOKEN` in that shell; the model never sees them.
+
+**With `csg` (stdio).** After `csg login`, add `csg mcp` to the agent's MCP configuration:
 
 ```json
 { "mcpServers": { "cloud-safeguard": { "command": "/absolute/path/to/build/csg", "args": ["mcp"] } } }
 ```
 
-`get_credential` never returns the secret to the model. It writes a file readable only by
-you under `~/.config/cloud-safeguard/credentials/` and returns its path, to be sourced by the
-command that needs it.
+Here `get_credential` writes a file readable only by you under
+`~/.config/cloud-safeguard/credentials/` and returns its path, to be sourced by the command
+that needs it.
 
 ## 1.13 Work as yourself on the command line
 
@@ -231,7 +256,7 @@ make demo
 It starts its own instance on port 18787 and runs ten scenarios end to end (setup, agent
 sign-in, automatic read, least privilege, denial, approval, revocation on a role change,
 the supervisor's emergency stop, a supervisor on the command line, audit and a secret-leak
-check), then prints `all S1-S10 scenarios passed`.
+check), then prints `all S1-S11 scenarios passed`.
 
 ## 1.15 Clean up
 

@@ -115,6 +115,9 @@ type Server struct {
 
 	handler   http.Handler
 	mockCloud http.Handler
+	// agentAPI is the agent API without authentication, for the remote MCP
+	// endpoint and credential links, which authenticate the agent themselves.
+	agentAPI  http.Handler
 	startedAt time.Time
 
 	// lifecycleMu guards the live listener/HTTP server/effective address so

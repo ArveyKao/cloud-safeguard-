@@ -152,9 +152,14 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   role change; the reviewer judged the branch fit as the base for remote MCP once that was
   closed. Closed (account edits that change the role ARN take the role lock), plus the
   small items. Not reviewed again.
-- **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
-  for everything except adding a cloud account, which stays console-only; (2) remote MCP over
-  HTTPS with OAuth-style sign-in so an agent connects with just a URL.
+- **Piece 3, remote MCP over HTTPS (2026-11-17):** owner chose a one-time link for the
+  credential (the secret goes to a shell, never to the model). `/mcp` (POST, JSON, no SSE),
+  OAuth 2.1 discovery, dynamic registration, PKCE S256, the person approves in the console
+  (`/mcp-connect`), the access token is a new owned agent's token. `get_credential` returns
+  `eval "$(curl -fsS -X POST LINK)"`; the link works once within 60 s. Schema 10:
+  `oauth_clients`, `oauth_requests`, `credential_links`. The MCP tool layer moved to
+  `internal/mcp`, shared with `csg mcp`. Demo S10 covers it; checked live with a scripted
+  OAuth client and the console in a browser. Not yet tried with Claude Code or Cursor.
 - **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
   README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
   Alibaba Cloud is untested.
@@ -174,7 +179,7 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console (target surface = api; browser E2E covers the console).
   No production deployment requested.
 - **Address / artifact:** `build/csg` (single binary), demo on `http://127.0.0.1:18787`.
-- **Final demo:** `make demo` → S1–S10 pass; console screenshots captured by verifier.
+- **Final demo:** `make demo` → S1–S11 pass; console screenshots captured by verifier.
 - **Evidence / review:** `scripts/demo.sh` transcript, `go test ./...`, `npm run build`,
   verifier report `changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md`, canonical
   `arvey-develop delivery check --phase complete` PASS.

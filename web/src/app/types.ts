@@ -118,6 +118,17 @@ export interface CLISignIn {
   expires_at: string
 }
 
+export interface MCPConnection {
+  client_name: string
+  redirect_uri: string
+  redirect_host: string
+  local: boolean
+  suggested_agent_name: string
+  remote_addr: string
+  created_at: string
+  expires_at: string
+}
+
 export interface CLISession {
   id: string
   client_name: string

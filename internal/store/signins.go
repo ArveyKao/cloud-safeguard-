@@ -107,7 +107,7 @@ func (db *DB) DecideSignIn(ctx context.Context, signInID, personID string, decis
 // It returns the stored agent and the IDs of the replaced agents, or
 // ErrConflict when the sign-in cannot be completed (anymore).
 func (db *DB) CompleteSignIn(ctx context.Context, signInID string, agent model.Agent, tokenHash string, now time.Time) (model.Agent, []string, error) {
-	replaced := []string{}
+	var replaced []string
 	err := db.withTx(ctx, func(tx *sql.Tx) error {
 		var ownerID string
 		err := tx.QueryRowContext(ctx,
@@ -125,26 +125,9 @@ func (db *DB) CompleteSignIn(ctx context.Context, signInID string, agent model.A
 		if ownerID == "" {
 			return ErrConflict
 		}
-		rows, err := tx.QueryContext(ctx,
-			`UPDATE agents SET status = 'revoked', updated_at = ?
-			 WHERE owner_id = ? AND name = ? AND status <> 'revoked' RETURNING id`,
-			toMillis(now), ownerID, agent.Name)
-		if err != nil {
-			return mapErr(err)
-		}
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return mapErr(err)
-			}
-			replaced = append(replaced, id)
-		}
-		if err := rows.Close(); err != nil {
-			return mapErr(err)
-		}
 		agent.OwnerID = ownerID
-		return insertAgent(ctx, tx, agent, tokenHash)
+		replaced, err = replaceOwnedAgent(ctx, tx, agent, tokenHash, now)
+		return err
 	})
 	if err != nil {
 		return model.Agent{}, nil, err
@@ -186,4 +169,29 @@ func (db *DB) RevokeOwnerLeases(ctx context.Context, personID, reason string, no
 		ids = append(ids, id)
 	}
 	return ids, mapErr(rows.Err())
+}
+
+// replaceOwnedAgent revokes the owner's earlier agents with the same name
+// and inserts agent, inside tx. It returns the IDs of the revoked agents.
+func replaceOwnedAgent(ctx context.Context, tx *sql.Tx, agent model.Agent, tokenHash string, now time.Time) ([]string, error) {
+	replaced := []string{}
+	rows, err := tx.QueryContext(ctx,
+		`UPDATE agents SET status = 'revoked', updated_at = ?
+		 WHERE owner_id = ? AND name = ? AND status <> 'revoked' RETURNING id`,
+		toMillis(now), agent.OwnerID, agent.Name)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, mapErr(err)
+		}
+		replaced = append(replaced, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, mapErr(err)
+	}
+	return replaced, insertAgent(ctx, tx, agent, tokenHash)
 }
