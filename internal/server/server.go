@@ -62,7 +62,9 @@ type Config struct {
 	// encrypted with; the data directory is checked against it.
 	MasterKey []byte
 	// TrustMasterKey accepts the supplied key for a directory that holds
-	// nothing to verify it against (see checkVaultKey).
+	// nothing encrypted and no master.key, so nothing can verify the key. It
+	// never overrides a key the data or a master.key proves wrong (see
+	// checkVaultKey).
 	TrustMasterKey bool
 	// Version overrides the reported version (default model.Version).
 	Version string
@@ -354,6 +356,12 @@ func loadMasterKeyForServe(cfg Config) ([]byte, error) {
 	}
 	key, err := os.ReadFile(filepath.Join(cfg.DataDir, "master.key"))
 	if errors.Is(err, fs.ErrNotExist) {
+		// A database without a key file was initialized with the key in the
+		// environment: say that, not "run csg init", which would refuse.
+		if fileExists(filepath.Join(cfg.DataDir, store.DBFileName)) {
+			return nil, fmt.Errorf("server: data directory %q has a database but no master.key, and $CSG_MASTER_KEY is not set. "+
+				"Set CSG_MASTER_KEY to the key this directory was created with, or restore master.key", cfg.DataDir)
+		}
 		return nil, notInitializedErr(cfg.DataDir)
 	}
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -70,6 +71,10 @@ issues a new setup code.
 	fmt.Fprintln(a.Stdout)
 	if len(res.ProviderIDs) > 0 {
 		fmt.Fprintln(a.Stdout, "Demo cloud account added (mock cloud).")
+	}
+	if _, statErr := os.Stat(filepath.Join(res.DataDir, "master.key")); statErr != nil {
+		fmt.Fprintln(a.Stdout, "The master key came from $CSG_MASTER_KEY and was not written to master.key.")
+		fmt.Fprintln(a.Stdout, "Keep that key: csg serve needs it set every time, and without it the data cannot be read.")
 	}
 	if res.Supervisor != nil {
 		a.printSetupCode("First supervisor", *res.Supervisor)

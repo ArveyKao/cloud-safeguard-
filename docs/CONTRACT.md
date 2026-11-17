@@ -11,7 +11,8 @@ are the wire contract).
 > **Read §17 first.** The admin token and the agent model of §3, §4, §6, §7, §9, §11 and §16
 > were removed on 2026-11-15 (§17.7a). Those sections are kept as the record of v0.1 and are
 > no longer the running behaviour. §2 is rewritten for the current authentication. What
-> still applies from the others is listed in §17.7a.
+> still applies from the others is listed in §17.7a. In §10 the hash chain is current; its
+> table of audit actions still lists v0.1's and is not complete for §17.
 
 ---
 
@@ -1045,7 +1046,9 @@ Agent CLI, same flow from a terminal:
   written to the audit log; the event and forgetting the report are one transaction too. So
   it is recorded exactly once by the first command that gets past the master-key check,
   `csg serve` or `csg supervisor recover`, even if an earlier command ran the upgrade and
-  then stopped or was killed.
+  then stopped or was killed, and even if two commands open the same old database at the
+  same moment (each upgrade step runs once, and only the command that removes the kept
+  report writes the event).
   At every start the server revokes each pending or active lease
   that is not an access request, with one `lease.revoked` event each. People sign their
   agents in again with `csg login`. An install that never had a supervisor does not start
@@ -1060,7 +1063,11 @@ Agent CLI, same flow from a terminal:
     with it; any other key is refused;
   - when nothing encrypted exists and there is no `master.key`, the key cannot be told from
     a mistyped one. The command is refused unless it is run once with `--trust-master-key`,
-    which writes the key check and a `vault.master_key_trusted` audit event.
+    which writes the key check and a `vault.master_key_trusted` audit event together.
+  A key the data proves right also gets a key check written if the directory had none, so
+  it stays verifiable. When a database exists but neither `master.key` nor
+  `$CSG_MASTER_KEY` is there, the commands say the key is missing, not that the directory
+  is not initialized. `csg init` with `$CSG_MASTER_KEY` set writes no `master.key` and says so.
 - Supervisors are Administrator on every cloud account (§17.1). A cloud account must be
   added with a RAM role ARN; a request without one is refused. A provider an older upgrade
   left without a cloud account ID can be given one by setting a role ARN in an account that

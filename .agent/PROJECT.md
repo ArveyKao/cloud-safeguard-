@@ -130,6 +130,15 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   with no `master.key` either, the operator must pass `--trust-master-key` once (audited).
   The upgrade record is written in the upgrade's own transaction and audited atomically.
   Awaiting the fifth round.
+- **Fifth review round, of 9a2bba9 (2026-11-16): fit as the base for the next piece**, no
+  blocker or major. Its two "require first" items are done: a test for an environment-only
+  old directory that already has a supervisor, and the upgrade is recorded once even when
+  two commands open the same old database at once. Minor items done too (trust decision and
+  key check written together; key check written once the data proves the key; clearer
+  messages for a missing key and a stale key file). These last changes have not been
+  reviewed. Left for later: a `csg init` killed half-way leaves a directory no command can
+  repair; whether every stored secret should be checked against the key at start; the
+  audit-action table in CONTRACT §10.
 - **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
   for everything except adding a cloud account, which stays console-only; (2) remote MCP over
   HTTPS with OAuth-style sign-in so an agent connects with just a URL.

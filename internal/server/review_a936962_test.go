@@ -1206,3 +1206,144 @@ func TestInitMessageForSidecarsNextToAKey(t *testing.T) {
 		}
 	}
 }
+
+// ---- regression tests for the fifth review round (commit 9a2bba9) ----
+
+// The exact case behind the fourth round's lockout: an old directory whose
+// key is only in the environment, with nothing encrypted, that ALREADY has a
+// supervisor. A mistyped key must not be adopted by csg serve.
+func TestEnvOnlyOldDirectoryWithASupervisorDoesNotAdoptATypo(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if _, err := Init(ctx, InitOptions{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	keyBytes, err := os.ReadFile(filepath.Join(dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	right := base64.StdEncoding.EncodeToString(keyBytes)
+	typo := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{5}, 32))
+	// The supervisor from init stays; the key check and the key file go.
+	rawExec(t, dir, `DELETE FROM meta WHERE key = 'vault_key_check'`)
+	if err := os.Remove(filepath.Join(dir, "master.key")); err != nil {
+		t.Fatal(err)
+	}
+	if people := func() int {
+		raw, _ := sql.Open("sqlite", filepath.Join(dir, store.DBFileName))
+		defer raw.Close()
+		n := 0
+		_ = raw.QueryRow(`SELECT COUNT(*) FROM persons WHERE supervisor = 1`).Scan(&n)
+		return n
+	}(); people != 1 {
+		t.Fatalf("precondition: %d supervisors", people)
+	}
+
+	t.Setenv("CSG_MASTER_KEY", typo)
+	if srv, err := New(Config{DataDir: dir}); !errors.Is(err, errVaultKeyUnverifiable) {
+		if srv != nil {
+			srv.Close()
+		}
+		t.Fatalf("serve with a mistyped key = %v, want a refusal", err)
+	}
+	if keyCheckExists(t, dir) {
+		t.Fatal("serve adopted a mistyped key")
+	}
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "admin"}); !errors.Is(err, errVaultKeyUnverifiable) {
+		t.Fatalf("recover with a mistyped key = %v", err)
+	}
+	if keyCheckExists(t, dir) {
+		t.Fatal("recover adopted a mistyped key")
+	}
+	// The right key, trusted once, then without the option; the typo is
+	// refused from then on.
+	t.Setenv("CSG_MASTER_KEY", right)
+	srv, err := New(Config{DataDir: dir, TrustMasterKey: true})
+	if err != nil {
+		t.Fatalf("trusted serve with the right key: %v", err)
+	}
+	trusted := srv.listAuditFor(t, "vault.master_key_trusted")
+	srv.Close()
+	if len(trusted) != 1 || !keyCheckExists(t, dir) {
+		t.Fatalf("after trusting: %d trust events, key check %v", len(trusted), keyCheckExists(t, dir))
+	}
+	if srv, err = New(Config{DataDir: dir}); err != nil {
+		t.Fatalf("serve with the right key: %v", err)
+	}
+	srv.Close()
+	t.Setenv("CSG_MASTER_KEY", typo)
+	if _, err := New(Config{DataDir: dir, TrustMasterKey: true}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("serve with the typo after the key was trusted = %v", err)
+	}
+}
+
+// A directory from before the key check whose key is proved by a stored
+// AccessKey gets its key check then, so the key stays verifiable.
+func TestKeyCheckIsWrittenOnceTheDataProvesTheKey(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true}); err != nil {
+		t.Fatal(err)
+	}
+	rawExec(t, dir, `DELETE FROM meta WHERE key = 'vault_key_check'`)
+	// A wrong key is refused by the stored AccessKey and writes nothing.
+	if _, err := New(Config{DataDir: dir, MasterKey: bytes.Repeat([]byte{9}, 32)}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("serve with a wrong key = %v", err)
+	}
+	if keyCheckExists(t, dir) {
+		t.Fatal("a wrong key wrote the key check")
+	}
+	srv, err := New(Config{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Close()
+	if !keyCheckExists(t, dir) {
+		t.Fatal("no key check after the stored AccessKey proved the key")
+	}
+}
+
+// A database without a key file and without $CSG_MASTER_KEY is not "not
+// initialized": the message says the key is missing.
+func TestMissingKeyIsNotReportedAsNotInitialized(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("CSG_MASTER_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	dir := t.TempDir()
+	if _, err := Init(ctx, InitOptions{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CSG_MASTER_KEY", "")
+	_, err := New(Config{DataDir: dir})
+	if err == nil || errors.Is(err, ErrNotInitialized) || !strings.Contains(err.Error(), "CSG_MASTER_KEY") {
+		t.Fatalf("serve without the key = %v", err)
+	}
+	_, err = RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "admin"})
+	if err == nil || errors.Is(err, ErrNotInitialized) || !strings.Contains(err.Error(), "CSG_MASTER_KEY") {
+		t.Fatalf("recover without the key = %v", err)
+	}
+}
+
+// Nothing encrypted and a master.key that is not the supplied key: refused,
+// and the message says how to proceed if the supplied key is the right one.
+func TestStaleKeyFileOnAnEmptyOldDirectoryExplainsItself(t *testing.T) {
+	dir, right := emptyV01Dir(t, false)
+	if err := os.WriteFile(filepath.Join(dir, "master.key"), bytes.Repeat([]byte{3}, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CSG_MASTER_KEY", right)
+	for _, trust := range []bool{false, true} {
+		_, err := New(Config{DataDir: dir, TrustMasterKey: trust})
+		if !errors.Is(err, errWrongMasterKey) || !strings.Contains(err.Error(), "remove the stale master.key") {
+			t.Fatalf("serve (trust %v) = %v", trust, err)
+		}
+	}
+	if keyCheckExists(t, dir) {
+		t.Fatal("a refused command wrote the key check")
+	}
+	// Following the message works.
+	if err := os.Remove(filepath.Join(dir, "master.key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecoverSupervisor(context.Background(), RecoverOptions{DataDir: dir, Username: "root", TrustMasterKey: true}); err != nil {
+		t.Fatalf("recover after removing the stale file: %v", err)
+	}
+}

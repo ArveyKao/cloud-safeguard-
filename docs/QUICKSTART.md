@@ -40,7 +40,8 @@ This builds the console and one binary, `build/csg`.
 ./build/csg init --demo --data-dir .demo/data
 ```
 
-It creates the master key, the database, a mock cloud account (`demo-aliyun`, cloud account
+It creates the master key (`master.key`, unless you set `CSG_MASTER_KEY`, which is then
+used and not written to disk), the database, a mock cloud account (`demo-aliyun`, cloud account
 ID `1234567890123456`) and the first supervisor, `admin`. It prints one secret: the
 supervisor's **setup code**, shown once and valid for 72 hours. There is no admin token and
 no agent token.

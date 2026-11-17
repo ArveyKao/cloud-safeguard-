@@ -1108,8 +1108,14 @@ func TestMigrationReportIsKeptAndMerged(t *testing.T) {
 	}
 	// Recording it forgets it, in the database too.
 	ev := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "schema.migrated", Status: "ok", Severity: "warning"}
-	if err := db.RecordMigrationAudit(ctx, &ev); err != nil {
-		t.Fatal(err)
+	if recorded, err := db.RecordMigrationAudit(ctx, &ev); err != nil || !recorded {
+		t.Fatalf("RecordMigrationAudit = %v, %v", recorded, err)
+	}
+	// A second call (another process that also had the report in memory)
+	// writes nothing.
+	again := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "schema.migrated", Status: "ok", Severity: "warning"}
+	if recorded, err := db.RecordMigrationAudit(ctx, &again); err != nil || recorded {
+		t.Fatalf("second RecordMigrationAudit = %v, %v; want false, nil", recorded, err)
 	}
 	if db.MigrationReport() != nil {
 		t.Fatal("the report is still there after it was recorded")
@@ -1124,5 +1130,118 @@ func TestMigrationReportIsKeptAndMerged(t *testing.T) {
 	}
 	if events, _, err := db.ListAudit(ctx, AuditFilter{Action: "schema.migrated", Limit: 10}); err != nil || len(events) != 1 {
 		t.Fatalf("schema.migrated events = %d, %v", len(events), err)
+	}
+}
+
+// Two processes open the same old database at once: each step runs once,
+// and only one of them records the upgrade.
+func TestConcurrentOpensUpgradeAndRecordOnce(t *testing.T) {
+	ctx := context.Background()
+	for round := 0; round < 5; round++ {
+		dir := t.TempDir()
+		db, err := Open(ctx, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().Exec(`INSERT INTO meta(key, value) VALUES('admin_token_hash', 'abc')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().Exec(`UPDATE meta SET value = '7' WHERE key = 'schema_version'`); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+
+		const openers = 4
+		start := make(chan struct{})
+		recorded := make(chan bool, openers)
+		errs := make(chan error, openers)
+		for i := 0; i < openers; i++ {
+			go func() {
+				<-start
+				db, err := Open(ctx, dir)
+				if err != nil {
+					errs <- err
+					recorded <- false
+					return
+				}
+				defer db.Close()
+				if db.MigrationReport() == nil {
+					errs <- nil
+					recorded <- false
+					return
+				}
+				ev := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "schema.migrated", Status: "ok", Severity: "warning"}
+				ok, err := db.RecordMigrationAudit(ctx, &ev)
+				errs <- err
+				recorded <- ok
+			}()
+		}
+		close(start)
+		count := 0
+		for i := 0; i < openers; i++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+			if <-recorded {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("round %d: %d of %d processes recorded the upgrade, want 1", round, count, openers)
+		}
+		check, err := Open(ctx, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, _, err := check.ListAudit(ctx, AuditFilter{Action: "schema.migrated", Limit: 10})
+		if err != nil || len(events) != 1 {
+			t.Fatalf("round %d: %d schema.migrated events, %v", round, len(events), err)
+		}
+		if res, err := check.VerifyAudit(ctx); err != nil || !res.OK {
+			t.Fatalf("round %d: audit chain = %+v, %v", round, res, err)
+		}
+		if _, err := check.GetMeta(ctx, "admin_token_hash"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("round %d: the admin token survived: %v", round, err)
+		}
+		check.Close()
+	}
+}
+
+// Two processes appending to the audit log at once (the server and a local
+// csg supervisor recover) keep one unbroken chain.
+func TestAuditAppendsFromTwoProcessesKeepOneChain(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	first, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	const each = 60
+	errs := make(chan error, 2*each)
+	start := make(chan struct{})
+	for _, db := range []*DB{first, second} {
+		go func() {
+			<-start
+			for i := 0; i < each; i++ {
+				ev := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "test.concurrent", Status: "ok", Severity: "info"}
+				errs <- db.AppendAudit(ctx, &ev)
+			}
+		}()
+	}
+	close(start)
+	for i := 0; i < 2*each; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	res, err := first.VerifyAudit(ctx)
+	if err != nil || !res.OK || res.Events != 2*each {
+		t.Fatalf("audit chain = %+v, %v; want %d events in one valid chain", res, err, 2*each)
 	}
 }

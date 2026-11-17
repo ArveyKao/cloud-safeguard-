@@ -366,6 +366,40 @@ func (db *DB) applyMigrations(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("store: begin migration %d: %w", v+1, err)
 		}
+		// Another process may be upgrading the same database. Take the write
+		// lock first, then read the version again: if the step was done
+		// meanwhile, it is not done twice and not reported by this process.
+		if v > 0 {
+			var raw string
+			if _, err := tx.ExecContext(ctx, `UPDATE meta SET value = value WHERE key = ?`, MetaSchemaVersion); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: lock for migration %d: %w", v+1, err)
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, MetaSchemaVersion).Scan(&raw); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: re-read schema version: %w", err)
+			}
+			if current, err := strconv.Atoi(raw); err != nil || current != v {
+				tx.Rollback()
+				if err != nil {
+					return fmt.Errorf("store: corrupt schema version %q: %w", raw, err)
+				}
+				if current > CurrentSchemaVersion {
+					return fmt.Errorf("store: database schema version %d is newer than supported version %d", current, CurrentSchemaVersion)
+				}
+				// Done by someone else: continue from where the database is.
+				// What they did is in the report they kept.
+				if pending, err = db.pendingMigrationReport(ctx); err != nil {
+					return err
+				}
+				report = nil
+				if current < CurrentSchemaVersion {
+					report = &MigrationReport{FromVersion: current, ToVersion: CurrentSchemaVersion}
+				}
+				v = current - 1
+				continue
+			}
+		}
 		for _, stmt := range migrations[v].statements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				tx.Rollback()

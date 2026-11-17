@@ -307,8 +307,9 @@ func auditMigrationReport(ctx context.Context, db *store.DB) error {
 	if err := json.Unmarshal(raw, &metadata); err != nil {
 		return fmt.Errorf("decode migration report: %w", err)
 	}
-	// The event and "the report is recorded" are one transaction.
-	return db.RecordMigrationAudit(ctx, &model.AuditEvent{
+	// The event and "the report is recorded" are one transaction; when
+	// another process recorded it first, nothing is written here.
+	_, err = db.RecordMigrationAudit(ctx, &model.AuditEvent{
 		ActorType:  "system",
 		ActorID:    "system",
 		ActorName:  model.ProductName,
@@ -319,6 +320,7 @@ func auditMigrationReport(ctx context.Context, db *store.DB) error {
 		TargetID:   "schema",
 		Metadata:   metadata,
 	})
+	return err
 }
 
 // bootstrapHook runs just before the first supervisor is created; tests
@@ -378,7 +380,9 @@ type RecoverOptions struct {
 	// encrypted with.
 	MasterKey []byte
 	// TrustMasterKey accepts the supplied key for a directory that holds
-	// nothing to verify it against (see checkVaultKey).
+	// nothing encrypted and no master.key, so nothing can verify the key. It
+	// never overrides a key the data or a master.key proves wrong (see
+	// checkVaultKey).
 	TrustMasterKey bool
 }
 
@@ -515,37 +519,59 @@ var errWrongMasterKey = errors.New("server: the master key does not match this d
 //     log.
 func checkVaultKey(ctx context.Context, db *store.DB, v *vault.Vault, dataDir string, key []byte, trust bool) error {
 	err := verifyVaultKey(ctx, db, v)
-	if err == nil || !errors.Is(err, errVaultKeyUnverifiable) {
+	if err == nil {
+		// The data proved the key (a stored AccessKey or TOTP secret did,
+		// when the directory is from before the key check). Write the check
+		// if it is missing, so the key stays verifiable when that data goes.
+		return writeVaultKeyCheckIfMissing(ctx, db, v)
+	}
+	if !errors.Is(err, errVaultKeyUnverifiable) {
 		return err
 	}
 	stored, readErr := os.ReadFile(filepath.Join(dataDir, "master.key"))
 	switch {
 	case readErr == nil:
 		if len(stored) != len(key) || subtle.ConstantTimeCompare(stored, key) != 1 {
-			return fmt.Errorf("%w: nothing in it is encrypted yet, and the key supplied is not the one in its master.key", errWrongMasterKey)
+			return fmt.Errorf("%w: nothing in it is encrypted yet, so its master.key is taken as the key, and the key supplied is a different one. "+
+				"If the supplied key is the right one, remove the stale master.key and run this command once with --trust-master-key", errWrongMasterKey)
 		}
+		return writeVaultKeyCheckIfMissing(ctx, db, v)
 	case !errors.Is(readErr, fs.ErrNotExist):
 		return fmt.Errorf("server: read master key: %w", readErr)
 	case !trust:
 		return errVaultKeyUnverifiable
 	}
-	if err := ensureVaultKeyCheck(ctx, db, v); err != nil {
+	// Trusted by the operator: the key check and the record of that decision
+	// are written together.
+	blob, err := v.Encrypt([]byte(vaultKeyCheckPlaintext), vaultKeyCheckAAD)
+	if err != nil {
 		return err
 	}
-	if readErr != nil {
-		return db.AppendAudit(ctx, &model.AuditEvent{
-			ActorType: "system", ActorID: "system", ActorName: model.ProductName,
-			Action: "vault.master_key_trusted", Status: "ok", Severity: "critical",
-			TargetType: "store", TargetID: "vault",
-			Metadata: map[string]any{"reason": "no key check and no master.key; the operator chose to trust the supplied key"},
-		})
-	}
-	return nil
+	return db.AppendAuditWithMeta(ctx, &model.AuditEvent{
+		ActorType: "system", ActorID: "system", ActorName: model.ProductName,
+		Action: "vault.master_key_trusted", Status: "ok", Severity: "critical",
+		TargetType: "store", TargetID: "vault",
+		Metadata: map[string]any{"reason": "no key check and no master.key; the operator chose to trust the supplied key"},
+	}, store.MetaVaultKeyCheck, blob)
 }
 
-// ensureVaultKeyCheck verifies the stored key check, or writes it when the
-// data directory has none yet. Init and serve call it; both hold the key the
-// directory was created with (or fail here).
+// writeVaultKeyCheckIfMissing stores the key check for a key that was just
+// proved right, when the directory has none yet.
+func writeVaultKeyCheckIfMissing(ctx context.Context, db *store.DB, v *vault.Vault) error {
+	if _, err := db.GetMeta(ctx, store.MetaVaultKeyCheck); !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	blob, err := v.Encrypt([]byte(vaultKeyCheckPlaintext), vaultKeyCheckAAD)
+	if err != nil {
+		return err
+	}
+	return db.SetMeta(ctx, store.MetaVaultKeyCheck, blob)
+}
+
+// ensureVaultKeyCheck verifies the key, or writes the key check when the
+// directory holds nothing to verify against. Only Init uses it, for a
+// directory it has just created with this key; serve and recovery go
+// through checkVaultKey, which does not take an unverifiable key on trust.
 func ensureVaultKeyCheck(ctx context.Context, db *store.DB, v *vault.Vault) error {
 	err := verifyVaultKey(ctx, db, v)
 	if err == nil || !errors.Is(err, errVaultKeyUnverifiable) {
