@@ -262,3 +262,33 @@ func TestDevNullIsNotATerminal(t *testing.T) {
 		t.Fatal("stdinIsTerminal is true for /dev/null")
 	}
 }
+
+// Equal values for two settings flags both apply; a supervisor flag saved
+// at sign-in that is out of date does not block supervisor commands (the
+// server decides).
+func TestE2ESupervisorSettingsAndStaleFlag(t *testing.T) {
+	old := pollSleep
+	pollSleep = func(time.Duration) {}
+	t.Cleanup(func() { pollSleep = old })
+	e := newPersonE2E(t)
+	ta := e.personApp()
+	// Both lowered to the same value: no code needed, both written.
+	if code := ta.run("supervisor", "settings", "set", "--max-credentials", "2", "--requests-per-minute", "2"); code != ExitOK {
+		t.Fatalf("settings set: exit %d, %s", code, ta.errOut())
+	}
+	var s model.PolicySettings
+	e.call(http.MethodGet, "/api/v1/supervisor/settings", nil, &s, http.StatusOK)
+	if s.MaxConcurrentLeasesPerAgent != 2 || s.LeasesPerMinutePerAgent != 2 {
+		t.Fatalf("settings = %+v, want both 2", s)
+	}
+	// The saved flag says "not a supervisor"; the server still lets them in.
+	cfg, _ := ta.app.loadPersonConfig()
+	cfg.Supervisor = false
+	if _, err := ta.app.savePersonConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	ta.stdout.Reset()
+	if code := ta.run("supervisor", "people"); code != ExitOK || !strings.Contains(ta.out(), "admin") {
+		t.Fatalf("supervisor people with a stale flag: exit %d, %s", code, ta.errOut())
+	}
+}

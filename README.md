@@ -195,7 +195,7 @@ The step-by-step path, the MCP setup and the real-cloud setup are in
 | Agent | `csg exec --account ID --resource R --permission P --ttl 15m -- CMD` · `csg credential --lease ID [--export\|--json]` · `csg revoke --lease ID` · `csg leases mine` |
 | MCP | `csg mcp` (stdio; tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `revoke`) |
 | Person sign-in | `csg person login --server URL [--name NAME]` · `csg person whoami` · `csg person logout` |
-| Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode read\|write\|full [--for DUR]` · `csg me sessions` |
+| Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode read\|write\|full [--for DUR]` · `csg me sessions` · `csg me end-session ID` |
 | Supervisor | `csg supervisor people [add\|suspend\|activate\|reset\|make-supervisor\|remove-supervisor] …` · `csg supervisor roles [set\|remove] …` · `csg supervisor accounts [show\|test\|enable\|disable\|rename\|set-region\|set-role-arn\|auto-level\|rotate] …` · `csg supervisor settings [set …]` · `csg supervisor audit [verify]` · `csg supervisor requests [deny\|revoke] …` |
 | Demo | `csg mock request METHOD /v1/PATH [JSON_BODY]` |
 

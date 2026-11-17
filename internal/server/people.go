@@ -280,21 +280,29 @@ func (s *Server) handlePutBinding(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, "role must be guest, member or administrator")
 		return
 	}
-	// Any role above guest may raise access, whatever the role was before.
-	if in.Role != model.RoleGuest && !s.stepUp(w, r) {
-		return
-	}
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
 	provider, person, ok := s.bindingTargets(w, r)
 	if !ok {
 		return
 	}
+	// Read, decide and write as one step (see bindingsMu).
+	s.bindingsMu.Lock()
+	defer s.bindingsMu.Unlock()
 	previous := ""
 	if old, err := s.db.GetBinding(ctx, person.ID, provider.ID); err == nil {
 		previous = string(old.Role)
 	} else if !errors.Is(err, store.ErrNotFound) {
 		s.internalError(w, "read binding", err)
+		return
+	}
+	// A role above the one the person has now raises access. No role at all
+	// counts as below guest, but giving guest (read) is allowed as is.
+	raises := in.Role.Rank() > model.Role(previous).Rank()
+	if previous == "" {
+		raises = in.Role != model.RoleGuest
+	}
+	if raises && !s.stepUp(w, r) {
 		return
 	}
 	now := s.nowUTC()
@@ -350,7 +358,10 @@ func (s *Server) handleDeleteBinding(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.db.DeleteBinding(ctx, person.ID, provider.ID); err != nil {
+	s.bindingsMu.Lock()
+	err := s.db.DeleteBinding(ctx, person.ID, provider.ID)
+	s.bindingsMu.Unlock()
+	if err != nil {
 		s.storeErrorResponse(w, err, "this person has no role on this cloud account")
 		return
 	}

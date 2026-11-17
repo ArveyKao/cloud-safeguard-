@@ -91,6 +91,27 @@ func (db *DB) DecideCLISignIn(ctx context.Context, signInID, personID string, de
 	return affectedOrConflict(res)
 }
 
+// CancelCLISignIn withdraws an approval that was not collected yet: only the
+// person who approved it can, and only before the client picked up its
+// session. ErrNotFound otherwise.
+func (db *DB) CancelCLISignIn(ctx context.Context, userCode, personID string, now time.Time) (CLISignIn, error) {
+	signIn, err := db.GetCLISignInByUserCode(ctx, userCode)
+	if err != nil {
+		return CLISignIn{}, err
+	}
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE cli_signins SET status = 'denied', decided_at = ?
+		 WHERE id = ? AND person_id = ? AND status = 'approved' AND expires_at > ?`,
+		toMillis(now), signIn.ID, personID, toMillis(now))
+	if err != nil {
+		return CLISignIn{}, mapErr(err)
+	}
+	if err := affectedOrNotFound(res); err != nil {
+		return CLISignIn{}, err
+	}
+	return signIn, nil
+}
+
 // CompleteCLISignIn finishes an approved sign-in in one transaction: it
 // marks it consumed (still approved, unexpired, approver active), so a token
 // is issued at most once, and creates the session for the approver. It

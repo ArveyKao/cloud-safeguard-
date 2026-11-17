@@ -217,6 +217,12 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		case account == "":
 			s.badRequest(w, "role_arn must be a RAM role ARN such as acs:ram::1234567890123456:role/cloud-safeguard")
 			return
+		case prov.CloudAccountID == "" && isCLIRequest(r):
+			// Giving a provider its first cloud account makes a new account
+			// usable: that is adding a cloud account, done in the console.
+			s.writeError(w, http.StatusForbidden, model.ErrCodeConsoleOnly,
+				"connecting a provider to a cloud account can only be done in the console, never from the command line")
+			return
 		case prov.CloudAccountID == "":
 			// Left without a cloud account by an upgrade (its role ARN was
 			// not a role, or another provider already had the account). It
@@ -488,6 +494,9 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, err.Error())
 		return
 	}
+	// Read, decide and write as one step (see settingsMu).
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	before, err := s.db.GetPolicySettings(r.Context())
 	if err != nil {
 		s.writeHandlerError(w, err)
@@ -499,11 +508,6 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		if !s.stepUp(w, r) {
 			return
 		}
-	}
-	before, err = s.db.GetPolicySettings(r.Context())
-	if err != nil {
-		s.writeHandlerError(w, err)
-		return
 	}
 	if err := s.db.SetPolicySettings(r.Context(), in); err != nil {
 		s.writeHandlerError(w, err)

@@ -83,6 +83,7 @@ export const api = {
   cliSignIn: (code: string) => call<CLISignIn>('GET', `/me/cli-signins/${enc(code)}`),
   approveCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/approve`, {}),
   denyCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/deny`, {}),
+  cancelCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/cancel`, {}),
   cliSessions: () => call<List<CLISession>>('GET', '/me/cli-sessions'),
   revokeCLISession: (id: string) => call<{ ok: boolean }>('POST', `/me/cli-sessions/${enc(id)}/revoke`, {}),
   setMode: (mode: ApprovalMode, expires_in_seconds: number) =>

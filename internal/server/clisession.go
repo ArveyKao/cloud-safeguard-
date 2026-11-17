@@ -197,6 +197,32 @@ func (s *Server) handleDenyCLISignIn(w http.ResponseWriter, r *http.Request) {
 	s.decideCLISignIn(w, r, model.SignInDenied)
 }
 
+// handleCancelCLISignIn withdraws the person's own approval before csg has
+// collected the session: an approval given by mistake can still be undone.
+func (s *Server) handleCancelCLISignIn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	actor, _ := sessionFromContext(ctx)
+	code, ok := normalizeUserCode(r.PathValue("code"))
+	if !ok {
+		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "no approved sign-in with this code is waiting")
+		return
+	}
+	signIn, err := s.db.CancelCLISignIn(ctx, code, actor.person.ID, s.nowUTC())
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound,
+				"no approved sign-in with this code is waiting: it was collected already (end it in Settings) or it expired")
+			return
+		}
+		s.internalError(w, "cancel sign-in", err)
+		return
+	}
+	s.personAudit(ctx, actor.person, "cli_signin.cancelled", "ok", "warning", "cli_signin", signIn.ID, map[string]any{
+		"client_name": signIn.ClientName, "remote_addr": signIn.RemoteAddr,
+	})
+	s.writeData(w, http.StatusOK, map[string]string{"status": string(model.SignInDenied)})
+}
+
 // decideCLISignIn records the signed-in person's decision. On approval the
 // client gets a session of that person.
 func (s *Server) decideCLISignIn(w http.ResponseWriter, r *http.Request, decision model.SignInStatus) {
@@ -270,7 +296,7 @@ func (s *Server) consoleOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if sc, ok := sessionFromContext(r.Context()); ok && sc.session.IsCLI() {
 			s.personAudit(r.Context(), sc.person, "auth.console_only_refused", "denied", "warning", "session", sc.session.ID,
-				map[string]any{"method": r.Method, "path": r.URL.Path})
+				map[string]any{"method": r.Method, "path": logPath(r.URL.Path)})
 			s.writeError(w, http.StatusForbidden, model.ErrCodeConsoleOnly,
 				"this can only be done in the console, never from the command line")
 			return
@@ -302,7 +328,7 @@ func (s *Server) stepUp(w http.ResponseWriter, r *http.Request) bool {
 			}
 		}
 		s.personAudit(ctx, sc.person, "auth.step_up_failed", "denied", "warning", "session", sc.session.ID, map[string]any{
-			"reason": reason, "method": r.Method, "path": r.URL.Path,
+			"reason": reason, "method": r.Method, "path": logPath(r.URL.Path),
 		})
 		s.writeError(w, http.StatusForbidden, model.ErrCodeAuthenticatorCodeInvalid, "the authenticator code was not accepted")
 		return false
@@ -349,7 +375,14 @@ func (s *Server) stepUp(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	s.personAudit(ctx, sc.person, "auth.step_up", "ok", "info", "session", sc.session.ID, map[string]any{
-		"method": r.Method, "path": r.URL.Path,
+		"method": r.Method, "path": logPath(r.URL.Path),
 	})
 	return true
+}
+
+// isCLIRequest reports whether the request comes from a command-line
+// session.
+func isCLIRequest(r *http.Request) bool {
+	sc, ok := sessionFromContext(r.Context())
+	return ok && sc.session.IsCLI()
 }

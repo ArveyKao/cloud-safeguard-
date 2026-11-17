@@ -17,17 +17,12 @@ import (
 // done in the console. Changes that raise access take --code (or ask for it
 // in a terminal).
 
-// supervisorAPI is the person's client, refused early when the saved session
-// is not a supervisor's (the server checks again).
+// supervisorAPI is the person's client for supervisor routes. Whether the
+// person is a supervisor is the server's answer (403), not a flag saved at
+// sign-in that may be out of date.
 func (a *App) supervisorAPI() (*apiClient, error) {
-	c, cfg, err := a.personAPI()
-	if err != nil {
-		return nil, err
-	}
-	if !cfg.Supervisor {
-		return nil, authf("signed in as %s, who is not a supervisor", cfg.Username)
-	}
-	return c, nil
+	c, _, err := a.personAPI()
+	return c, err
 }
 
 func (a *App) runSupervisorCommands(args []string) error {
@@ -269,10 +264,11 @@ func (a *App) runSupAccounts(args []string) error {
        csg supervisor accounts set-region ACCOUNT REGION [--code CODE]
        csg supervisor accounts set-role-arn ACCOUNT ARN [--code CODE]
        csg supervisor accounts auto-level ACCOUNT read|write|full [--code CODE]
-       csg supervisor accounts rotate ACCOUNT --key-id ID --code CODE   (secret on stdin)
+       csg supervisor accounts rotate ACCOUNT --key-id ID --code CODE < secret   (secret piped in)
 
 Adding a cloud account is done in the console only. rotate reads the new
-AccessKey secret from standard input, so its --code must be given as a flag.
+AccessKey secret from a pipe or file on standard input (never from the
+terminal), so its --code must be given as a flag.
 `)
 	keyID := fs.String("key-id", "", "the new AccessKey ID (rotate)")
 	positionals, err := parseFlags(fs, rest)
@@ -380,6 +376,11 @@ AccessKey secret from standard input, so its --code must be given as a flag.
 		if strings.TrimSpace(*keyID) == "" || strings.TrimSpace(*f.code) == "" {
 			return usagef("rotate needs --key-id and --code; the new secret is read from standard input")
 		}
+		// Typed at a terminal, the secret would be echoed and stay in the
+		// scrollback: it must come from a file or a pipe.
+		if a.stdinIsTerminal() {
+			return usagef("pipe the new AccessKey secret in, e.g. from your password manager or `< secret.txt`; it is not read from the terminal, where it would be shown")
+		}
 		secret, err := bufio.NewReader(a.Stdin).ReadString('\n')
 		secret = strings.TrimRight(secret, "\r\n")
 		if secret == "" {
@@ -450,15 +451,21 @@ your authenticator app; lowering does not.
 				return usagef("--approval-timeout: %v", err)
 			}
 		}
-		for flag, dst := range map[string]*int{*maxCreds: &s.MaxConcurrentLeasesPerAgent, *perMinute: &s.LeasesPerMinutePerAgent} {
-			if flag == "" {
+		for _, v := range []struct {
+			name, value string
+			dst         *int
+		}{
+			{"--max-credentials", *maxCreds, &s.MaxConcurrentLeasesPerAgent},
+			{"--requests-per-minute", *perMinute, &s.LeasesPerMinutePerAgent},
+		} {
+			if v.value == "" {
 				continue
 			}
-			n, err := strconv.Atoi(flag)
+			n, err := strconv.Atoi(v.value)
 			if err != nil || n <= 0 {
-				return usagef("--max-credentials and --requests-per-minute take a positive number")
+				return usagef("%s takes a positive number", v.name)
 			}
-			*dst = n
+			*v.dst = n
 		}
 		if err := a.raising(c, *f.code, http.MethodPut, apiPrefix+"/supervisor/settings", s, &s); err != nil {
 			return err

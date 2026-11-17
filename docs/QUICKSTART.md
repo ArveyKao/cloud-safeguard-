@@ -211,8 +211,8 @@ without use) and is saved in `~/.config/cloud-safeguard/person.json`, apart from
 
 Agents often run on the same machine and could read that file, so the session is guarded:
 
-- reading, and anything that lowers access (deny, revoke, lower or remove a role, suspend,
-  disable an account, set your mode to read), works as is;
+- reading, and anything that lowers access (deny, revoke, lower a role or remove it,
+  suspend, disable an account, set your mode to read), works as is;
 - anything that raises access (add or reset a person, make a supervisor, give a role above
   guest, enable or reconfigure an account, replace its AccessKey, raise a level or a limit,
   set your mode above read) needs a fresh code from your authenticator app. In a terminal

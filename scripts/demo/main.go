@@ -330,6 +330,7 @@ func (d *demo) s2() error {
 		line := scanner.Text()
 		shown.WriteString(line + "\n")
 		if code, ok := strings.CutPrefix(strings.TrimSpace(line), "code: "); ok && !approved {
+			d.secrets["the agent's sign-in code"] = code
 			// The person checks the code in the console and approves.
 			var pending model.AgentSignIn
 			if err := d.must(d.mei, http.MethodGet, "/api/v1/me/signins/"+code, nil, &pending, http.StatusOK); err != nil {
@@ -638,6 +639,7 @@ func (d *demo) s9person() error {
 		line := scanner.Text()
 		shown.WriteString(line + "\n")
 		if code, ok := strings.CutPrefix(strings.TrimSpace(line), "code: "); ok && !approved {
+			d.secrets["the command-line sign-in code"] = code
 			var pending model.CLISignIn
 			if err := d.must(d.sup, http.MethodGet, "/api/v1/me/cli-signins/"+code, nil, &pending, http.StatusOK); err != nil {
 				_ = cmd.Process.Kill()

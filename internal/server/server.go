@@ -124,12 +124,19 @@ type Server struct {
 	listener     net.Listener
 	returnedAddr string
 
+	// accountsMu serializes edits of cloud accounts and the role bindings
+	// written on them.
+	accountsMu sync.Mutex
+	// settingsMu and bindingsMu make "read the current value, decide whether
+	// the change raises access (and so needs an authenticator code), write"
+	// one step: a change in between cannot turn a lowering into a raise.
+	// Lock order: settingsMu or bindingsMu, then a person's lock (stepUp),
+	// then accountsMu.
+	settingsMu sync.Mutex
+	bindingsMu sync.Mutex
 	// leaseLocks serializes minting and activation per lease, so two approvals
 	// of one lease (double click, retry, approval racing auto-approval) never
 	// mint twice. The server is a single process per data dir (ADR-002).
-	// accountsMu serializes edits of cloud accounts and the role bindings
-	// written on them.
-	accountsMu   sync.Mutex
 	leaseLocksMu sync.Mutex
 	leaseLocks   map[string]*leaseLock
 

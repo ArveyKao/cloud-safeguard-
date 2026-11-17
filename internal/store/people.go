@@ -227,12 +227,27 @@ func (db *DB) SetPersonAuthority(ctx context.Context, id string, status model.Pe
 			return db.explainAuthorityRefusal(ctx, tx, id)
 		}
 		if status != model.PersonActive {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE person_id = ?`, id); err != nil {
-				return mapErr(err)
-			}
+			return endSessionsAndSignIns(ctx, tx, id)
 		}
 		return nil
 	})
+}
+
+// endSessionsAndSignIns ends everything a person has signed in or approved:
+// their sessions, and the agent and command-line sign-ins they approved that
+// were not collected yet. An approval made before a suspension or reset
+// must not become a sign-in after the person is active again.
+func endSessionsAndSignIns(ctx context.Context, tx *sql.Tx, personID string) error {
+	for _, stmt := range []string{
+		`DELETE FROM sessions WHERE person_id = ?`,
+		`UPDATE agent_signins SET status = 'denied' WHERE person_id = ? AND status = 'approved'`,
+		`UPDATE cli_signins SET status = 'denied' WHERE person_id = ? AND status = 'approved'`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, personID); err != nil {
+			return mapErr(err)
+		}
+	}
+	return nil
 }
 
 // explainAuthorityRefusal turns "no row updated" into a precise error.
@@ -274,8 +289,7 @@ func (db *DB) ResetPersonSetup(ctx context.Context, id, setupCodeHash string, se
 		if n, _ := res.RowsAffected(); n == 0 {
 			return db.explainAuthorityRefusal(ctx, tx, id)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE person_id = ?`, id)
-		return mapErr(err)
+		return endSessionsAndSignIns(ctx, tx, id)
 	})
 }
 

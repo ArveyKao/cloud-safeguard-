@@ -392,6 +392,8 @@ func TestCLICodeIsCheckedLikeASignIn(t *testing.T) {
 	a.nextStep()
 	code := a.totp(a.sup.secret, 0)
 	requireStatus(t, sup.doWithHeader(http.MethodPut, path, body, code), http.StatusOK)
+	// From member, administrator is the raise that needs a code.
+	body = model.PutBindingInput{Role: model.RoleAdministrator}
 	requireErrorCode(t, sup.doWithHeader(http.MethodPut, path, body, code), http.StatusForbidden, model.ErrCodeAuthenticatorCodeInvalid)
 
 	for i := 0; i < loginFailureThreshold; i++ {
@@ -508,4 +510,202 @@ func TestCLISessionRespectsTheSupervisorFlag(t *testing.T) {
 	read := a.request(accessInput("ecs", "read"))
 	requireStatus(t, sup.do(http.MethodPost, "/api/v1/supervisor/leases/"+read.ID+"/revoke", model.RevokeLeaseInput{Reason: "stop"}), http.StatusOK)
 	a.requireActor(a.lastEvent("lease.revoked"), a.sup)
+}
+
+// ---- regression tests for the independent review of commit b3b8bd7 ----
+
+// Two settings changes at once, neither with a code: the limit can end up
+// lowered, never raised back above where the lowering put it.
+func TestSettingsDecisionAndWriteAreOneStep(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		a := newAccessEnv(t, model.RoleMember)
+		cli := a.signInCLI(a.sup)
+		high := model.DefaultPolicySettings()
+		low := high
+		low.MaxLeaseTTLSeconds = 1800
+		start := make(chan struct{})
+		results := make(chan struct {
+			high bool
+			code int
+		}, 2)
+		for _, body := range []model.PolicySettings{high, low} {
+			go func() {
+				<-start
+				results <- struct {
+					high bool
+					code int
+				}{body.MaxLeaseTTLSeconds == high.MaxLeaseTTLSeconds, cli.do(http.MethodPut, "/api/v1/supervisor/settings", body).Code}
+			}()
+		}
+		close(start)
+		lowWritten := false
+		for i := 0; i < 2; i++ {
+			r := <-results
+			if !r.high && r.code == http.StatusOK {
+				lowWritten = true
+			}
+		}
+		got, _ := a.srv.db.GetPolicySettings(context.Background())
+		if lowWritten && got.MaxLeaseTTLSeconds != low.MaxLeaseTTLSeconds {
+			t.Fatalf("round %d: the limit went back up to %d without a code", round, got.MaxLeaseTTLSeconds)
+		}
+		if len(a.listAudit("auth.step_up")) != 0 {
+			t.Fatalf("round %d: a code was used although none was sent", round)
+		}
+	}
+}
+
+// A deterministic version: the lowering commits while the other request is
+// between its read and its write. With the lock, the second request reads
+// the lowered value and asks for a code.
+func TestSettingsRaiseAfterAConcurrentLoweringNeedsACode(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	cli := a.signInCLI(a.sup)
+	high := model.DefaultPolicySettings()
+	low := high
+	low.MaxLeaseTTLSeconds = 1800
+	a.srv.settingsMu.Lock()
+	done := make(chan int, 1)
+	go func() { done <- cli.do(http.MethodPut, "/api/v1/supervisor/settings", high).Code }()
+	time.Sleep(50 * time.Millisecond) // the request waits for the lock
+	if err := a.srv.db.SetPolicySettings(context.Background(), low); err != nil {
+		t.Fatal(err)
+	}
+	a.srv.settingsMu.Unlock()
+	if code := <-done; code != http.StatusForbidden {
+		t.Fatalf("raising after the lowering without a code = %d, want 403", code)
+	}
+	if got, _ := a.srv.db.GetPolicySettings(context.Background()); got.MaxLeaseTTLSeconds != 1800 {
+		t.Fatalf("the limit was raised to %d without a code", got.MaxLeaseTTLSeconds)
+	}
+}
+
+// Lowering a role works from the command line whatever it is lowered to;
+// raising one needs a code, and the decision uses the role at write time.
+func TestRoleChangesDecideOnTheCurrentRole(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	cli := a.signInCLI(a.sup)
+	path := "/api/v1/supervisor/accounts/" + a.providerID + "/people/" + a.mei.person.ID
+	role := func() model.Role {
+		b, _ := a.srv.db.GetBinding(context.Background(), a.mei.person.ID, a.providerID)
+		return b.Role
+	}
+	requireStatus(t, cli.do(http.MethodPut, path, model.PutBindingInput{Role: model.RoleMember}), http.StatusOK)
+	if role() != model.RoleMember {
+		t.Fatalf("administrator → member = %s", role())
+	}
+	requireStatus(t, cli.do(http.MethodPut, path, model.PutBindingInput{Role: model.RoleMember}), http.StatusOK) // unchanged
+	requireErrorCode(t, cli.do(http.MethodPut, path, model.PutBindingInput{Role: model.RoleAdministrator}), http.StatusForbidden, model.ErrCodeAuthenticatorCodeRequired)
+	if role() != model.RoleMember {
+		t.Fatal("member was raised to administrator without a code")
+	}
+	// The role is lowered while the request waits: it is now a raise.
+	a.srv.bindingsMu.Lock()
+	done := make(chan int, 1)
+	go func() { done <- cli.do(http.MethodPut, path, model.PutBindingInput{Role: model.RoleMember}).Code }()
+	time.Sleep(50 * time.Millisecond)
+	a.bindDirect(a.mei.person.ID, model.RoleGuest)
+	a.srv.bindingsMu.Unlock()
+	if code := <-done; code != http.StatusForbidden || role() != model.RoleGuest {
+		t.Fatalf("guest → member after a concurrent lowering: %d, role %s", code, role())
+	}
+	requireStatus(t, cli.withCode(http.MethodPut, path, model.PutBindingInput{Role: model.RoleAdministrator}), http.StatusOK)
+	if role() != model.RoleAdministrator {
+		t.Fatalf("with a code = %s", role())
+	}
+}
+
+// An approval that was not collected yet ends when its approver is suspended
+// or reset: the old device code gives nothing after they are active again.
+func TestSuspendAndResetEndUncollectedApprovals(t *testing.T) {
+	for _, how := range []string{"suspend", "reset"} {
+		t.Run(how, func(t *testing.T) {
+			a := newAccessEnv(t, model.RoleMember)
+			cliStart := a.startCLISignIn("laptop")
+			requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/cli-signins/"+cliStart.UserCode+"/approve", nil), http.StatusOK)
+			agentStart := a.startSignIn("another-agent")
+			requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/signins/"+agentStart.UserCode+"/approve", nil), http.StatusOK)
+
+			path := "/api/v1/supervisor/people/" + a.mei.person.ID
+			if how == "suspend" {
+				suspended, active := model.PersonSuspended, model.PersonActive
+				requireStatus(t, a.sup.do(http.MethodPatch, path, model.UpdatePersonInput{Status: &suspended}), http.StatusOK)
+				requireStatus(t, a.sup.do(http.MethodPatch, path, model.UpdatePersonInput{Status: &active}), http.StatusOK)
+			} else {
+				rec := a.sup.do(http.MethodPost, path+"/reset", nil)
+				requireStatus(t, rec, http.StatusOK)
+				a.completeSetup(decodeEnvelope[model.PersonWithSetupCode](t, rec).SetupCode)
+			}
+			if res := a.pollCLISignIn(cliStart.DeviceCode); res.Status == model.SignInApproved || res.Token != "" {
+				t.Fatalf("the command-line approval survived the %s: %+v", how, res)
+			}
+			if res := a.pollSignIn(agentStart.DeviceCode); res.Status == model.SignInApproved || res.Token != "" {
+				t.Fatalf("the agent approval survived the %s: %+v", how, res)
+			}
+		})
+	}
+}
+
+// An approval given by mistake can be withdrawn until csg collects it, by
+// the person who gave it only.
+func TestApprovedSignInCanBeWithdrawnBeforePickup(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	start := a.startCLISignIn("laptop")
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/cli-signins/"+start.UserCode+"/approve", nil), http.StatusOK)
+	// Someone else cannot withdraw it, and a command-line session cannot
+	// withdraw another person's.
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/me/cli-signins/"+start.UserCode+"/cancel", nil), http.StatusNotFound)
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/cli-signins/"+start.UserCode+"/cancel", nil), http.StatusOK)
+	if res := a.pollCLISignIn(start.DeviceCode); res.Status != model.SignInDenied || res.Token != "" {
+		t.Fatalf("after withdrawing: %+v", res)
+	}
+	a.requireActor(a.lastEvent("cli_signin.cancelled"), a.mei)
+	// Once collected it is a session: withdrawing is too late, ending it is
+	// done in Settings.
+	collected := a.signInCLI(a.mei)
+	_ = collected
+	second := a.startCLISignIn("laptop")
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/cli-signins/"+second.UserCode+"/approve", nil), http.StatusOK)
+	a.pollCLISignIn(second.DeviceCode)
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/cli-signins/"+second.UserCode+"/cancel", nil), http.StatusNotFound)
+}
+
+// The command-line sign-in code is masked wherever the server writes a
+// path: the access log and the audit log.
+func TestCLISignInCodeIsMaskedInLogs(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	cli := a.signInCLI(a.mei)
+	start := a.startCLISignIn("laptop")
+	a.mei.do(http.MethodGet, "/api/v1/me/cli-signins/"+start.UserCode, nil)
+	cli.do(http.MethodPost, "/api/v1/me/cli-signins/"+start.UserCode+"/approve", nil) // refused: console only
+	if strings.Contains(a.logs.String(), start.UserCode) {
+		t.Fatal("the access log contains the sign-in code")
+	}
+	raw, _ := json.Marshal(a.listAudit(""))
+	if strings.Contains(string(raw), start.UserCode) {
+		t.Fatal("the audit log contains the sign-in code")
+	}
+	if got := logPath("/api/v1/me/cli-signins/ABC-DEFG/approve"); got != "/api/v1/me/cli-signins/***/approve" {
+		t.Fatalf("logPath = %q", got)
+	}
+}
+
+// Giving a provider its first cloud account makes a new account usable: it
+// is console-only like adding one.
+func TestConnectingAProviderIsConsoleOnly(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", newMockAccount("second", "6543210987654321"))
+	requireStatus(t, rec, http.StatusCreated)
+	second := decodeEnvelope[model.Provider](t, rec)
+	if _, err := a.srv.db.SQL().Exec(`UPDATE providers SET cloud_account_id = '', role_arn = 'not-a-role' WHERE id = ?`, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	cli := a.signInCLI(a.sup)
+	arn := "acs:ram::7777777777777777:role/cloud-safeguard"
+	requireErrorCode(t, cli.withCode(http.MethodPatch, "/api/v1/supervisor/accounts/"+second.ID, model.UpdateProviderInput{RoleARN: &arn}),
+		http.StatusForbidden, model.ErrCodeConsoleOnly)
+	if got, _ := a.srv.db.GetProvider(context.Background(), second.ID); got.CloudAccountID != "" {
+		t.Fatal("a command-line session connected a provider")
+	}
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+second.ID, model.UpdateProviderInput{RoleARN: &arn}), http.StatusOK)
 }

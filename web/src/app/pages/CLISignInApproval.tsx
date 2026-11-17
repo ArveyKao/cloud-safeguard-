@@ -8,7 +8,7 @@ import { Button, Card, ErrorNote, PageHead, ago, useAction, useLoad } from '../u
 export function CLISignInApprovalPage({ code, person }: { code: string; person: Person }) {
   const signIn = useLoad(() => api.cliSignIn(code), [code])
   const [matched, setMatched] = useState(false)
-  const [done, setDone] = useState<'approved' | 'denied' | null>(null)
+  const [done, setDone] = useState<'approved' | 'denied' | 'cancelled' | null>(null)
   const action = useAction()
   const leave = () => navigate('/inbox')
 
@@ -27,12 +27,19 @@ export function CLISignInApprovalPage({ code, person }: { code: string; person: 
   if (done) {
     return (
       <>
-        <PageHead title={done === 'approved' ? 'csg is signed in as you' : 'Sign-in denied'} />
+        <PageHead title={done === 'approved' ? 'csg is signed in as you' : done === 'cancelled' ? 'Approval withdrawn' : 'Sign-in denied'} />
         <Card>
           {done === 'approved'
-            ? <p>The command line can now read, deny and revoke as you. Anything that raises access asks for a code from your authenticator app, and approving stays here in the console. You can end this sign-in any time in Settings.</p>
+            ? <>
+                <p>The command line can now read, deny and revoke as you. Anything that raises access asks for a code from your authenticator app, and approving stays here in the console. Once csg has picked up its sign-in, you can end it any time in Settings.</p>
+                <p className="muted small">Approved by mistake? Withdraw it now, before csg picks it up.</p>
+              </>
             : <p>The code no longer works. If you did not start this sign-in, nothing else is needed; it is in the activity log.</p>}
-          <Button kind="primary" onClick={() => navigate(done === 'approved' ? '/settings' : '/inbox')}>{done === 'approved' ? 'Go to Settings' : 'Back to Inbox'}</Button>
+          <ErrorNote error={action.error} />
+          <div className="row-actions left">
+            <Button kind="primary" onClick={() => navigate(done === 'approved' ? '/settings' : '/inbox')}>{done === 'approved' ? 'Go to Settings' : 'Back to Inbox'}</Button>
+            {done === 'approved' && <Button busy={action.busy} onClick={() => action.run(async () => { await api.cancelCLISignIn(code); setDone('cancelled') })}>Withdraw approval</Button>}
+          </div>
         </Card>
       </>
     )

@@ -78,6 +78,7 @@ func (s *Server) buildHandler() http.Handler {
 	meMux.HandleFunc("GET /api/v1/me/cli-signins/{code}", s.handleGetCLISignIn)
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/approve", s.consoleOnly(s.handleApproveCLISignIn))
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/deny", s.handleDenyCLISignIn)
+	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/cancel", s.handleCancelCLISignIn)
 	meMux.HandleFunc("GET /api/v1/me/cli-sessions", s.handleListCLISessions)
 	meMux.HandleFunc("POST /api/v1/me/cli-sessions/{id}/revoke", s.handleRevokeCLISession)
 	meMux.HandleFunc("POST /api/v1/me/requests/{id}/deny", s.handleDenyMyRequest)
@@ -236,15 +237,17 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 	})
 }
 
-// logPath is the request path as written to the access log. A sign-in user
-// code is an approval secret while the sign-in is pending, so it is masked.
+// logPath is the request path as written to the access log, the audit log
+// and panic messages. A sign-in user code (of an agent or of csg) is an
+// approval secret while the sign-in is pending, so it is masked.
 func logPath(path string) string {
-	const prefix = "/api/v1/me/signins/"
-	if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
-		if _, tail, found := strings.Cut(rest, "/"); found {
-			return prefix + "***/" + tail
+	for _, prefix := range []string{"/api/v1/me/signins/", "/api/v1/me/cli-signins/"} {
+		if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
+			if _, tail, found := strings.Cut(rest, "/"); found {
+				return prefix + "***/" + tail
+			}
+			return prefix + "***"
 		}
-		return prefix + "***"
 	}
 	return path
 }
@@ -254,7 +257,7 @@ func (s *Server) recoverPanics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				s.logf("panic serving %s %s: %v", r.Method, r.URL.Path, rec)
+				s.logf("panic serving %s %s: %v", r.Method, logPath(r.URL.Path), rec)
 				s.writeError(w, http.StatusInternalServerError, model.ErrCodeInternal, "internal error")
 			}
 		}()

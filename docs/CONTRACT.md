@@ -1102,8 +1102,12 @@ and could read it.
   `GET /api/v1/me/cli-signins/{code}`, `POST /api/v1/me/cli-signins/{code}/approve|deny`.
   Only a console session can approve; a command-line session cannot approve another one.
 - `POST /api/v1/person-signin/token` `{device_code}` → on approval, once:
-  `{status, token, person, expires_at}`. The token (`csg_ses_…`) is stored only as a hash,
-  in `~/.config/cloud-safeguard/person.json` (0600) on the client.
+  `{status, token, person, expires_at}`. The client keeps the token (`csg_ses_…`) in
+  `~/.config/cloud-safeguard/person.json` (0600); the server stores only its hash.
+- The approver can withdraw an approval until the client collects it
+  (`POST /api/v1/me/cli-signins/{code}/cancel`). Suspending or resetting a person also ends
+  every agent or command-line sign-in they approved that was not collected yet.
+- The sign-in code is masked in the access log and the audit log, like the agent's.
 - It is a session of the approving person, with the console's limits: 30 minutes idle,
   12 hours at most. It ends at `csg person logout`, when the person is suspended or reset,
   or when the person revokes it in the console (`GET /api/v1/me/cli-sessions`,
@@ -1114,25 +1118,31 @@ and could read it.
 **What a command-line session may do.**
 - Everything that reads.
 - Everything that lowers access, as is: deny or revoke a request or credential, revoke
-  one's own agent, lower or remove a role, suspend a person, remove the supervisor flag,
+  one's own agent, lower a role (to any lower role) or remove it, suspend a person, remove
+  the supervisor flag,
   disable a cloud account, lower an approval mode to read, lower an account's highest
   automatic level to read, test a connection, sign out.
 - Anything that raises access needs a fresh authenticator code of the signed-in person on
   that request (`X-CSG-Authenticator-Code`): add a person, reset a person (it issues a setup
-  code), activate a person, make a supervisor, give a role other than guest, change a cloud
-  account other than disabling or renaming it, replace its AccessKey, raise its highest
-  automatic level, change the limits unless every value is lowered, set an approval mode
-  other than read. A wrong code counts towards the sign-in lockout (5 failures lock the
+  code), activate a person, make a supervisor, give a role higher than the person has now
+  (no role counts as below guest, but giving guest needs no code), change a cloud account
+  other than disabling or renaming it, replace its AccessKey, raise its highest automatic
+  level, change the limits unless every value is lowered, set an approval mode other than
+  read. The server decides from the current value and writes under the same lock, so a
+  change made meanwhile cannot turn a lowering into a raise. A wrong code counts towards the sign-in lockout (5 failures lock the
   person for 15 minutes); a code is accepted once. The CLI asks for the code when it runs
   in a terminal, or takes `--code`.
 - Console only, with or without a code: approving an access request, approving an agent
-  sign-in or a command-line sign-in, adding a cloud account. A command-line session gets
+  sign-in or a command-line sign-in, adding a cloud account, and giving a provider that an
+  upgrade left without one its first cloud account (that makes a new account usable). A command-line session gets
   403 for these, so an agent that reads the session file can never approve itself.
 - Console sessions are unchanged.
 
 **Commands.** `csg person login|logout|whoami`; `csg me requests|deny|revoke|agents|
-revoke-agent|accounts|mode`; `csg supervisor people|roles|accounts|settings|audit|requests`
-with subcommands for every supervisor route except adding a cloud account.
+revoke-agent|accounts|mode|sessions|end-session`; `csg supervisor people|roles|accounts|
+settings|audit|requests` for the supervisor's work except what is console-only (not yet:
+showing one request by ID, changing a display name). `supervisor accounts rotate` reads the
+new secret from a pipe or file, never from the terminal.
 `csg supervisor recover` stays a local command on the server host.
 
 ### 17.8 Implementation status

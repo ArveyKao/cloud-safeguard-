@@ -144,7 +144,11 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   `csg supervisor people|roles|accounts|settings|audit|requests`. Schema 9: sessions have a
   kind (console or cli); `cli_signins`. A command-line session cannot approve anything or add
   a cloud account; raising access needs `X-CSG-Authenticator-Code`. Console: approval page
-  and Settings → Command-line sign-ins. Demo S9 covers it. Awaiting commit and review.
+  and Settings → Command-line sign-ins. Demo S9 covers it. First review (2026-11-17): a race
+  let a limit be raised without a code (decision and write now under one lock, same for
+  roles); approvals not yet collected survived a suspend or reset (now ended, and the
+  approver can withdraw one); lowering administrator → member asked for a code (fixed).
+  Awaiting the second round.
 - **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
   for everything except adding a cloud account, which stays console-only; (2) remote MCP over
   HTTPS with OAuth-style sign-in so an agent connects with just a URL.

@@ -168,6 +168,11 @@ describe('agent sign-in', () => {
     fireEvent.click(approve)
     await waitFor(() => expect(changes().map((c) => c.path)).toEqual(['/me/cli-signins/CLI-CODE/approve']))
     await screen.findByText('csg is signed in as you')
+    // Approved by mistake: it can be withdrawn before csg picks it up.
+    routes['POST /me/cli-signins/CLI-CODE/cancel'] = { status: 'denied' }
+    fireEvent.click(screen.getByRole('button', { name: 'Withdraw approval' }))
+    await screen.findByText('Approval withdrawn')
+    expect(changes().map((c) => c.path)).toEqual(['/me/cli-signins/CLI-CODE/approve', '/me/cli-signins/CLI-CODE/cancel'])
   })
 
   it('remembers a sign-in link once, and only for ten minutes', () => {
