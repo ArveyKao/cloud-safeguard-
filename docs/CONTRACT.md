@@ -1160,28 +1160,35 @@ registration. The owner chose that the credential is handed over through a one-t
   `/oauth/register`; response type `code`, grant type `authorization_code`, PKCE `S256` only,
   token endpoint authentication `none` (public clients).
 
-**Registration.** `POST /oauth/register` (RFC 7591), unauthenticated: a `client_name` and
+**Registration.** `POST /oauth/register` (RFC 7591), unauthenticated, with a JSON body
+(`Content-Type: application/json`, so another website cannot register from a visitor's
+browser): a `client_name` (no control or format characters) and
 1-10 `redirect_uris`, each `https://…`, `http://` on a loopback host, or a private-use scheme
 such as `cursor://` (never `javascript:`, `data:`, `file:` and the like, never a fragment). It
 returns a `client_id` (`mcc_…`) for a public client (`token_endpoint_auth_method: none`).
 Registering grants nothing. At most 500 registrations that never led to a connection may be
-made in 24 hours, 20 from one address; such unused registrations are deleted after 24 hours.
+made in 24 hours, 20 from one address; such unused registrations are deleted after 24 hours,
+and a registration not used for 90 days is deleted too (the client registers again). Behind
+a proxy, the address is the client's only with `--trusted-proxy`; otherwise every client
+shares the proxy's address and its limits.
 
 **Sign-in.**
 - `GET /oauth/authorize?response_type=code&client_id&redirect_uri&code_challenge&
   code_challenge_method=S256&state[&resource][&scope]`. The redirect URI must be one the
   client registered, exactly, except that the port of a loopback `http` URI may differ
-  (RFC 8252). An unknown client or redirect URI gets an error page, never a redirect; other
-  errors go back to the client. PKCE S256 is required; `resource`, when sent, must be this
+  (RFC 8252) as long as it is a real port. An unknown client or redirect URI gets an error
+  page, never a redirect; other errors go back to the client (a `state` over 1000 characters
+  as `invalid_request`, without the state). PKCE S256 is required; `resource`, when sent, must be this
   server's `/mcp`. The server keeps the request for 10 minutes (at most 100 waiting, 10 from
   one address) and sends the browser to the console with a random key
   (`/?mcp-connect=KEY`), stored only as a hash; the link survives the console sign-in.
 - The person, signed in to the console, sees the client's name, **the host the sign-in is
-  sent to**, and an agent name to give it, and approves or denies
+  sent to** (for a private-use scheme, the whole redirect URI without its query), and an agent
+  name to give it, and approves or denies
   (`GET /api/v1/me/mcp-connections/{key}`, `POST …/approve {agent_name}` (console only),
   `POST …/deny`). The answer is the `redirect_url` the console sends the browser to: the
   redirect URI with a one-time `code` (valid 60 seconds) or `error=access_denied`, and `state`
-  and `iss`.
+  and `iss` (the issuer the client started at, whatever host the console was opened at).
 - `POST /oauth/token` (form-encoded): `grant_type=authorization_code`, `code`, `redirect_uri`,
   `client_id`, `code_verifier` (and optionally `resource`). The code works once, with the
   right client, redirect URI (when sent) and verifier, while the approver is active; a code
@@ -1195,7 +1202,9 @@ made in 24 hours, 20 from one address; such unused registrations are deleted aft
 **The MCP endpoint.** `POST /mcp`, Streamable HTTP without server-sent events: one JSON-RPC
 message or a batch per request, answered as `application/json`; notifications get 202 and
 no body. `GET` and `DELETE` answer 405. A request whose `Origin` is not this server is
-refused (DNS rebinding); there is no CORS. Protocol versions 2025-06-18, 2025-03-26; an
+refused; there is no CORS. Against DNS rebinding this needs `--public-url`, since without it
+"this server" follows the `Host` header; the bearer token, which a browser cannot send
+cross-site without a preflight that is never granted, is the protection in either case. Protocol versions 2025-06-18, 2025-03-26; an
 unknown `MCP-Protocol-Version` header is refused. 1 MiB per request. The tools are those of
 `csg mcp` (§17.7) and go through the agent API, with its rules, limits and audit:
 `list_accounts`, `request_access`, `check_status`, `revoke`, and `get_credential`, which
@@ -1208,7 +1217,7 @@ returns a **one-time link** instead of the secret:
 - using it returns shell `export` lines (`ALIBABA_CLOUD_ACCESS_KEY_ID`, `…_SECRET`,
   `…_SECURITY_TOKEN`, `CSG_LEASE_ID`, `CSG_SERVER`, `CSG_CAPABILITY`, values single-quoted)
   and an `echo` to stderr saying until when it is valid, with `Cache-Control: no-store`; the
-  tool tells the agent to run `eval "$(curl -fsS -X POST '<link>')"` in the shell that runs
+  tool tells the agent to run `eval "$(curl -fsS -X POST '<link>')"` (the link shell-quoted) in the shell that runs
   the cloud command, so the secret goes into that shell, not into the conversation; a link
   that is unknown, used or expired gets 404 and only an `echo` to stderr;
 - the agent (active, owner active) and every release check of the credential endpoint are

@@ -192,7 +192,8 @@ app gives itself and **where the sign-in goes**; check that it is the app you ar
 connecting, name the agent, tick the box and approve. The browser returns to the app, which
 is now your agent; revoke it on the Agents page. A browser on another machine than the
 server needs the server's real URL (`csg serve --public-url`), and anything but localhost
-needs HTTPS in front of it.
+needs HTTPS in front of it. Behind a proxy also pass `--trusted-proxy`, or every client shares
+the proxy's address for the sign-in limits and the console shows it as "Started from".
 
 `get_credential` returns a one-time link instead of the secret, with the command to run in
 the shell that runs the cloud command:

@@ -290,6 +290,7 @@ var migrations = []migration{
 				code_hash      TEXT NOT NULL DEFAULT '',
 				agent_id       TEXT NOT NULL DEFAULT '',
 				remote_addr    TEXT NOT NULL DEFAULT '',
+				issuer         TEXT NOT NULL DEFAULT '',
 				created_at     INTEGER NOT NULL,
 				expires_at     INTEGER NOT NULL,
 				decided_at     INTEGER

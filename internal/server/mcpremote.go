@@ -178,7 +178,7 @@ func (s *Server) prepareCredentialLink(ctx context.Context, backend inProcessBac
 	return map[string]any{
 		"request_id":         lease.ID,
 		"credential_expires": lease.ExpiresAt.UTC().Format(time.RFC3339),
-		"run":                `eval "$(curl -fsS -X POST '` + link + `')"`,
+		"run":                `eval "$(curl -fsS -X POST ` + shellQuoteValue(link) + `)"`,
 		"note": "Run this once, within 60 seconds, in the shell that runs the cloud command; it sets the credential's environment variables there. " +
 			"The link works once. The secret is not shown here; do not print it. Revoke the request when done.",
 	}, nil
@@ -192,7 +192,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "agent token required")
 		return
 	}
-	if v := r.Header.Get("MCP-Protocol-Version"); v != "" && !containsString(remoteMCPVersions, v) && v != "2024-11-05" {
+	if v := r.Header.Get("MCP-Protocol-Version"); v != "" && !containsString(remoteMCPVersions, v) {
 		s.writeError(w, http.StatusBadRequest, model.ErrCodeInvalidRequest, "unsupported MCP-Protocol-Version")
 		return
 	}

@@ -12,7 +12,7 @@ import (
 func newOAuthRequest(t *testing.T, db *DB, id string) OAuthRequest {
 	t.Helper()
 	r := OAuthRequest{ID: id, ConnectHash: "ch-" + id, ClientID: "mcc_1", RedirectURI: "https://app.example/cb",
-		CodeChallenge: "challenge", State: "s", RemoteAddr: "10.0.0.1", CreatedAt: peopleNow, ExpiresAt: peopleNow.Add(10 * time.Minute)}
+		CodeChallenge: "challenge", State: "s", RemoteAddr: "10.0.0.1", Issuer: "https://csg.example", CreatedAt: peopleNow, ExpiresAt: peopleNow.Add(10 * time.Minute)}
 	if err := db.CreateOAuthRequest(context.Background(), r, 100, 100); err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestOAuthClientRegistrationLimits(t *testing.T) {
 	if _, err := db.sql.ExecContext(ctx, `UPDATE oauth_clients SET last_used_at = 1 WHERE id = 'c2'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.DeleteUnusedOAuthClients(ctx, peopleNow); err != nil {
+	if err := db.DeleteUnusedOAuthClients(ctx, peopleNow, time.UnixMilli(0)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.GetOAuthClient(ctx, "c1"); !errors.Is(err, ErrNotFound) {
@@ -57,6 +57,27 @@ func TestOAuthClientRegistrationLimits(t *testing.T) {
 	}
 	if _, err := db.GetOAuthClient(ctx, "c2"); err != nil {
 		t.Fatalf("used client removed: %v", err)
+	}
+	// A used client goes once it has been idle past the retention, unless a
+	// kept request still refers to it.
+	if err := add("c5", "d"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.ExecContext(ctx, `UPDATE oauth_clients SET last_used_at = 1 WHERE id = 'c5'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateOAuthRequest(ctx, OAuthRequest{ID: "r1", ConnectHash: "ch", ClientID: "c5", RedirectURI: "https://a.example/cb",
+		CodeChallenge: "c", CreatedAt: peopleNow, ExpiresAt: peopleNow.Add(time.Minute)}, 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteUnusedOAuthClients(ctx, peopleNow, time.UnixMilli(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetOAuthClient(ctx, "c2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("idle used client kept: %v", err)
+	}
+	if _, err := db.GetOAuthClient(ctx, "c5"); err != nil {
+		t.Fatalf("client with a kept request removed: %v", err)
 	}
 }
 
@@ -71,7 +92,7 @@ func TestOAuthCodeIsExchangedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newOAuthRequest(t, db, "r1")
-	if got, err := db.GetOAuthRequestByConnectHash(ctx, "ch-r1"); err != nil || got.ID != "r1" || got.Status != model.SignInPending {
+	if got, err := db.GetOAuthRequestByConnectHash(ctx, "ch-r1"); err != nil || got.ID != "r1" || got.Status != model.SignInPending || got.Issuer != "https://csg.example" {
 		t.Fatalf("by connect hash: %+v %v", got, err)
 	}
 	// Not consumable before approval; not approvable by an inactive person

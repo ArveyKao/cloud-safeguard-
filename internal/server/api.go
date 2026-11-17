@@ -253,15 +253,28 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 // logPath is the request path as written to the access log, the audit log
 // and panic messages. A sign-in user code (of an agent or of csg) or an MCP
 // connection key is an approval secret while pending, and a credential link
-// is a secret until used, so they are masked.
+// is a secret until used, so they are masked: everything after the prefix,
+// except a final approve or deny.
 func logPath(path string) string {
 	for _, prefix := range []string{"/api/v1/me/signins/", "/api/v1/me/cli-signins/", "/api/v1/me/mcp-connections/", credentialLinkPrefix} {
-		if rest, ok := strings.CutPrefix(path, prefix); ok && rest != "" {
-			if _, tail, found := strings.Cut(rest, "/"); found {
-				return prefix + "***/" + tail
-			}
-			return prefix + "***"
+		i := strings.Index(path, prefix)
+		if i < 0 {
+			i = strings.Index(strings.ToLower(path), strings.ToLower(prefix))
 		}
+		if i < 0 {
+			continue
+		}
+		rest := path[i+len(prefix):]
+		if rest == "" {
+			return path
+		}
+		masked := path[:i+len(prefix)] + "***"
+		for _, action := range []string{"/approve", "/deny"} {
+			if strings.HasSuffix(rest, action) {
+				return masked + action
+			}
+		}
+		return masked
 	}
 	return path
 }

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/arveykao/cloud-safeguard/internal/authn"
@@ -23,7 +24,9 @@ func cleanDisplayName(raw string) (string, bool) {
 		return "", false
 	}
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f {
+		// Control and format characters (bidi overrides, zero-width
+		// characters) could make a name render as something else.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return "", false
 		}
 	}

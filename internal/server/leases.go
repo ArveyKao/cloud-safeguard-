@@ -1199,7 +1199,7 @@ func (s *Server) sweepOnce(ctx context.Context) {
 	if err := s.db.DeleteOldOAuthRequests(ctx, now.Add(-signInRetention)); err != nil {
 		s.logf("sweeper: delete old MCP sign-ins: %v", err)
 	}
-	if err := s.db.DeleteUnusedOAuthClients(ctx, now.Add(-oauthClientWindow)); err != nil {
+	if err := s.db.DeleteUnusedOAuthClients(ctx, now.Add(-oauthClientWindow), now.Add(-oauthClientRetention)); err != nil {
 		s.logf("sweeper: delete unused OAuth clients: %v", err)
 	}
 	if err := s.db.DeleteOldCredentialLinks(ctx, now); err != nil {

@@ -397,13 +397,65 @@ func TestRemoteMCPRegistrationAndAuthorizeChecks(t *testing.T) {
 			t.Fatalf("%s: redirect %s", key, rec.Header().Get("Location"))
 		}
 	}
-	// Deny sends access_denied back.
+	// A too-long state goes back as invalid_request, without the state.
+	q = good()
+	q.Set("state", strings.Repeat("s", maxOAuthStateLength+1))
+	rec := authz(q)
+	requireStatus(t, rec, http.StatusFound)
+	if loc, _ := url.Parse(rec.Header().Get("Location")); loc.Host != "client.example.net" || loc.Query().Get("error") != "invalid_request" || loc.Query().Has("state") {
+		t.Fatalf("long state: redirect %s", rec.Header().Get("Location"))
+	}
+	// Registration needs a JSON body, so a cross-site simple POST is refused.
+	requireStatus(t, env.raw(http.MethodPost, "/oauth/register", map[string]string{"Content-Type": "text/plain"},
+		`{"client_name":"x","redirect_uris":["https://a.example/cb"]}`), http.StatusUnsupportedMediaType)
+	// Malformed hosts and ports, and names that render as something else.
+	for _, bad := range []string{"https://:443/cb", "https://./cb", "https://../cb", "https://a.example:99999/cb", "https://a.example:/cb",
+		"https://a.example:0443/cb", "http://127.0.0.1:0/cb"} {
+		if validRedirectURI(bad) {
+			t.Fatalf("%s accepted", bad)
+		}
+	}
+	requireStatus(t, reg(`{"client_name":"Claude\u202eedoC","redirect_uris":["https://a.example/cb"]}`), http.StatusBadRequest)
+	requireStatus(t, reg(`{"client_name":"Clau\u200bde","redirect_uris":["https://a.example/cb"]}`), http.StatusBadRequest)
+	// The requested loopback URI may change the port, but only to a real one.
+	loopID := env.registerClient("Loop", "http://127.0.0.1:1/cb")
+	q = good()
+	q.Set("client_id", loopID)
+	q.Set("redirect_uri", "http://127.0.0.1:"+strings.Repeat("9", 3000)+"/cb")
+	requireStatus(t, authz(q), http.StatusBadRequest)
+	q.Set("redirect_uri", "http://127.0.0.1:65000/cb")
+	requireStatus(t, authz(q), http.StatusFound)
+	// A private-use redirect shows the whole URI, not just the scheme.
+	if got := redirectHost("cursor://anysphere.cursor-mcp/oauth/callback?x=1"); got != "cursor://anysphere.cursor-mcp/oauth/callback" {
+		t.Fatalf("redirect host %q", got)
+	}
+
+	// Deny sends access_denied back, with the issuer the client started at
+	// even when the console is opened at another host name.
 	sup := env.supervisorClient()
 	id := env.authorize(clientID, "https://client.example.net/cb", "s")
-	rec := sup.do(http.MethodPost, "/api/v1/me/mcp-connections/"+id+"/deny", nil)
+	rec = sup.do(http.MethodPost, "http://localhost/api/v1/me/mcp-connections/"+id+"/deny", nil)
 	requireStatus(t, rec, http.StatusOK)
-	if !strings.Contains(decodeEnvelope[map[string]string](t, rec)["redirect_url"], "error=access_denied") {
+	if loc, _ := url.Parse(decodeEnvelope[map[string]string](t, rec)["redirect_url"]); loc.Query().Get("error") != "access_denied" ||
+		loc.Query().Get("iss") != "http://example.com" {
 		t.Fatalf("deny %s", rec.Body)
+	}
+}
+
+func TestLogPathMasksSecrets(t *testing.T) {
+	for in, want := range map[string]string{
+		"/api/v1/credential-links/TOKEN":          "/api/v1/credential-links/***",
+		"/api/v1/credential-links//TOKEN":         "/api/v1/credential-links/***",
+		"//api/v1/credential-links/TOKEN":         "//api/v1/credential-links/***",
+		"/api/v1/me/mcp-connections//KEY/approve": "/api/v1/me/mcp-connections/***/approve",
+		"/api/v1/me/mcp-connections/KEY/deny":     "/api/v1/me/mcp-connections/***/deny",
+		"/api/v1/me/signins/CODE/x/y":             "/api/v1/me/signins/***",
+		"/api/v1/me/cli-signins/":                 "/api/v1/me/cli-signins/",
+		"/api/v1/leases":                          "/api/v1/leases",
+	} {
+		if got := logPath(in); got != want {
+			t.Errorf("logPath(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -422,8 +474,10 @@ func TestRemoteMCPEndpointGuards(t *testing.T) {
 	delete(h, "Origin")
 	requireStatus(t, env.raw(http.MethodGet, "/mcp", h, ""), http.StatusMethodNotAllowed)
 	requireStatus(t, env.raw(http.MethodDelete, "/mcp", h, ""), http.StatusMethodNotAllowed)
-	h["MCP-Protocol-Version"] = "1999-01-01"
-	requireStatus(t, env.raw(http.MethodPost, "/mcp", h, ping), http.StatusBadRequest)
+	for _, v := range []string{"1999-01-01", "2024-11-05"} {
+		h["MCP-Protocol-Version"] = v
+		requireStatus(t, env.raw(http.MethodPost, "/mcp", h, ping), http.StatusBadRequest)
+	}
 	delete(h, "MCP-Protocol-Version")
 	big := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"` + strings.Repeat("a", mcp.MaxMessage) + `"}}`
 	requireStatus(t, env.raw(http.MethodPost, "/mcp", h, big), http.StatusRequestEntityTooLarge)

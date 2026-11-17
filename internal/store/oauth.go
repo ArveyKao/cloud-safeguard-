@@ -78,9 +78,16 @@ func (db *DB) GetOAuthClient(ctx context.Context, id string) (OAuthClient, error
 }
 
 // DeleteUnusedOAuthClients removes registrations made before cutoff that
-// never led to a connection.
-func (db *DB) DeleteUnusedOAuthClients(ctx context.Context, cutoff time.Time) error {
-	_, err := db.sql.ExecContext(ctx, `DELETE FROM oauth_clients WHERE last_used_at IS NULL AND created_at <= ?`, toMillis(cutoff))
+// never led to a connection, and registrations last used before usedCutoff
+// that no kept request refers to. A client whose registration is gone
+// registers again on its next sign-in; connected agents are not affected.
+func (db *DB) DeleteUnusedOAuthClients(ctx context.Context, cutoff, usedCutoff time.Time) error {
+	_, err := db.sql.ExecContext(ctx,
+		`DELETE FROM oauth_clients
+		 WHERE (last_used_at IS NULL AND created_at <= ?)
+		    OR (last_used_at IS NOT NULL AND last_used_at <= ?
+		        AND NOT EXISTS (SELECT 1 FROM oauth_requests WHERE client_id = oauth_clients.id))`,
+		toMillis(cutoff), toMillis(usedCutoff))
 	return mapErr(err)
 }
 
@@ -102,7 +109,10 @@ type OAuthRequest struct {
 	CodeHash      string
 	AgentID       string
 	RemoteAddr    string
-	CreatedAt     time.Time
+	// Issuer is the authorization server's origin as the client saw it at
+	// /oauth/authorize; the redirect after the decision carries it as iss.
+	Issuer    string
+	CreatedAt time.Time
 	// ExpiresAt is when the request expires while pending, and when the
 	// authorization code expires once approved.
 	ExpiresAt time.Time
@@ -110,7 +120,7 @@ type OAuthRequest struct {
 }
 
 const oauthRequestColumns = `id, connect_hash, client_id, redirect_uri, code_challenge, state, status, person_id, agent_name,
-	code_hash, agent_id, remote_addr, created_at, expires_at, decided_at`
+	code_hash, agent_id, remote_addr, issuer, created_at, expires_at, decided_at`
 
 func scanOAuthRequest(row rowScanner) (OAuthRequest, error) {
 	var (
@@ -119,7 +129,7 @@ func scanOAuthRequest(row rowScanner) (OAuthRequest, error) {
 		decided          *int64
 	)
 	if err := row.Scan(&r.ID, &r.ConnectHash, &r.ClientID, &r.RedirectURI, &r.CodeChallenge, &r.State, &r.Status, &r.PersonID,
-		&r.AgentName, &r.CodeHash, &r.AgentID, &r.RemoteAddr, &created, &expires, &decided); err != nil {
+		&r.AgentName, &r.CodeHash, &r.AgentID, &r.RemoteAddr, &r.Issuer, &created, &expires, &decided); err != nil {
 		return OAuthRequest{}, mapErr(err)
 	}
 	r.CreatedAt, r.ExpiresAt, r.DecidedAt = fromMillis(created), fromMillis(expires), timePtr(decided)
@@ -130,11 +140,11 @@ func scanOAuthRequest(row rowScanner) (OAuthRequest, error) {
 // waiting (maxTotal overall, maxPerAddr from one address).
 func (db *DB) CreateOAuthRequest(ctx context.Context, r OAuthRequest, maxTotal, maxPerAddr int) error {
 	res, err := db.sql.ExecContext(ctx,
-		`INSERT INTO oauth_requests(id, connect_hash, client_id, redirect_uri, code_challenge, state, status, remote_addr, created_at, expires_at)
-		 SELECT ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?
+		`INSERT INTO oauth_requests(id, connect_hash, client_id, redirect_uri, code_challenge, state, status, remote_addr, issuer, created_at, expires_at)
+		 SELECT ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?
 		 WHERE (SELECT COUNT(*) FROM oauth_requests WHERE status = 'pending' AND expires_at > ?) < ?
 		   AND (SELECT COUNT(*) FROM oauth_requests WHERE status = 'pending' AND expires_at > ? AND remote_addr = ?) < ?`,
-		r.ID, r.ConnectHash, r.ClientID, r.RedirectURI, r.CodeChallenge, r.State, r.RemoteAddr, toMillis(r.CreatedAt), toMillis(r.ExpiresAt),
+		r.ID, r.ConnectHash, r.ClientID, r.RedirectURI, r.CodeChallenge, r.State, r.RemoteAddr, r.Issuer, toMillis(r.CreatedAt), toMillis(r.ExpiresAt),
 		toMillis(r.CreatedAt), maxTotal, toMillis(r.CreatedAt), r.RemoteAddr, maxPerAddr)
 	if err != nil {
 		return mapErr(err)

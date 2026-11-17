@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,7 +29,10 @@ const (
 	oauthCodeTTL    = 60 * time.Second
 	// Unused registrations within oauthClientWindow are bounded; older ones
 	// are deleted.
-	oauthClientWindow        = 24 * time.Hour
+	oauthClientWindow = 24 * time.Hour
+	// A registration that led to a connection is kept until it has not
+	// been used for oauthClientRetention.
+	oauthClientRetention     = 90 * 24 * time.Hour
 	maxUnusedOAuthClients    = 500
 	maxUnusedOAuthClientAddr = 20
 	maxOpenOAuthRequests     = 100
@@ -117,12 +121,23 @@ func validRedirectURI(raw string) bool {
 	}
 	switch scheme := strings.ToLower(u.Scheme); {
 	case scheme == "https":
-		return u.Host != "" && u.Opaque == ""
+		host := u.Hostname()
+		return u.Opaque == "" && host != "" && strings.Trim(host, ".") != "" && validURIPort(u.Port(), u.Host)
 	case scheme == "http":
-		return u.Opaque == "" && isLoopbackHost(u.Hostname())
+		return u.Opaque == "" && isLoopbackHost(u.Hostname()) && validURIPort(u.Port(), u.Host)
 	default:
 		return u.Scheme == scheme && privateSchemeRE.MatchString(scheme) && !forbiddenRedirectSchemes[scheme]
 	}
+}
+
+// validURIPort accepts no port, or a port from 1 to 65535 written without
+// leading zeros. host is the URI's host:port, to refuse an empty port ("h:").
+func validURIPort(port, host string) bool {
+	if port == "" {
+		return !strings.HasSuffix(host, ":")
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
 }
 
 func isLoopbackHost(host string) bool {
@@ -158,6 +173,13 @@ func (s *Server) handleOAuthRegister(w http.ResponseWriter, r *http.Request) {
 		GrantTypes              []string `json:"grant_types"`
 		ResponseTypes           []string `json:"response_types"`
 		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	}
+	// Requiring JSON makes a browser send a preflight, which is never
+	// granted, so another website cannot register clients from a visitor's
+	// address.
+	if !isJSONRequest(r) {
+		s.oauthError(w, http.StatusUnsupportedMediaType, "invalid_client_metadata", "Content-Type must be application/json")
+		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, oauthFormLimit+1))
 	if err != nil || len(body) > oauthFormLimit || json.Unmarshal(body, &in) != nil {
@@ -237,7 +259,7 @@ func (s *Server) oauthPageError(w http.ResponseWriter, status int, message strin
 
 // oauthRedirect builds the redirect back to the client with params, state
 // and the issuer (RFC 9207).
-func (s *Server) oauthRedirect(r *http.Request, redirectURI, state string, params map[string]string) string {
+func oauthRedirect(issuer, redirectURI, state string, params map[string]string) string {
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		return ""
@@ -249,7 +271,7 @@ func (s *Server) oauthRedirect(r *http.Request, redirectURI, state string, param
 	if state != "" {
 		q.Set("state", state)
 	}
-	q.Set("iss", s.expectedOrigin(r))
+	q.Set("iss", issuer)
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -275,9 +297,12 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	if redirectURI == "" && len(client.RedirectURIs) == 1 {
 		redirectURI = client.RedirectURIs[0]
 	}
+	// The requested URI must itself be valid: a loopback port may differ
+	// from the registered one, but stays a real port, and the length stays
+	// bounded.
 	matched := false
 	for _, registered := range client.RedirectURIs {
-		if redirectURIMatches(registered, redirectURI) {
+		if validRedirectURI(redirectURI) && redirectURIMatches(registered, redirectURI) {
 			matched = true
 			break
 		}
@@ -287,11 +312,13 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// From here on, errors go back to the client.
+	issuer := s.expectedOrigin(r)
 	fail := func(code, description string) {
-		http.Redirect(w, r, s.oauthRedirect(r, redirectURI, state, map[string]string{"error": code, "error_description": description}), http.StatusFound)
+		http.Redirect(w, r, oauthRedirect(issuer, redirectURI, state, map[string]string{"error": code, "error_description": description}), http.StatusFound)
 	}
 	if len(state) > maxOAuthStateLength {
-		s.oauthPageError(w, http.StatusBadRequest, "state is too long")
+		state = "" // not echoed back
+		fail("invalid_request", "state is too long")
 		return
 	}
 	if q.Get("response_type") != "code" {
@@ -321,7 +348,7 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	now := s.nowUTC()
 	req := store.OAuthRequest{
 		ID: id, ConnectHash: connectHash, ClientID: client.ID, RedirectURI: redirectURI, CodeChallenge: q.Get("code_challenge"), State: state,
-		RemoteAddr: s.clientAddr(r), CreatedAt: now, ExpiresAt: now.Add(oauthRequestTTL),
+		RemoteAddr: s.clientAddr(r), Issuer: issuer, CreatedAt: now, ExpiresAt: now.Add(oauthRequestTTL),
 	}
 	if err := s.db.CreateOAuthRequest(r.Context(), req, maxOpenOAuthRequests, maxOpenOAuthRequestsAddr); err != nil {
 		if errors.Is(err, store.ErrOAuthLimit) {
@@ -338,8 +365,19 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?mcp-connect="+connectKey, http.StatusFound)
 }
 
+// requestIssuer is the issuer the client saw when it started the request,
+// so the redirect after the decision carries the same iss whatever host
+// name the console was opened at.
+func (s *Server) requestIssuer(r *http.Request, req store.OAuthRequest) string {
+	if req.Issuer != "" {
+		return req.Issuer
+	}
+	return s.expectedOrigin(r)
+}
+
 // redirectHost is what the person is shown about where the sign-in goes:
-// the host of an http(s) URI, or the scheme of a private-use one.
+// the host of an http(s) URI, or a private-use URI without its query, since
+// its scheme alone says little.
 func redirectHost(uri string) string {
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -348,7 +386,8 @@ func redirectHost(uri string) string {
 	if u.Scheme == "http" || u.Scheme == "https" {
 		return u.Host
 	}
-	return u.Scheme + ":"
+	u.RawQuery, u.ForceQuery, u.Fragment = "", false, ""
+	return u.String()
 }
 
 // mcpConnection is what the console shows about a pending request.
@@ -473,7 +512,7 @@ func (s *Server) handleApproveMCPConnection(w http.ResponseWriter, r *http.Reque
 		"redirect_host": redirectHost(req.RedirectURI), "started_from": req.RemoteAddr,
 	})
 	s.writeData(w, http.StatusOK, map[string]string{
-		"redirect_url": s.oauthRedirect(r, req.RedirectURI, req.State, map[string]string{"code": code}),
+		"redirect_url": oauthRedirect(s.requestIssuer(r, req), req.RedirectURI, req.State, map[string]string{"code": code}),
 	})
 }
 
@@ -498,7 +537,7 @@ func (s *Server) handleDenyMCPConnection(w http.ResponseWriter, r *http.Request)
 		"client_id": client.ID, "client_name": client.ClientName, "redirect_host": redirectHost(req.RedirectURI),
 	})
 	s.writeData(w, http.StatusOK, map[string]string{
-		"redirect_url": s.oauthRedirect(r, req.RedirectURI, req.State, map[string]string{
+		"redirect_url": oauthRedirect(s.requestIssuer(r, req), req.RedirectURI, req.State, map[string]string{
 			"error": "access_denied", "error_description": "the person denied the connection",
 		}),
 	})
