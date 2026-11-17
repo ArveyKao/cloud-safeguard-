@@ -163,6 +163,13 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, "invalid request body: "+err.Error())
 		return
 	}
+	// Only disabling or renaming lowers nothing else; any other change of a
+	// cloud account (its role, its region, enabling it) may raise access.
+	if in.RoleARN != nil || in.Region != nil || (in.Status != nil && *in.Status != model.ProviderDisabled) {
+		if !s.stepUp(w, r) {
+			return
+		}
+	}
 	// One edit of cloud accounts at a time (single process per data dir):
 	// the account is read, checked and written under this lock, so two edits
 	// cannot each write a row based on what the other has since changed.
@@ -304,6 +311,10 @@ func (s *Server) handleRotateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(in.AccessKeyID) == "" || in.AccessKeySecret == "" {
 		s.badRequest(w, "access_key_id and access_key_secret are required")
+		return
+	}
+	// A new AccessKey decides what every credential of the account can do.
+	if !s.stepUp(w, r) {
 		return
 	}
 	prov, err := s.db.GetProvider(r.Context(), r.PathValue("id"))
@@ -478,6 +489,18 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	before, err := s.db.GetPolicySettings(r.Context())
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	// Lowering every limit lowers access; anything else may raise it.
+	if !(in.MaxLeaseTTLSeconds <= before.MaxLeaseTTLSeconds && in.PendingTimeoutSeconds <= before.PendingTimeoutSeconds &&
+		in.MaxConcurrentLeasesPerAgent <= before.MaxConcurrentLeasesPerAgent && in.LeasesPerMinutePerAgent <= before.LeasesPerMinutePerAgent) {
+		if !s.stepUp(w, r) {
+			return
+		}
+	}
+	before, err = s.db.GetPolicySettings(r.Context())
 	if err != nil {
 		s.writeHandlerError(w, err)
 		return

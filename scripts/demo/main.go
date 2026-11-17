@@ -1,11 +1,11 @@
-// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S9)
+// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S10)
 // against a running control plane in mock mode. scripts/demo.sh builds csg,
 // bootstraps a throwaway data directory, starts the server and runs this.
 //
 // People act through the same HTTP API the console uses (setup, sign-in with
 // an authenticator code, approvals); the agent acts through the real csg
 // binary. No secret is printed: setup codes, passwords, tokens and
-// credentials stay in memory, and S9 checks that none of them reached the
+// credentials stay in memory, and S10 checks that none of them reached the
 // server log or this program's own output.
 package main
 
@@ -53,6 +53,8 @@ type demo struct {
 	printed bytes.Buffer
 
 	sup, mei *person
+	// supSecret is the supervisor's TOTP secret, for codes on the command line.
+	supSecret string
 	// tokens of the credentials issued along the way.
 	writeLease, writeToken string
 }
@@ -83,7 +85,8 @@ func main() {
 		{"S6 write waits for the owner; only the owner approves", d.s6},
 		{"S7 lowering the role revokes the credential at once", d.s7},
 		{"S8 a supervisor can stop anything; the admin token is gone", d.s8},
-		{"S9 audit chain verifies and no secret leaked", d.s9},
+		{"S9 a supervisor on the command line: raising access needs a code, approving stays in the console", d.s9person},
+		{"S10 audit chain verifies and no secret leaked", d.s9},
 	}
 	failed := 0
 	for _, s := range scenarios {
@@ -100,7 +103,7 @@ func main() {
 	}
 }
 
-// say prints and remembers what was printed, for the leak check in S9.
+// say prints and remembers what was printed, for the leak check in S10.
 func (d *demo) say(format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
 	d.printed.WriteString(text)
@@ -172,6 +175,9 @@ func (d *demo) setUp(name, setupCode string) (*person, error) {
 		return nil, err
 	}
 	d.secrets[name+"'s authenticator secret"] = begin.TOTPSecret
+	if name == "the supervisor" {
+		d.supSecret = begin.TOTPSecret
+	}
 	code, err := authn.TOTPCode(begin.TOTPSecret, authn.TOTPStep(time.Now()))
 	if err != nil {
 		return nil, err
@@ -608,6 +614,114 @@ func (d *demo) s9() error {
 				return fmt.Errorf("%s appears in %s", name, where)
 			}
 		}
+	}
+	return nil
+}
+
+func (d *demo) s9person() error {
+	// csg person login: the supervisor approves the code in the console.
+	cmd := exec.Command(d.csg, "person", "login", "--server", d.server, "--name", "demo-laptop")
+	cmd.Env = []string{"HOME=" + d.home, "PATH=" + os.Getenv("PATH")}
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	var shown bytes.Buffer
+	approved := false
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := scanner.Text()
+		shown.WriteString(line + "\n")
+		if code, ok := strings.CutPrefix(strings.TrimSpace(line), "code: "); ok && !approved {
+			var pending model.CLISignIn
+			if err := d.must(d.sup, http.MethodGet, "/api/v1/me/cli-signins/"+code, nil, &pending, http.StatusOK); err != nil {
+				_ = cmd.Process.Kill()
+				return err
+			}
+			if pending.ClientName != "demo-laptop" {
+				_ = cmd.Process.Kill()
+				return fmt.Errorf("the console shows client %q for this code", pending.ClientName)
+			}
+			if err := d.must(d.sup, http.MethodPost, "/api/v1/me/cli-signins/"+code+"/approve", nil, nil, http.StatusOK); err != nil {
+				_ = cmd.Process.Kill()
+				return err
+			}
+			approved = true
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("csg person login: %v: %s", err, firstLine(shown.String()))
+	}
+	raw, err := os.ReadFile(filepath.Join(d.home, ".config", "cloud-safeguard", "person.json"))
+	if err != nil {
+		return err
+	}
+	var saved struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &saved); err != nil || !strings.HasPrefix(saved.Token, "csg_ses_") {
+		return errors.New("csg person login saved no session")
+	}
+	d.secrets["the supervisor's command-line session"] = saved.Token
+	if strings.Contains(stdout.String()+shown.String(), saved.Token) {
+		return errors.New("csg person login printed the session token")
+	}
+
+	// Reading works.
+	out, errOut, code := d.agent(nil, "supervisor", "people")
+	if code != 0 || !strings.Contains(out, "mei") {
+		return fmt.Errorf("csg supervisor people exit %d: %s", code, firstLine(errOut))
+	}
+	// Raising access without a code is refused, nothing changes.
+	if _, errOut, code := d.agent(nil, "supervisor", "roles", "set", demoAccount, "mei", "member"); code != 3 || !strings.Contains(errOut, "--code") {
+		return fmt.Errorf("a role was raised without a code (exit %d): %s", code, firstLine(errOut))
+	}
+	// With a fresh code it works.
+	next, err := authn.TOTPCode(d.supSecret, authn.TOTPStep(time.Now())+1)
+	if err != nil {
+		return err
+	}
+	if _, errOut, code := d.agent(nil, "supervisor", "roles", "set", demoAccount, "mei", "member", "--code", next); code != 0 {
+		return fmt.Errorf("raising a role with a code: exit %d: %s", code, firstLine(errOut))
+	}
+	// Lowering needs none.
+	if _, errOut, code := d.agent(nil, "supervisor", "roles", "set", demoAccount, "mei", "guest"); code != 0 {
+		return fmt.Errorf("lowering a role: exit %d: %s", code, firstLine(errOut))
+	}
+	// Approving an agent's request is never possible from the command line,
+	// even for the request's owner with a code (the session is the
+	// supervisor's here; the server refuses it as console-only).
+	write, _, err := d.request("write", "--reason", "demo: try to approve from the command line")
+	if err != nil {
+		return err
+	}
+	{
+		req, _ := http.NewRequest(http.MethodPost, d.server+"/api/v1/me/requests/"+write.ID+"/approve", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer "+saved.Token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			return fmt.Errorf("approving from a command-line session answered %d, want 403", resp.StatusCode)
+		}
+	}
+	if _, errOut, code := d.agent(nil, "supervisor", "accounts", "add"); code != 2 || !strings.Contains(errOut, "console") {
+		return errors.New("csg offers to add a cloud account")
+	}
+	// Sign out.
+	if _, errOut, code := d.agent(nil, "person", "logout"); code != 0 {
+		return fmt.Errorf("csg person logout: %s", firstLine(errOut))
+	}
+	if _, _, code := d.agent(nil, "person", "whoami"); code != 3 {
+		return errors.New("the session still works after logout")
 	}
 	return nil
 }

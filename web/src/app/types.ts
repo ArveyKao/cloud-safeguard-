@@ -109,6 +109,25 @@ export interface AccessRequest {
   expires_at?: string
 }
 
+export interface CLISignIn {
+  user_code: string
+  client_name: string
+  status: string
+  remote_addr: string
+  created_at: string
+  expires_at: string
+}
+
+export interface CLISession {
+  id: string
+  client_name: string
+  remote_addr: string
+  created_at: string
+  last_seen_at: string
+  expires_at: string
+  current: boolean
+}
+
 export interface AgentSignIn {
   user_code: string
   agent_name: string

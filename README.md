@@ -119,7 +119,7 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | `csg` CLI for agents and an MCP server (`csg mcp`) for Claude, Cursor and others | ✅ |
 | Mock cloud and a scripted demo (no cloud account needed) | ✅ |
 | Real Alibaba Cloud `sts` mode | ✅ implemented, unit-tested against a fake STS endpoint; not yet run against a live account |
-| `csg` sign-in for people (supervisor commands) | 🔜 next |
+| `csg` sign-in for people, with supervisor commands (raising access needs an authenticator code) | ✅ |
 | Remote MCP over HTTPS, so an agent connects with just a URL | 🔜 next |
 | More clouds (AWS, GCP), SSO, chat approvals, credential-free proxy mode | 🔜 later |
 
@@ -161,8 +161,22 @@ In a second terminal, sign an agent in and ask for access:
   --name i-2ze0demo001 --ttl 10m --reason "restart after a config change" --wait 5m
 ```
 
-Or run the whole scripted demo (nine scenarios: setup, agent sign-in, automatic read, least
-privilege, denial, approval, revocation, emergency stop, audit) in one command:
+People can work from the command line too. `csg person login` signs you in by approving a
+code in the console; then you can read everything and lower access from the terminal.
+Anything that raises access asks for a code from your authenticator app, and approving
+requests and sign-ins stays in the console, so an agent that reads the saved session can
+never approve itself:
+
+```bash
+./build/csg person login --server http://127.0.0.1:8787
+./build/csg me requests                     # your agents' requests
+./build/csg supervisor people               # supervisors: people, roles, accounts, settings, audit
+./build/csg supervisor roles set 1234567890123456 mei member --code 123456
+```
+
+Or run the whole scripted demo (ten scenarios: setup, agent sign-in, automatic read, least
+privilege, denial, approval, revocation, emergency stop, a supervisor on the command line,
+audit) in one command:
 
 ```bash
 make demo
@@ -180,10 +194,16 @@ The step-by-step path, the MCP setup and the real-cloud setup are in
 | Agent | `csg accounts` · `csg access request --account ID --resource R --permission P --ttl 15m [--name N] [--reason ...] [--wait 5m]` · `csg access status ID` |
 | Agent | `csg exec --account ID --resource R --permission P --ttl 15m -- CMD` · `csg credential --lease ID [--export\|--json]` · `csg revoke --lease ID` · `csg leases mine` |
 | MCP | `csg mcp` (stdio; tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `revoke`) |
+| Person sign-in | `csg person login --server URL [--name NAME]` · `csg person whoami` · `csg person logout` |
+| Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode read\|write\|full [--for DUR]` · `csg me sessions` |
+| Supervisor | `csg supervisor people [add\|suspend\|activate\|reset\|make-supervisor\|remove-supervisor] …` · `csg supervisor roles [set\|remove] …` · `csg supervisor accounts [show\|test\|enable\|disable\|rename\|set-region\|set-role-arn\|auto-level\|rotate] …` · `csg supervisor settings [set …]` · `csg supervisor audit [verify]` · `csg supervisor requests [deny\|revoke] …` |
 | Demo | `csg mock request METHOD /v1/PATH [JSON_BODY]` |
 
-Cloud accounts, people, roles and limits are managed in the console. Configuration is
-resolved as flags > `CSG_SERVER` / `CSG_TOKEN` > `~/.config/cloud-safeguard/config.json` (0600). Exit codes: `0` ok, `1` operation
+Changes that raise access take `--code` (a code from your authenticator app), or ask for it
+in a terminal. Adding a cloud account and approving are console-only. The agent's
+configuration is resolved as flags > `CSG_SERVER` / `CSG_TOKEN` >
+`~/.config/cloud-safeguard/config.json` (0600); a person's session is in
+`~/.config/cloud-safeguard/person.json` (0600) and only person commands read it. Exit codes: `0` ok, `1` operation
 failed (denied/failed/HTTP error), `2` usage/validation, `3` auth, `4` wait timeout.
 Durations accept `90s`, `10m`, `1h` or a plain number of seconds.
 
@@ -236,7 +256,7 @@ cloud-safeguard/
 │   ├── token/          # bearer token generation and hashing
 │   └── cli/            # csg commands and the MCP server
 ├── web/                # React + Vite console, embedded into the binary
-├── scripts/demo.sh     # end-to-end demo (S1–S9), driven by scripts/demo/
+├── scripts/demo.sh     # end-to-end demo (S1–S10), driven by scripts/demo/
 ├── docs/               # SPEC, CONTRACT, PRODUCT, SECURITY, ARCHITECTURE, QUICKSTART, API, DECISIONS
 └── Makefile            # build / test / demo entry points
 ```
@@ -251,8 +271,8 @@ Current boundaries:
 - **Single-tenant.** People sign in with a password and an authenticator app; there is no
   SSO yet.
 - **Alibaba Cloud only**, with ECS, DNS and OSS as the resource types.
-- **Supervisor work is console-only for now.** A person sign-in for `csg` and a remote MCP
-  endpoint are the next two pieces.
+- **No remote MCP yet.** Agents use `csg mcp` over stdio; a remote endpoint over HTTPS is
+  the next piece.
 - **STS credentials still reach the agent.** The stronger design is a credential-free
   proxy where `csg` injects the cloud credential and agents never see one — that is a
   later direction. This bounds blast radius (TTL + inline policy + session name +
@@ -271,7 +291,7 @@ Current boundaries:
 - **No independent security audit, and no live-cloud run yet.** `sts` mode is implemented
   and unit-tested against a fake STS endpoint only.
 
-Roadmap: next, the `csg` sign-in for people and remote MCP over HTTPS; then a live Alibaba
+Roadmap: next, remote MCP over HTTPS; then a live Alibaba
 Cloud test, AWS and GCP, SSO, chat approvals and a credential-free proxy mode.
 
 ## Documentation

@@ -27,7 +27,14 @@ type PersonAuth struct {
 	LockedUntil    *time.Time
 }
 
-// Session is a console session. Only the hash of the cookie value is stored.
+// Session kinds (CONTRACT §17.9).
+const (
+	SessionConsole = "console" // a browser, with a cookie and a CSRF token
+	SessionCLI     = "cli"     // csg on the command line, with a bearer token
+)
+
+// Session is a person's session. Only the hash of the cookie value or bearer
+// token is stored.
 type Session struct {
 	TokenHash  string
 	PersonID   string
@@ -35,6 +42,32 @@ type Session struct {
 	CreatedAt  time.Time
 	LastSeenAt time.Time
 	ExpiresAt  time.Time
+	// Kind is SessionConsole or SessionCLI ("" counts as console).
+	Kind string
+	// ID names a command-line session to its person; empty for the console.
+	ID string
+	// ClientName and RemoteAddr describe where a command-line session was
+	// signed in.
+	ClientName string
+	RemoteAddr string
+}
+
+// IsCLI reports whether s is a command-line session.
+func (s Session) IsCLI() bool { return s.Kind == SessionCLI }
+
+const sessionColumns = `token_hash, person_id, csrf_token, created_at, last_seen_at, expires_at, kind, id, client_name, remote_addr`
+
+func scanSession(row rowScanner) (Session, error) {
+	var (
+		s                         Session
+		created, lastSeen, expiry int64
+	)
+	if err := row.Scan(&s.TokenHash, &s.PersonID, &s.CSRFToken, &created, &lastSeen, &expiry,
+		&s.Kind, &s.ID, &s.ClientName, &s.RemoteAddr); err != nil {
+		return Session{}, mapErr(err)
+	}
+	s.CreatedAt, s.LastSeenAt, s.ExpiresAt = fromMillis(created), fromMillis(lastSeen), fromMillis(expiry)
+	return s, nil
 }
 
 const personColumns = `id, username, display_name, status, supervisor, last_login_at, created_at, updated_at,
@@ -344,12 +377,66 @@ func affectedOrConflict(res sql.Result) error {
 // The check is part of the INSERT, so a session can never be created after a
 // suspend or reset has committed. It returns ErrConflict otherwise.
 func (db *DB) CreateSession(ctx context.Context, s Session) error {
-	res, err := db.sql.ExecContext(ctx,
-		`INSERT INTO sessions(token_hash, person_id, csrf_token, created_at, last_seen_at, expires_at)
-		 SELECT ?, ?, ?, ?, ?, ?
+	return insertSession(ctx, db.sql, s)
+}
+
+func insertSession(ctx context.Context, x execer, s Session) error {
+	if s.Kind == "" {
+		s.Kind = SessionConsole
+	}
+	res, err := x.ExecContext(ctx,
+		`INSERT INTO sessions(token_hash, person_id, csrf_token, created_at, last_seen_at, expires_at, kind, id, client_name, remote_addr)
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		 WHERE EXISTS (SELECT 1 FROM persons WHERE id = ? AND status = 'active')`,
 		s.TokenHash, s.PersonID, s.CSRFToken, toMillis(s.CreatedAt), toMillis(s.LastSeenAt), toMillis(s.ExpiresAt),
-		s.PersonID)
+		s.Kind, s.ID, s.ClientName, s.RemoteAddr, s.PersonID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrConflict(res)
+}
+
+// ListCLISessions returns a person's live command-line sessions, newest
+// first. Callers drop the stale ones.
+func (db *DB) ListCLISessions(ctx context.Context, personID string) ([]Session, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+sessionColumns+` FROM sessions WHERE person_id = ? AND kind = ? ORDER BY created_at DESC`, personID, SessionCLI)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := []Session{}
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, mapErr(rows.Err())
+}
+
+// DeleteCLISession ends one of a person's command-line sessions by its ID;
+// ErrNotFound when the person has no such session.
+func (db *DB) DeleteCLISession(ctx context.Context, personID, id string) error {
+	if id == "" {
+		return ErrNotFound
+	}
+	res, err := db.sql.ExecContext(ctx, `DELETE FROM sessions WHERE person_id = ? AND kind = ? AND id = ?`, personID, SessionCLI, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrNotFound(res)
+}
+
+// ConsumeTOTPStep accepts an authenticator code for an action (not a login):
+// it records the code's time step so the same code cannot be used again,
+// and clears the failure count. ErrConflict when the person is not active or
+// the step was already used.
+func (db *DB) ConsumeTOTPStep(ctx context.Context, id string, totpStep int64) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE persons SET totp_last_step = ?, failed_logins = 0, locked_until = NULL
+		 WHERE id = ? AND status = 'active' AND totp_last_step < ?`, totpStep, id, totpStep)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -366,18 +453,7 @@ func (db *DB) AnyTOTPSecret(ctx context.Context) (personID, encrypted string, er
 
 // GetSession returns a session by cookie hash.
 func (db *DB) GetSession(ctx context.Context, tokenHash string) (Session, error) {
-	var (
-		s                         Session
-		created, lastSeen, expiry int64
-	)
-	err := db.sql.QueryRowContext(ctx,
-		`SELECT token_hash, person_id, csrf_token, created_at, last_seen_at, expires_at FROM sessions WHERE token_hash = ?`, tokenHash).
-		Scan(&s.TokenHash, &s.PersonID, &s.CSRFToken, &created, &lastSeen, &expiry)
-	if err != nil {
-		return Session{}, mapErr(err)
-	}
-	s.CreatedAt, s.LastSeenAt, s.ExpiresAt = fromMillis(created), fromMillis(lastSeen), fromMillis(expiry)
-	return s, nil
+	return scanSession(db.sql.QueryRowContext(ctx, `SELECT `+sessionColumns+` FROM sessions WHERE token_hash = ?`, tokenHash))
 }
 
 // TouchSession records activity on a session.

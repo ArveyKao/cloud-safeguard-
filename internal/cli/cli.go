@@ -142,6 +142,10 @@ func (a *App) Run(args []string) int {
 		err = a.runServe(rest)
 	case "supervisor":
 		err = a.runSupervisor(rest)
+	case "person":
+		err = a.runPerson(rest)
+	case "me":
+		err = a.runMe(rest)
 	case "login":
 		err = a.runLogin(rest)
 	case "whoami":
@@ -223,8 +227,14 @@ Agent:
   leases     mine | get ID: this agent's requests
   mcp        Run the MCP server for Claude, Cursor and other agents
 
-People sign in to the console to approve requests and to manage cloud
-accounts, people and settings.
+People (signed in with csg person login):
+  person     login | logout | whoami
+  me         requests | deny | revoke | agents | revoke-agent | accounts | mode | sessions | end-session
+  supervisor people | roles | accounts | settings | audit | requests   (supervisors)
+
+From the command line a person can read everything and lower access. Raising
+access asks for a code from the authenticator app. Approving requests and
+sign-ins, and adding a cloud account, are done in the console only.
 
 Demo:
   mock request METHOD /v1/PATH [JSON_BODY]

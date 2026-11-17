@@ -28,7 +28,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 8
+const CurrentSchemaVersion = 9
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -246,6 +246,63 @@ var migrations = []migration{
 	{ // version 7 -> 8: no admin token, no agents without an owner (CONTRACT §17.7a)
 		transform: removeAdminTokenAndOldAgentModel,
 	},
+	{ // version 8 -> 9: people on the command line (CONTRACT §17.9)
+		// The session columns are added by the transform, only when missing.
+		transform: addSessionKindColumns,
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS cli_signins (
+				id               TEXT PRIMARY KEY,
+				device_code_hash TEXT NOT NULL UNIQUE,
+				user_code        TEXT NOT NULL UNIQUE,
+				client_name      TEXT NOT NULL,
+				status           TEXT NOT NULL,
+				person_id        TEXT NOT NULL DEFAULT '',
+				session_id       TEXT NOT NULL DEFAULT '',
+				remote_addr      TEXT NOT NULL DEFAULT '',
+				created_at       INTEGER NOT NULL,
+				expires_at       INTEGER NOT NULL,
+				decided_at       INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_cli_signins_status ON cli_signins(status, expires_at)`,
+		},
+	},
+}
+
+// addSessionKindColumns adds the session columns of schema 9 that are not
+// there yet, and their index.
+func addSessionKindColumns(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info('sessions')`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range []struct{ name, ddl string }{
+		{"kind", `ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'console'`},
+		{"id", `ALTER TABLE sessions ADD COLUMN id TEXT NOT NULL DEFAULT ''`},
+		{"client_name", `ALTER TABLE sessions ADD COLUMN client_name TEXT NOT NULL DEFAULT ''`},
+		{"remote_addr", `ALTER TABLE sessions ADD COLUMN remote_addr TEXT NOT NULL DEFAULT ''`},
+	} {
+		if have[col.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_sessions_person_kind ON sessions(person_id, kind)`)
+	return err
 }
 
 // removeAdminTokenAndOldAgentModel deletes the admin token, revokes every

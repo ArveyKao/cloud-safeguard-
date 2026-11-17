@@ -222,6 +222,9 @@ type apiClient struct {
 	baseURL string
 	token   string
 	http    HTTPDoer
+	// authCode, when set, is sent as a fresh authenticator code with the
+	// request (CONTRACT §17.9).
+	authCode string
 }
 
 // newAPIClient builds a client from a resolved config.
@@ -269,6 +272,9 @@ func (c *apiClient) do(ctx context.Context, method, path string, body, out any) 
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if c.authCode != "" {
+		req.Header.Set(authenticatorCodeHeader, c.authCode)
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -323,6 +329,11 @@ func (c *apiClient) get(ctx context.Context, path string, out any) error {
 // post performs a POST request.
 func (c *apiClient) post(ctx context.Context, path string, body, out any) error {
 	return c.do(ctx, http.MethodPost, path, body, out)
+}
+
+// patch performs a PATCH request.
+func (c *apiClient) patch(ctx context.Context, path string, body, out any) error {
+	return c.do(ctx, http.MethodPatch, path, body, out)
 }
 
 // put performs a PUT request.

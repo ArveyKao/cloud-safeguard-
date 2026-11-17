@@ -203,17 +203,22 @@ func (s *Server) requireSameOrigin(next http.Handler) http.Handler {
 	})
 }
 
-// requireSession authenticates the console session cookie. State-changing
-// requests must also be same-origin and carry the session's CSRF token.
+// requireSession authenticates a person: the console's session cookie, or a
+// command-line session's bearer token (CONTRACT §17.9). State-changing
+// requests with the cookie must also be same-origin and carry the session's
+// CSRF token; a bearer token is not sent by a browser on its own, so it needs
+// neither.
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sc, ok := s.loadSession(r)
 		if !ok {
-			s.clearSessionCookie(w, r)
+			if _, bearer := r.Header["Authorization"]; !bearer {
+				s.clearSessionCookie(w, r)
+			}
 			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "sign in required")
 			return
 		}
-		if !isSafeMethod(r.Method) {
+		if !isSafeMethod(r.Method) && !sc.session.IsCLI() {
 			if !s.sameOrigin(r) || !authn.Equal(r.Header.Get(csrfHeader), sc.session.CSRFToken) {
 				s.personAudit(r.Context(), sc.person, "auth.csrf_rejected", "denied", "warning", "person", sc.person.ID,
 					map[string]any{"remote_addr": s.clientAddr(r)})
@@ -237,17 +242,32 @@ func (s *Server) requireSupervisor(next http.Handler) http.Handler {
 	})
 }
 
-// loadSession resolves the session cookie to a live session of an active
-// person. Stale sessions are deleted.
+// loadSession resolves the request to a live session of an active person.
+// With an Authorization header only a command-line session token counts,
+// and the cookie is ignored; without one only the console cookie counts.
+// Stale sessions are deleted.
 func (s *Server) loadSession(r *http.Request) (sessionContext, bool) {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil || cookie.Value == "" || len(cookie.Value) > 128 {
-		return sessionContext{}, false
+	var plain, wantKind string
+	if _, present := r.Header["Authorization"]; present {
+		bearer, ok := bearerToken(r)
+		if !ok || !strings.HasPrefix(bearer, cliTokenPrefix) || len(bearer) > 128 {
+			return sessionContext{}, false
+		}
+		plain, wantKind = bearer, store.SessionCLI
+	} else {
+		cookie, err := r.Cookie(sessionCookieName)
+		if err != nil || cookie.Value == "" || len(cookie.Value) > 128 {
+			return sessionContext{}, false
+		}
+		plain, wantKind = cookie.Value, store.SessionConsole
 	}
 	ctx := r.Context()
-	hash := authn.HashSecret(cookie.Value)
+	hash := authn.HashSecret(plain)
 	sess, err := s.db.GetSession(ctx, hash)
 	if err != nil {
+		return sessionContext{}, false
+	}
+	if kind := sess.Kind; kind != wantKind && !(kind == "" && wantKind == store.SessionConsole) {
 		return sessionContext{}, false
 	}
 	now := s.nowUTC()
@@ -325,7 +345,11 @@ func (s *Server) sessionInfo(ctx context.Context, person model.Person, sess stor
 	if err != nil {
 		return model.SessionInfo{}, err
 	}
-	return model.SessionInfo{Person: person.AsOf(s.nowUTC()), Bindings: bindings, CSRFToken: sess.CSRFToken, ExpiresAt: sess.ExpiresAt}, nil
+	kind := store.SessionConsole
+	if sess.IsCLI() {
+		kind = store.SessionCLI
+	}
+	return model.SessionInfo{Person: person.AsOf(s.nowUTC()), Bindings: bindings, CSRFToken: sess.CSRFToken, ExpiresAt: sess.ExpiresAt, Kind: kind}, nil
 }
 
 // ================= handlers =================

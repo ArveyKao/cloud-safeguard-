@@ -9,6 +9,7 @@ import { PeoplePage } from './pages/People'
 import { SettingsPage } from './pages/Settings'
 import { SignInApprovalPage } from './pages/SignInApproval'
 import { rememberSignIn, takeSignIn } from './App'
+import { CLISignInApprovalPage } from './pages/CLISignInApproval'
 import type { Person } from './types'
 
 // A fake API: routes map "METHOD /path" to a payload or a function.
@@ -152,10 +153,29 @@ describe('agent sign-in', () => {
     await waitFor(() => expect(changes().map((c) => c.path)).toEqual(['/me/signins/ABC-DEFG/approve']))
   })
 
+  it('approves a command-line sign-in only after the code is confirmed', async () => {
+    routes['GET /me/cli-signins/CLI-CODE'] = { user_code: 'CLI-CODE', client_name: 'laptop', status: 'pending',
+      remote_addr: '10.0.0.7', created_at: '', expires_at: new Date(Date.now() + 600_000).toISOString() }
+    routes['POST /me/cli-signins/CLI-CODE/approve'] = { status: 'approved' }
+    const me = { id: 'per_1', username: 'mei', display_name: '', status: 'active', supervisor: true } as unknown as Person
+    wrap(<CLISignInApprovalPage code="CLI-CODE" person={me} />)
+    const approve = await screen.findByRole('button', { name: 'Approve sign-in' })
+    await screen.findByText(/Approving requests and sign-ins is never possible from it/)
+    expect((approve as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(approve)
+    expect(changes().length).toBe(0)
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.click(approve)
+    await waitFor(() => expect(changes().map((c) => c.path)).toEqual(['/me/cli-signins/CLI-CODE/approve']))
+    await screen.findByText('csg is signed in as you')
+  })
+
   it('remembers a sign-in link once, and only for ten minutes', () => {
     rememberSignIn('ABC-DEFG')
-    expect(takeSignIn()).toBe('ABC-DEFG')
+    expect(takeSignIn()).toEqual({ code: 'ABC-DEFG', kind: 'agent' })
     expect(takeSignIn()).toBeNull()
+    rememberSignIn('CLI-CODE', 'cli')
+    expect(takeSignIn()).toEqual({ code: 'CLI-CODE', kind: 'cli' })
     const now = Date.now()
     rememberSignIn('OLD-CODE')
     vi.spyOn(Date, 'now').mockReturnValue(now + 11 * 60 * 1000)

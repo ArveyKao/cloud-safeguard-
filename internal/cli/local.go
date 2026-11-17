@@ -147,8 +147,11 @@ func (a *App) printSetupCode(label string, p model.PersonWithSetupCode) {
 
 // runSupervisor implements `csg supervisor recover`.
 func (a *App) runSupervisor(args []string) error {
-	if len(args) == 0 || args[0] != "recover" {
-		return usagef("usage: csg supervisor recover --username NAME [--data-dir DIR] [--json]")
+	if len(args) == 0 {
+		return usagef("usage: csg supervisor people|roles|accounts|settings|audit|requests ... (signed in with csg person login), or csg supervisor recover --username NAME (on the server host)")
+	}
+	if args[0] != "recover" {
+		return a.runSupervisorCommands(args)
 	}
 	fs := a.newFlagSet("supervisor recover", `Usage: csg supervisor recover --username NAME [--data-dir DIR] [--trust-master-key] [--json]
 

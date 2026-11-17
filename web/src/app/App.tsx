@@ -10,6 +10,7 @@ import { LoginPage } from './pages/Login'
 import { SetupPage } from './pages/Setup'
 import { InboxPage } from './pages/Inbox'
 import { SignInApprovalPage } from './pages/SignInApproval'
+import { CLISignInApprovalPage } from './pages/CLISignInApproval'
 import { AgentsPage } from './pages/Agents'
 import { AccountsPage } from './pages/Accounts'
 import { AddAccountPage } from './pages/AddAccount'
@@ -17,24 +18,32 @@ import { ActivityPage } from './pages/Activity'
 import { PeoplePage } from './pages/People'
 import { SettingsPage } from './pages/Settings'
 
-// A sign-in link (/?signin=CODE) survives the login screen, for as long as
-// the code lives at most, and is used once.
+// A sign-in link survives the login screen, for as long as the code lives at
+// most, and is used once: /?signin=CODE for an agent, /?cli-signin=CODE for
+// csg signed in as the person.
 const SIGNIN_KEY = 'csg.pendingSignIn'
 const SIGNIN_TTL_MS = 10 * 60 * 1000
 
-export function rememberSignIn(code: string) {
-  try { sessionStorage.setItem(SIGNIN_KEY, JSON.stringify({ code, at: Date.now() })) } catch { /* storage may be off */ }
+export type SignInKind = 'agent' | 'cli'
+
+export function rememberSignIn(code: string, kind: SignInKind = 'agent') {
+  try { sessionStorage.setItem(SIGNIN_KEY, JSON.stringify({ code, kind, at: Date.now() })) } catch { /* storage may be off */ }
 }
 
-export function takeSignIn(): string | null {
+export function takeSignIn(): { code: string; kind: SignInKind } | null {
   try {
     const raw = sessionStorage.getItem(SIGNIN_KEY)
     sessionStorage.removeItem(SIGNIN_KEY)
-    const v = raw ? JSON.parse(raw) as { code?: string; at?: number } : null
-    return v?.code && v.at && Date.now() - v.at < SIGNIN_TTL_MS ? v.code : null
+    const v = raw ? JSON.parse(raw) as { code?: string; kind?: string; at?: number } : null
+    if (!v?.code || !v.at || Date.now() - v.at >= SIGNIN_TTL_MS) return null
+    return { code: v.code, kind: v.kind === 'cli' ? 'cli' : 'agent' }
   } catch {
     return null
   }
+}
+
+function signInPath(link: { code: string; kind: SignInKind }): string {
+  return `${link.kind === 'cli' ? '/cli-signin' : '/signin'}?code=${encodeURIComponent(link.code)}`
 }
 
 export function App() {
@@ -45,20 +54,22 @@ export function App() {
   const signedIn = useCallback((s: SessionInfo) => {
     setCsrf(s.csrf_token)
     setSession(s)
-    const code = takeSignIn()
-    navigate(code ? `/signin?code=${encodeURIComponent(code)}` : (path === '/login' || path === '/setup' || path === '/' ? '/inbox' : path))
+    const link = takeSignIn()
+    navigate(link ? signInPath(link) : (path === '/login' || path === '/setup' || path === '/' ? '/inbox' : path))
   }, [path])
 
   useEffect(() => {
-    const linkCode = query.get('signin')
-    if (linkCode) rememberSignIn(linkCode)
+    const agentCode = query.get('signin')
+    const cliCode = query.get('cli-signin')
+    if (cliCode) rememberSignIn(cliCode, 'cli')
+    else if (agentCode) rememberSignIn(agentCode, 'agent')
     setSignedOutHandler(() => { setCsrf(''); setSession(null) })
     api.me()
       .then((s) => {
         setCsrf(s.csrf_token)
         setSession(s)
-        const code = takeSignIn()
-        if (code) navigate(`/signin?code=${encodeURIComponent(code)}`)
+        const link = takeSignIn()
+        if (link) navigate(signInPath(link))
       })
       .catch(() => setSession(null))
       .finally(() => setChecked(true))
@@ -103,6 +114,7 @@ function SignedIn({ session, path, query, setSession }: {
 
   let page
   if (path === '/signin') page = <SignInApprovalPage code={query.get('code') ?? ''} />
+  else if (path === '/cli-signin') page = <CLISignInApprovalPage code={query.get('code') ?? ''} person={person} />
   else if (path === '/agents') page = <AgentsPage />
   else if (path === '/accounts/new' && person.supervisor) page = <AddAccountPage />
   else if (path.startsWith('/accounts')) page = <AccountsPage person={person} />

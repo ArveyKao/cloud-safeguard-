@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { ApprovalMode, Person, PolicySettings } from '../types'
-import { Button, Card, ErrorNote, PageHead, useAction, useConfirm, useLoad, useToast, when } from '../ui'
+import { Button, Card, ErrorNote, PageHead, ago, useAction, useConfirm, useLoad, useToast, when } from '../ui'
 
 const MODES: { value: ApprovalMode; title: string; text: string }[] = [
   { value: 'read', title: 'Read mode', text: 'Reading is automatic. Every change asks you.' },
@@ -94,8 +94,42 @@ export function SettingsPage({ person, onPersonChange }: { person: Person; onPer
         )}
       </Card>
 
+      <CLISessions />
+
       {person.supervisor && <Limits />}
     </>
+  )
+}
+
+/** The person's command-line sign-ins, each of which can be ended here. */
+function CLISessions() {
+  const sessions = useLoad(() => api.cliSessions(), [])
+  const action = useAction()
+  const toast = useToast()
+  const items = sessions.data?.items ?? []
+  return (
+    <Card title="Command-line sign-ins">
+      <p className="muted">Each <code>csg person login</code> you approved. End one you do not recognise, or no longer use.</p>
+      <ErrorNote error={action.error ?? sessions.error} />
+      {items.length === 0 ? <p className="muted">None.</p> : (
+        <table className="table compact">
+          <thead><tr><th>Client</th><th>From</th><th>Signed in</th><th>Last used</th><th /></tr></thead>
+          <tbody>
+            {items.map((s) => (
+              <tr key={s.id}>
+                <td>{s.client_name}</td>
+                <td className="mono">{s.remote_addr}</td>
+                <td>{ago(s.created_at)}</td>
+                <td>{ago(s.last_seen_at)}</td>
+                <td className="right"><Button kind="link" busy={action.busy} onClick={() => action.run(async () => {
+                  await api.revokeCLISession(s.id); toast('Sign-in ended'); sessions.reload()
+                })}>End</Button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Card>
   )
 }
 

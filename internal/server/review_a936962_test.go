@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -983,7 +984,7 @@ func TestUpgradeRecordSurvivesARefusedCommand(t *testing.T) {
 	if events, _, _ := db.ListAudit(ctx, store.AuditFilter{Action: "schema.migrated", Limit: 10}); len(events) != 0 {
 		t.Fatalf("a command refused for a wrong key wrote %d audit events", len(events))
 	}
-	if version, _ := db.GetMeta(ctx, store.MetaSchemaVersion); version != "8" {
+	if version, _ := db.GetMeta(ctx, store.MetaSchemaVersion); version != strconv.Itoa(store.CurrentSchemaVersion) {
 		t.Fatalf("schema version = %s", version)
 	}
 	db.Close()

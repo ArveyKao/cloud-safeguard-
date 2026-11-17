@@ -1086,8 +1086,54 @@ Agent CLI, same flow from a terminal:
 - Still in force from §1–§16: the file layout and configuration (§1), envelopes and error
   codes (§2), the lease states (§5), providers and the mock cloud (§8), the audit hash chain
   (§10) and the IAM prohibition (§16.3).
-- Next: a person sign-in for `csg` (supervisor commands except adding cloud accounts), then a
-  remote MCP endpoint over HTTPS with OAuth sign-in so an agent connects with a URL.
+- Next: a remote MCP endpoint over HTTPS with OAuth sign-in so an agent connects with a URL.
+
+### 17.9 People on the command line (decided 2026-11-17)
+
+The owner's decisions: a person signs in to `csg` by approving a short code in the console,
+and a command-line session is **guarded**, because agents often run on the same machine
+and could read it.
+
+**Sign-in.** `csg person login --server URL [--name NAME]` works like the agent sign-in:
+- `POST /api/v1/person-signin/start` `{client_name}` → `{device_code, user_code,
+  verification_url, expires_at, interval_seconds}`. The code is valid for 10 minutes.
+- The person opens the link (`/?cli-signin=CODE`) in the console, where they are signed in
+  with password and authenticator, checks the code and approves:
+  `GET /api/v1/me/cli-signins/{code}`, `POST /api/v1/me/cli-signins/{code}/approve|deny`.
+  Only a console session can approve; a command-line session cannot approve another one.
+- `POST /api/v1/person-signin/token` `{device_code}` → on approval, once:
+  `{status, token, person, expires_at}`. The token (`csg_ses_…`) is stored only as a hash,
+  in `~/.config/cloud-safeguard/person.json` (0600) on the client.
+- It is a session of the approving person, with the console's limits: 30 minutes idle,
+  12 hours at most. It ends at `csg person logout`, when the person is suspended or reset,
+  or when the person revokes it in the console (`GET /api/v1/me/cli-sessions`,
+  `POST /api/v1/me/cli-sessions/{id}/revoke`). It is sent as `Authorization: Bearer` on
+  `/api/v1/auth/me|logout`, `/api/v1/me/` and `/api/v1/supervisor/`; it needs no CSRF token.
+  It never works on `/api/v1/agent/`, and an agent token never works as a session.
+
+**What a command-line session may do.**
+- Everything that reads.
+- Everything that lowers access, as is: deny or revoke a request or credential, revoke
+  one's own agent, lower or remove a role, suspend a person, remove the supervisor flag,
+  disable a cloud account, lower an approval mode to read, lower an account's highest
+  automatic level to read, test a connection, sign out.
+- Anything that raises access needs a fresh authenticator code of the signed-in person on
+  that request (`X-CSG-Authenticator-Code`): add a person, reset a person (it issues a setup
+  code), activate a person, make a supervisor, give a role other than guest, change a cloud
+  account other than disabling or renaming it, replace its AccessKey, raise its highest
+  automatic level, change the limits unless every value is lowered, set an approval mode
+  other than read. A wrong code counts towards the sign-in lockout (5 failures lock the
+  person for 15 minutes); a code is accepted once. The CLI asks for the code when it runs
+  in a terminal, or takes `--code`.
+- Console only, with or without a code: approving an access request, approving an agent
+  sign-in or a command-line sign-in, adding a cloud account. A command-line session gets
+  403 for these, so an agent that reads the session file can never approve itself.
+- Console sessions are unchanged.
+
+**Commands.** `csg person login|logout|whoami`; `csg me requests|deny|revoke|agents|
+revoke-agent|accounts|mode`; `csg supervisor people|roles|accounts|settings|audit|requests`
+with subcommands for every supervisor route except adding a cloud account.
+`csg supervisor recover` stays a local command on the server host.
 
 ### 17.8 Implementation status
 
@@ -1102,7 +1148,8 @@ Agent CLI, same flow from a terminal:
 | Supervisor API for cloud accounts, settings, audit and the emergency stop | implemented |
 | Supervisors are Administrator on every cloud account (§17.1) | implemented |
 | Removal of the admin token and the §16 agent model (§17.7a) | implemented, schema version 8 |
-| Person sign-in for `csg`; remote MCP over HTTPS | not started |
+| Person sign-in for `csg` with guarded sessions (§17.9) | implemented, schema version 9 |
+| Remote MCP over HTTPS | not started |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
 | Console redesign (sign-in, Inbox, Agents, Cloud accounts, Activity, People, Settings) | implemented; the admin-token console is removed |

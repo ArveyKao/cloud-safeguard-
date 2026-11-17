@@ -125,6 +125,46 @@ type SessionInfo struct {
 	Bindings  []RoleBinding `json:"bindings"`
 	CSRFToken string        `json:"csrf_token"`
 	ExpiresAt time.Time     `json:"expires_at"`
+	// Kind is "console" or "cli" (CONTRACT §17.9).
+	Kind string `json:"kind"`
+}
+
+// ---- people on the command line (CONTRACT §17.9) ----
+
+// PersonSignInStartInput begins a command-line sign-in of a person.
+type PersonSignInStartInput struct {
+	ClientName string `json:"client_name,omitempty"`
+}
+
+// PersonSignInResult is the client's poll answer. Token, Person and
+// ExpiresAt are set exactly once, when Status is approved.
+type PersonSignInResult struct {
+	Status    SignInStatus `json:"status"`
+	Token     string       `json:"token,omitempty"`
+	Person    *Person      `json:"person,omitempty"`
+	ExpiresAt *time.Time   `json:"expires_at,omitempty"`
+}
+
+// CLISignIn is a pending command-line sign-in as its approver sees it.
+type CLISignIn struct {
+	UserCode   string       `json:"user_code"`
+	ClientName string       `json:"client_name"`
+	Status     SignInStatus `json:"status"`
+	RemoteAddr string       `json:"remote_addr"`
+	CreatedAt  time.Time    `json:"created_at"`
+	ExpiresAt  time.Time    `json:"expires_at"`
+}
+
+// CLISession is one of a person's command-line sessions.
+type CLISession struct {
+	ID         string    `json:"id"`
+	ClientName string    `json:"client_name"`
+	RemoteAddr string    `json:"remote_addr"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	// Current is true for the session the request came with.
+	Current bool `json:"current"`
 }
 
 // ---- agent-first sign-in (CONTRACT §17.3 item 2) ----

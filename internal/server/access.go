@@ -546,6 +546,11 @@ func (s *Server) handleSetMyApprovalMode(w http.ResponseWriter, r *http.Request)
 		s.badRequest(w, "expires_in_seconds must be between 0 and 30 days")
 		return
 	}
+	// A mode above read lets agents get more without asking: it is a
+	// standing approval, so it needs the code.
+	if in.Mode != model.ModeRead && !s.stepUp(w, r) {
+		return
+	}
 	now := s.nowUTC()
 	var expiresAt *time.Time
 	if in.ExpiresInSeconds > 0 && in.Mode != model.ModeRead {
@@ -590,6 +595,9 @@ func (s *Server) handleSetAccountAutoLevel(w http.ResponseWriter, r *http.Reques
 	}
 	if !in.MaxAutoLevel.Valid() {
 		s.badRequest(w, "max_auto_level must be read, write or full")
+		return
+	}
+	if in.MaxAutoLevel != model.ModeRead && !s.stepUp(w, r) {
 		return
 	}
 	prov, err := s.db.GetProvider(ctx, r.PathValue("provider"))

@@ -189,24 +189,56 @@ configuration:
 you under `~/.config/cloud-safeguard/credentials/` and returns its path, to be sourced by the
 command that needs it.
 
-## 1.13 The scripted demo
+## 1.13 Work as yourself on the command line
+
+```bash
+./build/csg person login --server http://127.0.0.1:8787
+```
+
+It prints a link and a code like the agent sign-in. Open the link in the console, check the
+code and approve. The session is yours (not an agent's), lasts up to 12 hours (30 minutes
+without use) and is saved in `~/.config/cloud-safeguard/person.json`, apart from any agent's.
+
+```bash
+./build/csg person whoami
+./build/csg me requests --status pending
+./build/csg me deny lea_... --reason "not now"
+./build/csg supervisor people                       # supervisors only
+./build/csg supervisor roles set demo-aliyun mei member
+#  → "this change raises access: run it again with --code …"
+./build/csg supervisor roles set demo-aliyun mei member --code 123456
+```
+
+Agents often run on the same machine and could read that file, so the session is guarded:
+
+- reading, and anything that lowers access (deny, revoke, lower or remove a role, suspend,
+  disable an account, set your mode to read), works as is;
+- anything that raises access (add or reset a person, make a supervisor, give a role above
+  guest, enable or reconfigure an account, replace its AccessKey, raise a level or a limit,
+  set your mode above read) needs a fresh code from your authenticator app. In a terminal
+  csg asks for it; otherwise pass `--code`. Wrong codes count towards the sign-in lockout;
+- approving requests and sign-ins, and adding a cloud account, work in the console only.
+
+End it with `csg person logout`, or from the console in **Settings → Command-line sign-ins**.
+
+## 1.14 The scripted demo
 
 ```bash
 make demo
 ```
 
-It starts its own instance on port 18787 and runs nine scenarios end to end (setup, agent
+It starts its own instance on port 18787 and runs ten scenarios end to end (setup, agent
 sign-in, automatic read, least privilege, denial, approval, revocation on a role change,
-the supervisor's emergency stop, audit and a secret-leak check), then prints
-`all S1-S9 scenarios passed`.
+the supervisor's emergency stop, a supervisor on the command line, audit and a secret-leak
+check), then prints `all S1-S10 scenarios passed`.
 
-## 1.14 Clean up
+## 1.15 Clean up
 
 Stop the server with Ctrl-C, then:
 
 ```bash
 rm -rf .demo
-rm -f ~/.config/cloud-safeguard/config.json
+rm -f ~/.config/cloud-safeguard/config.json ~/.config/cloud-safeguard/person.json
 ```
 
 ---
@@ -399,7 +431,9 @@ make demo
 | The Alibaba Cloud CLI uses an old key | Set `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` and remove the old profile. |
 | The server refuses to start after `CSG_MASTER_KEY` changed | The key does not match the data directory. Restore the original key. |
 | `cannot verify the master key … --trust-master-key` | An old directory with no `master.key` and nothing stored yet: nothing can tell the right key from a mistyped one. Check `CSG_MASTER_KEY`, then run the command once with `--trust-master-key`. |
-| Commands such as `csg providers` or `csg request` are unknown | They were removed with the admin token. Cloud accounts, people and limits are managed in the console; agents use `csg access`. |
+| Commands such as `csg providers` or `csg request` are unknown | They were removed with the admin token. People use `csg person login`, then `csg me …` and `csg supervisor …`; agents use `csg access`. |
+| `this change raises access: run it again with --code` | A command-line session needs a fresh authenticator code for that change. Add `--code 123456`, or run it in a terminal to be asked. |
+| `this can only be done in the console` | Approving requests and sign-ins, and adding a cloud account, are console-only on purpose. |
 
 ---
 

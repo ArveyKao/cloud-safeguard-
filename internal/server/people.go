@@ -83,6 +83,10 @@ func (s *Server) handleCreatePerson(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, "display_name must be at most 100 characters without control characters")
 		return
 	}
+	// A new person gets a setup code: whoever holds it holds the account.
+	if !s.stepUp(w, r) {
+		return
+	}
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
 	created, err := newPersonWithSetupCode(ctx, s.db, username, displayName, in.Supervisor, s.nowUTC(),
@@ -110,6 +114,12 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 	if err := s.decodeJSON(w, r, &in); err != nil {
 		s.badRequest(w, err.Error())
 		return
+	}
+	// Making a supervisor or activating a person raises access.
+	if (in.Supervisor != nil && *in.Supervisor) || (in.Status != nil && *in.Status == model.PersonActive) {
+		if !s.stepUp(w, r) {
+			return
+		}
 	}
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
@@ -202,6 +212,10 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 // was; this is also how a suspended person who never finished setup is
 // brought back.
 func (s *Server) handleResetPerson(w http.ResponseWriter, r *http.Request) {
+	// A reset issues a new setup code: whoever holds it holds the account.
+	if !s.stepUp(w, r) {
+		return
+	}
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
 	id := r.PathValue("id")
@@ -264,6 +278,10 @@ func (s *Server) handlePutBinding(w http.ResponseWriter, r *http.Request) {
 	}
 	if !in.Role.Valid() {
 		s.badRequest(w, "role must be guest, member or administrator")
+		return
+	}
+	// Any role above guest may raise access, whatever the role was before.
+	if in.Role != model.RoleGuest && !s.stepUp(w, r) {
 		return
 	}
 	ctx := r.Context()

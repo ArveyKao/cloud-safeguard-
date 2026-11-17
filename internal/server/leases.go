@@ -1190,6 +1190,9 @@ func (s *Server) sweepOnce(ctx context.Context) {
 	if err := s.db.DeleteStaleSessions(ctx, now, sessionIdleTimeout); err != nil {
 		s.logf("sweeper: delete stale sessions: %v", err)
 	}
+	if err := s.db.DeleteOldCLISignIns(ctx, now.Add(-signInRetention)); err != nil {
+		s.logf("sweeper: delete old command-line sign-ins: %v", err)
+	}
 	if err := s.db.DeleteOldSignIns(ctx, now.Add(-signInRetention)); err != nil {
 		s.logf("sweeper: delete old sign-ins: %v", err)
 	}

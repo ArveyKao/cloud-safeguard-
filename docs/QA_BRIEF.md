@@ -26,7 +26,7 @@ every problem as a GitHub issue.
 
 ```bash
 go build -o build/csg ./cmd/csg
-./scripts/demo.sh            # must end with "all S1-S9 scenarios passed"
+./scripts/demo.sh            # must end with "all S1-S10 scenarios passed"
 go test ./...                # must pass
 ./build/csg init --demo --data-dir ./build/qa-data
 ./build/csg serve --data-dir ./build/qa-data
@@ -59,6 +59,18 @@ is listed in CONTRACT §17.8; `docs/QUICKSTART.md` walks through the whole flow.
   `agents`, `caps`, `policy`, `audit`, `request`) are unknown.
 - `csg mcp`: the five tools work, and `get_credential` never returns the secret.
 - The audit log records every step, and the Activity page shows the chain as verified.
+
+### A2. People on the command line (CONTRACT §17.9)
+
+- `csg person login` signs in by approving a code in the console; the session is saved in
+  `person.json` (0600), apart from the agent's config, and never printed.
+- Reading and lowering access work from the command line without a code.
+- Every change that raises access (see §17.9) is refused without `--code`, and works with a
+  fresh authenticator code; a code works once; five wrong codes lock the person for 15 minutes.
+- Approving a request, an agent sign-in or another command-line sign-in, and adding a cloud
+  account, are refused from the command line even with a code.
+- The session ends on logout, suspend, reset, 30 minutes idle, 12 hours, and when revoked in
+  Settings → Command-line sign-ins.
 
 ### B. People, supervisors and sign-in (CONTRACT §17.1–§17.3)
 
@@ -96,7 +108,6 @@ tells you which test resources exist.
 - SECURITY, API, ARCHITECTURE, SPEC, DECISIONS and PRODUCT still describe v0.1 and say so at
   the top.
 - AWS and GCP are not supported.
-- People cannot sign in with `csg` yet; supervisor work is console-only.
 - The console has no button for the supervisor's emergency stop (it is in the API).
 
 ## Reporting

@@ -610,6 +610,14 @@ const (
 	ErrCodeCredentialUnavailable = "credential_unavailable"
 	ErrCodeProviderError         = "provider_error"
 	ErrCodePolicyDenied          = "policy_denied"
+	// ErrCodeConsoleOnly: a command-line session asked for something that
+	// is done in the console only (CONTRACT §17.9).
+	ErrCodeConsoleOnly = "console_only"
+	// ErrCodeAuthenticatorCodeRequired: a command-line session asked for a
+	// change that raises access without a fresh authenticator code.
+	ErrCodeAuthenticatorCodeRequired = "authenticator_code_required"
+	// ErrCodeAuthenticatorCodeInvalid: the code sent was not accepted.
+	ErrCodeAuthenticatorCodeInvalid = "authenticator_code_invalid"
 )
 
 var aliyunRoleARN = regexp.MustCompile(`^acs:ram::([0-9]{6,32}):role/[A-Za-z0-9._/-]+$`)
