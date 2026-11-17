@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -672,10 +674,27 @@ func TestWrongMasterKeyIsRefusedWithoutProviders(t *testing.T) {
 	}
 	empty := newTestEnv(t, false)
 	deleteKeyCheck(empty)
-	for name, key := range map[string][]byte{"wrong": wrongKey, "right": nil} {
+	// A key supplied from outside cannot be verified, right or wrong, and
+	// nothing is written.
+	rightKey, err := os.ReadFile(filepath.Join(empty.dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, key := range map[string][]byte{"wrong": wrongKey, "right but supplied": rightKey} {
 		if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin", MasterKey: key}); !errors.Is(err, errVaultKeyUnverifiable) {
 			t.Fatalf("nothing to verify against, %s key: %v", name, err)
 		}
+		if _, err := empty.srv.db.GetMeta(ctx, store.MetaVaultKeyCheck); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("%s key: a key check was written: %v", name, err)
+		}
+	}
+	// The directory's own master.key is the right key by definition: the
+	// check is written with it, and a wrong key is refused from then on.
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin"}); err != nil {
+		t.Fatalf("nothing to verify against, the directory's own key: %v", err)
+	}
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty.dir, Username: "admin", MasterKey: wrongKey}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("after the key check was written, wrong key: %v", err)
 	}
 
 	// The right key still works.

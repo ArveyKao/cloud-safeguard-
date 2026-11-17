@@ -640,3 +640,32 @@ func TestAssumeRoleNeedsNestedCredentials(t *testing.T) {
 		t.Fatalf("Mint() = %+v, %v; want InvalidResponse", cred.AccessKeyID, err)
 	}
 }
+
+// A session policy longer than Alibaba Cloud accepts is refused before any
+// call is made.
+func TestAssumeRoleRefusesAnOversizedPolicy(t *testing.T) {
+	oldEndpoint := stsEndpoint
+	defer func() { stsEndpoint = oldEndpoint }()
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }))
+	defer srv.Close()
+	stsEndpoint = srv.URL + "/"
+
+	actions := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		actions = append(actions, fmt.Sprintf("ecs:DescribeSomething%03d", i))
+	}
+	policy, _ := json.Marshal(map[string]any{"Version": "1", "Statement": []any{map[string]any{"Effect": "Allow", "Action": actions, "Resource": "*"}}})
+	if len(policy) <= STSMaxPolicyLength {
+		t.Fatalf("test policy is only %d characters", len(policy))
+	}
+	minter, _ := New(model.ModeSTS)
+	req := MintRequest{LeaseID: "lea_x", Provider: model.Provider{ID: "prv", RoleARN: "acs:ram::1:role/r"},
+		BrokerAccessKeyID: "ak", BrokerAccessKeySecret: "sk", PolicyJSON: policy, DurationSeconds: 900}
+	if _, err := minter.Mint(context.Background(), req); err == nil || !strings.Contains(err.Error(), "2048") {
+		t.Fatalf("Mint() with a %d-character policy = %v", len(policy), err)
+	}
+	if called {
+		t.Fatal("an oversized policy was sent to STS")
+	}
+}

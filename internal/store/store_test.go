@@ -242,10 +242,6 @@ func TestProviderCRUD(t *testing.T) {
 	p.Name = "renamed"
 	p.Status = model.ProviderDisabled
 	p.UpdatedAt = testTime.Add(time.Minute)
-	ok := true
-	p.LastTestOK = &ok
-	tested := testTime.Add(2 * time.Minute)
-	p.LastTestedAt = &tested
 	if err := db.UpdateProvider(ctx, p); err != nil {
 		t.Fatalf("UpdateProvider: %v", err)
 	}
@@ -256,8 +252,43 @@ func TestProviderCRUD(t *testing.T) {
 	if got.Name != "renamed" || got.Status != model.ProviderDisabled {
 		t.Fatalf("provider not updated: %+v", got)
 	}
+
+	// A connection test writes its result and nothing else: here the caller
+	// still believes the provider is active and has its old name.
+	tested := testTime.Add(2 * time.Minute)
+	if err := db.SetProviderTestResult(ctx, p.ID, tested, true); err != nil {
+		t.Fatalf("SetProviderTestResult: %v", err)
+	}
+	got, _ = db.GetProvider(ctx, p.ID)
 	if got.LastTestOK == nil || !*got.LastTestOK || got.LastTestedAt == nil || !got.LastTestedAt.Equal(tested) {
 		t.Fatalf("last test fields not persisted: %+v", got)
+	}
+	if got.Name != "renamed" || got.Status != model.ProviderDisabled {
+		t.Fatalf("a test result changed other fields: %+v", got)
+	}
+	if err := db.SetProviderTestResult(ctx, "prv_missing", tested, true); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetProviderTestResult(missing) = %v", err)
+	}
+
+	// An update never writes the test result or the masked key, and is
+	// refused when the provider's cloud account ID is not the one the
+	// caller read.
+	stale := got
+	stale.LastTestOK, stale.LastTestedAt, stale.AccessKeyIDMasked = nil, nil, "LTAI****stale"
+	if err := db.UpdateProvider(ctx, stale); err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	got, _ = db.GetProvider(ctx, p.ID)
+	if got.LastTestOK == nil || got.AccessKeyIDMasked != "LTAI****oker" {
+		t.Fatalf("an update overwrote the test result or the masked key: %+v", got)
+	}
+	stale.CloudAccountID = "9999999999999999"
+	stale.RoleARN = "acs:ram::9999999999999999:role/other"
+	if err := db.UpdateProvider(ctx, stale); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdateProvider with another cloud account ID = %v, want ErrConflict", err)
+	}
+	if after, _ := db.GetProvider(ctx, p.ID); after.RoleARN != got.RoleARN {
+		t.Fatalf("a refused update changed the role ARN to %q", after.RoleARN)
 	}
 
 	if err := db.UpdateProvider(ctx, model.Provider{ID: "prv_missing"}); !errors.Is(err, ErrNotFound) {
@@ -275,12 +306,79 @@ func TestProviderCRUD(t *testing.T) {
 		t.Fatalf("CountProviderCredentials = %d, %v", n, err)
 	}
 
-	if err := db.UpdateProviderCredential(ctx, p.ID, "v1:rotated"); err != nil {
-		t.Fatalf("UpdateProviderCredential: %v", err)
+	if err := db.RotateProviderCredential(ctx, p.ID, "v1:rotated", "LTAI****new1", testTime.Add(3*time.Minute)); err != nil {
+		t.Fatalf("RotateProviderCredential: %v", err)
 	}
 	cred, _ = db.GetProviderCredential(ctx, p.ID)
-	if cred != "v1:rotated" {
-		t.Fatalf("credential after rotate = %q", cred)
+	after, _ := db.GetProvider(ctx, p.ID)
+	if cred != "v1:rotated" || after.AccessKeyIDMasked != "LTAI****new1" {
+		t.Fatalf("after rotate: credential %q, masked %q", cred, after.AccessKeyIDMasked)
+	}
+	if after.Status != model.ProviderDisabled || after.Name != "renamed" || after.RoleARN != got.RoleARN {
+		t.Fatalf("a rotation changed other fields: %+v", after)
+	}
+	if err := db.RotateProviderCredential(ctx, "prv_missing", "x", "y", testTime); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RotateProviderCredential(missing) = %v", err)
+	}
+}
+
+// Adopting a cloud account ID and removing the provider's role bindings is
+// one step: both happen, or neither.
+func TestAdoptProviderCloudAccountID(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	first := testProvider()
+	first.CloudAccountID = "1234567890123456"
+	orphan := testProvider()
+	orphan.ID, orphan.Name, orphan.RoleARN = "prv_orphan", "orphan", "not-a-role"
+	for _, p := range []model.Provider{first, orphan} {
+		if err := db.CreateProvider(ctx, p, "v1:x"); err != nil {
+			t.Fatalf("CreateProvider(%s): %v", p.ID, err)
+		}
+	}
+	bind := func(provider, person string) {
+		t.Helper()
+		if err := db.PutBinding(ctx, model.RoleBinding{PersonID: person, ProviderID: provider, Role: model.RoleAdministrator, CreatedAt: testTime, UpdatedAt: testTime}); err != nil {
+			t.Fatalf("PutBinding: %v", err)
+		}
+	}
+	bind(orphan.ID, "per_a")
+	bind(orphan.ID, "per_b")
+	bind(first.ID, "per_a")
+	count := func(provider string) int {
+		list, err := db.ListBindings(ctx, "", provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(list)
+	}
+
+	// The account of another provider: refused, and the bindings stay.
+	if _, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "acs:ram::1234567890123456:role/x", "1234567890123456", testTime); !errors.Is(err, ErrConflict) {
+		t.Fatalf("adopting a connected account = %v, want ErrConflict", err)
+	}
+	if got, _ := db.GetProvider(ctx, orphan.ID); got.CloudAccountID != "" || got.RoleARN != "not-a-role" || count(orphan.ID) != 2 {
+		t.Fatalf("a refused adoption changed something: %+v, %d bindings", got, count(orphan.ID))
+	}
+	if _, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "x", "", testTime); err == nil {
+		t.Fatal("adopting an empty account ID succeeded")
+	}
+
+	removed, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "acs:ram::7777777777777777:role/x", "7777777777777777", testTime.Add(time.Minute))
+	if err != nil || len(removed) != 2 || removed[0].PersonID != "per_a" || removed[1].PersonID != "per_b" || removed[0].Role != model.RoleAdministrator {
+		t.Fatalf("adoption = %+v, %v", removed, err)
+	}
+	got, _ := db.GetProvider(ctx, orphan.ID)
+	if got.CloudAccountID != "7777777777777777" || got.RoleARN != "acs:ram::7777777777777777:role/x" || count(orphan.ID) != 0 {
+		t.Fatalf("after adoption: %+v, %d bindings", got, count(orphan.ID))
+	}
+	if count(first.ID) != 1 {
+		t.Fatal("adoption removed another provider's bindings")
+	}
+	// It has an account now: a second adoption is refused.
+	bind(orphan.ID, "per_c")
+	if _, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "acs:ram::8888888888888888:role/x", "8888888888888888", testTime); !errors.Is(err, ErrConflict) || count(orphan.ID) != 1 {
+		t.Fatalf("second adoption = %v, %d bindings", err, count(orphan.ID))
 	}
 }
 

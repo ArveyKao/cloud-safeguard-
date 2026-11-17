@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -23,6 +24,10 @@ func (s *Server) handleAgentMe(w http.ResponseWriter, r *http.Request) {
 	}
 	active, err := s.db.CountActiveLeases(r.Context(), ag.ID)
 	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	if ag, err = s.withLiveLimits(r.Context(), ag); err != nil {
 		s.writeHandlerError(w, err)
 		return
 	}
@@ -53,4 +58,17 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.logf("heartbeat: touch agent %s: %v", ag.ID, err)
 	}
 	s.writeData(w, http.StatusOK, heartbeatResponse{OK: true, ServerTime: now})
+}
+
+// withLiveLimits replaces the limits stored on an agent, which are a record
+// of the settings when it signed in, with the supervisor's current settings:
+// those are what is enforced, so those are what is shown.
+func (s *Server) withLiveLimits(ctx context.Context, ag model.Agent) (model.Agent, error) {
+	settings, err := s.db.GetPolicySettings(ctx)
+	if err != nil {
+		return ag, err
+	}
+	ag.MaxTTLSeconds = settings.MaxLeaseTTLSeconds
+	ag.MaxConcurrentLeases = settings.MaxConcurrentLeasesPerAgent
+	return ag, nil
 }

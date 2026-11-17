@@ -467,7 +467,7 @@ func (s *Server) handleAgentRevokeLease(w http.ResponseWriter, r *http.Request) 
 	s.writeData(w, http.StatusOK, updated)
 }
 
-// ================= admin lease endpoints =================
+// ================= supervisor lease endpoints (list, get, deny, revoke) =================
 
 // handleListLeases implements GET /api/v1/supervisor/leases.
 func (s *Server) handleListLeases(w http.ResponseWriter, r *http.Request) {
@@ -516,14 +516,21 @@ func (s *Server) handleGetLease(w http.ResponseWriter, r *http.Request) {
 // supervisors included (CONTRACT §17.5). A person asking about a request that
 // is not theirs gets "not found", the same as for one that does not exist.
 func (s *Server) approveLease(ctx context.Context, leaseID string, in model.ApproveLeaseInput, approver *model.Person) (model.Lease, error) {
+	notFound := errNotFoundAPI("request not found")
+	// The agent's lock first, then the lease's: the same order as a new
+	// request. It is held until the credential is active, so the count of
+	// active credentials checked below cannot change before this one is
+	// added: two approvals at once cannot both fit under the limit.
+	if first, err := s.db.GetLease(ctx, leaseID); err == nil {
+		unlockAgent := s.lockAgentRequests(first.AgentID)
+		defer unlockAgent()
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return model.Lease{}, err
+	}
 	// Serialize with any other approval of this lease; the status read below
 	// happens under the lock, so a second approval sees the first one's result.
 	unlock := s.lockLease(leaseID)
 	defer unlock()
-	notFound := errNotFoundAPI("lease not found")
-	if approver != nil {
-		notFound = errNotFoundAPI("request not found")
-	}
 	lease, err := s.db.GetLease(ctx, leaseID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1057,13 +1064,11 @@ func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, re
 	if err != nil {
 		return model.Lease{}, err
 	}
-	metadata := map[string]any{
+	metadata := s.leaseAgentMetadata(ctx, lease, map[string]any{
 		"actor":           "system",
 		"reason":          reason,
 		"previous_status": string(previousStatus),
-		"agent_id":        lease.AgentID,
-		"agent_name":      lease.AgentName,
-	}
+	})
 	for k, v := range cause {
 		metadata[k] = v
 	}
@@ -1072,7 +1077,9 @@ func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, re
 }
 
 // revokeLease kills a pending or active lease, scrubbing its credential.
-// actor is the agent for agent-initiated revocations, nil for admin ones.
+// actor is the agent for agent-initiated revocations; nil means the person
+// whose session the request runs in (a supervisor), or the control plane
+// when there is no session.
 func (s *Server) revokeLease(ctx context.Context, lease model.Lease, reason string, actor *model.Agent) (model.Lease, error) {
 	updated, previousStatus, err := s.markLeaseRevoked(ctx, lease, reason)
 	if err != nil {
@@ -1086,7 +1093,7 @@ func (s *Server) revokeLease(ctx context.Context, lease model.Lease, reason stri
 		metadata["actor"] = "agent:" + actor.ID
 		s.agentAudit(ctx, *actor, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
 	} else {
-		metadata["actor"] = "admin"
+		metadata["actor"] = "system"
 		if sc, ok := sessionFromContext(ctx); ok {
 			metadata["actor"] = "person:" + sc.person.ID
 		}

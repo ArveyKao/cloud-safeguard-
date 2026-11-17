@@ -102,32 +102,18 @@ func (db *DB) ListProviders(ctx context.Context) ([]model.Provider, error) {
 	return out, nil
 }
 
-// UpdateProvider updates the mutable provider fields (not the credential blob).
+// UpdateProvider writes what a supervisor can edit on a provider: its name,
+// region, role ARN and status. It never touches the cloud account ID, the
+// stored credential or the test result, and it writes only while the
+// provider still has the cloud account ID the caller read (ErrConflict
+// otherwise), so an edit based on an old read cannot pair one account's ID
+// with another account's role.
 func (db *DB) UpdateProvider(ctx context.Context, p model.Provider) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE providers SET name = ?, region = ?, role_arn = ?, access_key_id_masked = ?,
-			status = ?, last_tested_at = ?, last_test_ok = ?, updated_at = ?
-		 WHERE id = ?`,
-		p.Name, p.Region, p.RoleARN, p.AccessKeyIDMasked, string(p.Status),
-		millisPtr(p.LastTestedAt), boolPtrInt(p.LastTestOK), toMillis(p.UpdatedAt), p.ID,
+		`UPDATE providers SET name = ?, region = ?, role_arn = ?, status = ?, updated_at = ?
+		 WHERE id = ? AND cloud_account_id = ?`,
+		p.Name, p.Region, p.RoleARN, string(p.Status), toMillis(p.UpdatedAt), p.ID, p.CloudAccountID,
 	)
-	if err != nil {
-		return mapErr(err)
-	}
-	return affectedOrNotFound(res)
-}
-
-// AdoptProviderCloudAccountID gives a provider that has no cloud account ID
-// one, together with the role ARN it comes from. It writes only while the ID
-// is still empty; ErrConflict when another provider already has that ID or
-// this one got an ID meanwhile.
-func (db *DB) AdoptProviderCloudAccountID(ctx context.Context, id, roleARN, cloudAccountID string, now time.Time) error {
-	if cloudAccountID == "" {
-		return errors.New("store: cloud account ID is required")
-	}
-	res, err := db.sql.ExecContext(ctx,
-		`UPDATE providers SET role_arn = ?, cloud_account_id = ?, updated_at = ?
-		 WHERE id = ? AND cloud_account_id = ''`, roleARN, cloudAccountID, toMillis(now), id)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -136,19 +122,91 @@ func (db *DB) AdoptProviderCloudAccountID(ctx context.Context, id, roleARN, clou
 		return mapErr(err)
 	}
 	if n == 0 {
+		if _, err := db.GetProvider(ctx, p.ID); err != nil {
+			return err
+		}
 		return ErrConflict
 	}
 	return nil
 }
 
-// UpdateProviderCredential replaces the encrypted broker credential blob.
-func (db *DB) UpdateProviderCredential(ctx context.Context, id, encryptedCredential string) error {
+// SetProviderTestResult records the outcome of a connection test and nothing
+// else.
+func (db *DB) SetProviderTestResult(ctx context.Context, id string, at time.Time, ok bool) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE providers SET encrypted_credential = ? WHERE id = ?`, encryptedCredential, id)
+		`UPDATE providers SET last_tested_at = ?, last_test_ok = ? WHERE id = ?`,
+		toMillis(at), boolPtrInt(&ok), id)
 	if err != nil {
 		return mapErr(err)
 	}
 	return affectedOrNotFound(res)
+}
+
+// RotateProviderCredential replaces the encrypted broker credential and its
+// masked AccessKey ID in one statement, and nothing else.
+func (db *DB) RotateProviderCredential(ctx context.Context, id, encryptedCredential, maskedAccessKeyID string, now time.Time) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE providers SET encrypted_credential = ?, access_key_id_masked = ?, updated_at = ? WHERE id = ?`,
+		encryptedCredential, maskedAccessKeyID, toMillis(now), id)
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrNotFound(res)
+}
+
+// AdoptProviderCloudAccountID gives a provider that has no cloud account ID
+// one, together with the role ARN it comes from, and in the same transaction
+// removes every role binding on that provider: roles given while it had no
+// account did nothing and must not start to count for an account nobody
+// chose them for. It returns the removed bindings. Nothing changes, bindings
+// included, when another provider already has that ID or this one got an ID
+// meanwhile (ErrConflict).
+func (db *DB) AdoptProviderCloudAccountID(ctx context.Context, id, roleARN, cloudAccountID string, now time.Time) ([]model.RoleBinding, error) {
+	if cloudAccountID == "" {
+		return nil, errors.New("store: cloud account ID is required")
+	}
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE providers SET role_arn = ?, cloud_account_id = ?, updated_at = ?
+		 WHERE id = ? AND cloud_account_id = ''`, roleARN, cloudAccountID, toMillis(now), id)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if n == 0 {
+		return nil, ErrConflict
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+bindingColumns+` FROM role_bindings WHERE provider_id = ? ORDER BY person_id ASC`, id)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	removed := []model.RoleBinding{}
+	for rows.Next() {
+		b, err := scanBinding(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		removed = append(removed, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM role_bindings WHERE provider_id = ?`, id); err != nil {
+		return nil, mapErr(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, mapErr(err)
+	}
+	return removed, nil
 }
 
 // GetProviderCredential returns the encrypted broker credential blob.
@@ -209,6 +267,10 @@ func scanCapability(row rowScanner) (model.Capability, error) {
 	}
 	return c, nil
 }
+
+// The stored-capability functions below belong to the removed capability
+// model (CONTRACT §17.7a). The server no longer calls them; they remain for
+// the schema-2 migration's tests and for reading an upgraded database.
 
 // CreateCapability persists a capability.
 func (db *DB) CreateCapability(ctx context.Context, c model.Capability) error {

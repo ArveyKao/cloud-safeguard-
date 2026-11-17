@@ -163,6 +163,11 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, "invalid request body: "+err.Error())
 		return
 	}
+	// One edit of cloud accounts at a time (single process per data dir):
+	// the account is read, checked and written under this lock, so two edits
+	// cannot each write a row based on what the other has since changed.
+	s.accountsMu.Lock()
+	defer s.accountsMu.Unlock()
 	prov, err := s.db.GetProvider(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -210,32 +215,30 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			// not a role, or another provider already had the account). It
 			// cannot issue anything until it gets one; the unique index
 			// refuses an account that is already connected.
-			// Roles given on it while it had no account did nothing. They
-			// must not start to count for an account nobody chose them for:
-			// remove them first; the supervisor gives roles again.
-			stale, err := s.db.ListBindings(r.Context(), "", prov.ID)
+			removed, err := s.db.AdoptProviderCloudAccountID(r.Context(), prov.ID, *in.RoleARN, account, s.nowUTC())
 			if err != nil {
-				s.writeHandlerError(w, err)
-				return
-			}
-			removed := []string{}
-			for _, b := range stale {
-				if err := s.db.DeleteBinding(r.Context(), b.PersonID, prov.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
-					s.writeHandlerError(w, err)
-					return
-				}
-				removed = append(removed, b.PersonID)
-			}
-			values["removed_role_bindings"] = map[string]string{"from": strings.Join(removed, ","), "to": ""}
-			if err := s.db.AdoptProviderCloudAccountID(r.Context(), prov.ID, *in.RoleARN, account, s.nowUTC()); err != nil {
 				if errors.Is(err, store.ErrConflict) {
+					s.actorAudit(r.Context(), "provider.update_refused", "denied", "warning", "provider", prov.ID, map[string]any{
+						"reason": "cloud account already connected", "cloud_account_id": account,
+					})
 					s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
-						"cloud account "+account+" is already connected; disable this duplicate instead")
+						"cloud account "+account+" is already connected; nothing was changed. Disable this duplicate instead")
 					return
 				}
 				s.writeHandlerError(w, err)
 				return
 			}
+			// Roles given on it while it had no account did nothing, and the
+			// store removed them with the adoption: say whose.
+			gone := make([]map[string]string, 0, len(removed))
+			for _, b := range removed {
+				entry := map[string]string{"person_id": b.PersonID, "role": string(b.Role)}
+				if person, err := s.db.GetPerson(r.Context(), b.PersonID); err == nil {
+					entry["username"] = person.Username
+				}
+				gone = append(gone, entry)
+			}
+			values["removed_role_bindings"] = gone
 			prov.CloudAccountID = account
 			values["cloud_account_id"] = map[string]string{"from": "", "to": account}
 			changed = append(changed, "cloud_account_id")
@@ -325,14 +328,15 @@ func (s *Server) handleRotateAccount(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
-	if err := s.db.UpdateProviderCredential(r.Context(), prov.ID, encrypted); err != nil {
+	// Only the credential and its masked ID are written: a rotation must
+	// never put back a status or role ARN that changed since the read above.
+	oldMasked := prov.AccessKeyIDMasked
+	now := s.nowUTC()
+	if err := s.db.RotateProviderCredential(r.Context(), prov.ID, encrypted, maskAccessKeyID(in.AccessKeyID), now); err != nil {
 		s.writeHandlerError(w, err)
 		return
 	}
-	oldMasked := prov.AccessKeyIDMasked
-	prov.AccessKeyIDMasked = maskAccessKeyID(in.AccessKeyID)
-	prov.UpdatedAt = s.nowUTC()
-	if err := s.db.UpdateProvider(r.Context(), prov); err != nil {
+	if prov, err = s.db.GetProvider(r.Context(), prov.ID); err != nil {
 		s.writeHandlerError(w, err)
 		return
 	}
@@ -365,10 +369,9 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, message := s.testProvider(r.Context(), prov)
 	now := s.nowUTC()
-	prov.LastTestedAt = &now
-	prov.LastTestOK = &ok
-	prov.UpdatedAt = now
-	if err := s.db.UpdateProvider(r.Context(), prov); err != nil {
+	// The test can take seconds. Only its result is written: writing the row
+	// read before it would undo a disable that happened meanwhile.
+	if err := s.db.SetProviderTestResult(r.Context(), prov.ID, now, ok); err != nil {
 		s.writeHandlerError(w, err)
 		return
 	}

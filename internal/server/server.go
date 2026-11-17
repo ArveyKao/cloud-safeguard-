@@ -118,6 +118,9 @@ type Server struct {
 	// leaseLocks serializes minting and activation per lease, so two approvals
 	// of one lease (double click, retry, approval racing auto-approval) never
 	// mint twice. The server is a single process per data dir (ADR-002).
+	// accountsMu serializes edits of cloud accounts and the role bindings
+	// written on them.
+	accountsMu   sync.Mutex
 	leaseLocksMu sync.Mutex
 	leaseLocks   map[string]*leaseLock
 
@@ -233,6 +236,14 @@ func New(cfg Config) (*Server, error) {
 		db.Close()
 		return nil, fmt.Errorf("server: record the schema upgrade: %w", err)
 	}
+	// Refuse to run with a master key other than the one this data
+	// directory was encrypted with. A directory from before the key check
+	// gets its check here, before anything can stop the start, so that
+	// `csg supervisor recover` can verify the key afterwards.
+	if err := ensureVaultKeyCheck(context.Background(), db, v); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// Without a supervisor nobody can sign in, add people or connect a cloud
 	// account, and there is no other credential: an install upgraded from a
 	// version that had only the admin token is in this state. Refuse to run
@@ -268,12 +279,6 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	if s.trustedProxies, err = parseTrustedProxies(cfg.TrustedProxies); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// Refuse to run with a master key other than the one this data
-	// directory was encrypted with.
-	if err := ensureVaultKeyCheck(context.Background(), db, v); err != nil {
 		db.Close()
 		return nil, err
 	}

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -415,4 +416,348 @@ func TestUnknownPathsForEveryMethod(t *testing.T) {
 	if code := a.testEnv.request(http.MethodPost, "/api/v1/supervisor/nope", a.sup.cookie, nil, nil).Code; code != http.StatusForbidden {
 		t.Errorf("POST without the CSRF token = %d, want 403", code)
 	}
+}
+
+// ---- regression tests for the second review round (commit dfb2b7a) ----
+
+// A real v0.1 directory that never stored a secret: no key check (it did not
+// exist yet), no cloud account, no person. Serve-first and recover-first must
+// both end with a supervisor, exactly one upgrade record and a key check.
+func TestEmptyV01InstallCanBeRecoveredEitherWay(t *testing.T) {
+	ctx := context.Background()
+	for _, order := range []string{"serve first", "recover first"} {
+		t.Run(order, func(t *testing.T) {
+			dir := t.TempDir()
+			if _, err := Init(ctx, InitOptions{DataDir: dir}); err != nil { // no --demo: no cloud account
+				t.Fatal(err)
+			}
+			downgradeToV1(t, dir)
+			rawExec(t, dir, `DELETE FROM persons`, `DELETE FROM audit`, `DELETE FROM meta WHERE key = 'vault_key_check'`,
+				`INSERT INTO meta(key, value) VALUES('admin_token_hash', 'abc'), ('admin_token_prefix', 'csg_adm_abc')`)
+
+			if order == "serve first" {
+				for attempt := 1; attempt <= 2; attempt++ {
+					if srv, err := New(Config{DataDir: dir}); !errors.Is(err, ErrNoSupervisor) {
+						if srv != nil {
+							srv.Close()
+						}
+						t.Fatalf("attempt %d: New = %v, want ErrNoSupervisor", attempt, err)
+					}
+				}
+			}
+			out, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"})
+			if err != nil || out.SetupCode == "" {
+				t.Fatalf("recover: %v", err)
+			}
+			srv, err := New(Config{DataDir: dir})
+			if err != nil {
+				t.Fatalf("New after recovery: %v", err)
+			}
+			defer srv.Close()
+			if migrated := srv.listAuditFor(t, "schema.migrated"); len(migrated) != 1 || migrated[0].Metadata["deleted_admin_token"] != true {
+				t.Fatalf("schema.migrated = %+v", migrated)
+			}
+			if _, err := srv.db.GetMeta(ctx, store.MetaVaultKeyCheck); err != nil {
+				t.Fatalf("no key check after recovery: %v", err)
+			}
+			if res, err := srv.db.VerifyAudit(ctx); err != nil || !res.OK {
+				t.Fatalf("audit chain = %+v, %v", res, err)
+			}
+			// From now on a wrong key is refused.
+			if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root", MasterKey: make([]byte, 32)}); !errors.Is(err, errWrongMasterKey) {
+				t.Fatalf("wrong key after recovery: %v", err)
+			}
+		})
+	}
+}
+
+// A 7 -> 8 upgrade that had no admin token says so.
+func TestUpgradeRecordSaysWhenNoAdminTokenWasDeleted(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rawExec(t, dir, `UPDATE meta SET value = '7' WHERE key = 'schema_version'`)
+	srv, err := New(Config{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	migrated := srv.listAuditFor(t, "schema.migrated")
+	if len(migrated) != 1 {
+		t.Fatalf("schema.migrated events = %d", len(migrated))
+	}
+	if v, ok := migrated[0].Metadata["deleted_admin_token"]; !ok || v != false {
+		t.Fatalf("deleted_admin_token = %v (present %v), want false", v, ok)
+	}
+}
+
+// Init creates nothing when $CSG_MASTER_KEY is unusable, and never removes
+// something that was there before it, a dangling symlink included.
+func TestInitLeavesNoTraceAndRemovesOnlyItsOwnFiles(t *testing.T) {
+	ctx := context.Background()
+	parent := t.TempDir()
+	for _, bad := range []string{"not-base64!!", "c2hvcnQ="} {
+		t.Setenv("CSG_MASTER_KEY", bad)
+		dir := filepath.Join(parent, "new-"+bad[:3])
+		if _, err := Init(ctx, InitOptions{DataDir: dir}); err == nil {
+			t.Fatalf("Init accepted CSG_MASTER_KEY=%q", bad)
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a refused Init created %s", dir)
+		}
+	}
+	t.Setenv("CSG_MASTER_KEY", "")
+
+	// A dangling master.key symlink is someone else's: Init refuses, and it
+	// is still there afterwards.
+	linked := t.TempDir()
+	link := filepath.Join(linked, "master.key")
+	if err := os.Symlink(filepath.Join(linked, "elsewhere", "key"), link); err != nil {
+		t.Skip("symlinks are not available")
+	}
+	if _, err := Init(ctx, InitOptions{DataDir: linked}); err == nil {
+		t.Fatal("Init ran over a dangling master.key symlink")
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("Init removed a symlink it did not create: %v", err)
+	}
+
+	// A failure removes the directory Init made, and leaves a directory
+	// that existed, with the files that were in it.
+	old := bootstrapHook
+	bootstrapHook = func() error { return errors.New("injected failure") }
+	defer func() { bootstrapHook = old }()
+	made := filepath.Join(parent, "made-by-init")
+	if _, err := Init(ctx, InitOptions{DataDir: made}); err == nil {
+		t.Fatal("the injected failure did not fail Init")
+	}
+	if _, err := os.Lstat(made); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a failed Init left the directory it created: %v", err)
+	}
+	existing := t.TempDir()
+	notes := filepath.Join(existing, "notes.txt")
+	if err := os.WriteFile(notes, []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Init(ctx, InitOptions{DataDir: existing}); err == nil {
+		t.Fatal("the injected failure did not fail Init")
+	}
+	entries, _ := os.ReadDir(existing)
+	if data, err := os.ReadFile(notes); err != nil || string(data) != "mine" || len(entries) != 1 {
+		t.Fatalf("a failed Init changed an existing directory: %d entries, %v", len(entries), err)
+	}
+}
+
+// A connection test or a key rotation in flight writes only its own fields:
+// it must not put back the status or role ARN it read before a supervisor
+// changed them.
+func TestTestAndRotateDoNotUndoAConcurrentEdit(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	account := "/api/v1/supervisor/accounts/" + a.providerID
+	active := a.request(accessInput("ecs", "read"))
+
+	// The account is disabled while its connection test is running.
+	a.minter.onTest = func() {
+		requireStatus(t, a.sup.do(http.MethodPatch, account, map[string]any{"status": "disabled", "name": "renamed"}), http.StatusOK)
+	}
+	rec := a.sup.do(http.MethodPost, account+"/test", nil)
+	requireStatus(t, rec, http.StatusOK)
+	a.minter.onTest = nil
+	got, err := a.srv.db.GetProvider(context.Background(), a.providerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.ProviderDisabled || got.Name != "renamed" {
+		t.Fatalf("the test's write undid the edit: status %s, name %q", got.Status, got.Name)
+	}
+	if got.LastTestOK == nil || !*got.LastTestOK {
+		t.Fatalf("the test result was not recorded: %+v", got.LastTestOK)
+	}
+	if a.status(active.ID) != model.LeaseRevoked {
+		t.Fatalf("credential of a disabled account = %s", a.status(active.ID))
+	}
+	requireStatus(t, a.requestRaw(a.token, accessInput("ecs", "read")), http.StatusConflict)
+
+	// A rotation keeps it disabled too, and returns the row as it is now.
+	rec = a.sup.do(http.MethodPost, account+"/rotate", model.RotateProviderCredentialInput{AccessKeyID: "LTAI5tRotatedKeyId88", AccessKeySecret: "rotated-secret-value"})
+	requireStatus(t, rec, http.StatusOK)
+	if p := decodeEnvelope[model.Provider](t, rec); p.Status != model.ProviderDisabled || p.Name != "renamed" || p.AccessKeyIDMasked == got.AccessKeyIDMasked {
+		t.Fatalf("after rotation: %+v", p)
+	}
+	if after, _ := a.srv.db.GetProvider(context.Background(), a.providerID); after.Status != model.ProviderDisabled || after.RoleARN != got.RoleARN {
+		t.Fatalf("a rotation changed status or role ARN: %+v", after)
+	}
+}
+
+// A refused repair changes nothing, roles included, and is recorded; a role
+// cannot be given on a provider that has no cloud account yet.
+func TestRefusedRepairKeepsRolesAndUnconnectedAccountTakesNoRoles(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", newMockAccount("second", "6543210987654321"))
+	requireStatus(t, rec, http.StatusCreated)
+	second := decodeEnvelope[model.Provider](t, rec)
+	account := "/api/v1/supervisor/accounts/" + second.ID
+	binding := account + "/people/" + a.mei.person.ID
+	requireStatus(t, a.sup.do(http.MethodPut, binding, model.PutBindingInput{Role: model.RoleAdministrator}), http.StatusOK)
+	if _, err := a.srv.db.SQL().Exec(`UPDATE providers SET cloud_account_id = '', role_arn = 'not-a-role' WHERE id = ?`, second.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	taken := "acs:ram::" + demoAccountID + ":role/cloud-safeguard"
+	requireStatus(t, a.sup.do(http.MethodPatch, account, model.UpdateProviderInput{RoleARN: &taken}), http.StatusConflict)
+	if b, err := a.srv.db.GetBinding(context.Background(), a.mei.person.ID, second.ID); err != nil || b.Role != model.RoleAdministrator {
+		t.Fatalf("a refused repair removed or changed the role: %+v, %v", b, err)
+	}
+	if got, _ := a.srv.db.GetProvider(context.Background(), second.ID); got.CloudAccountID != "" || got.RoleARN != "not-a-role" {
+		t.Fatalf("a refused repair changed the account: %+v", got)
+	}
+	refused := a.lastEvent("provider.update_refused")
+	a.requireActor(refused, a.sup)
+	if refused.TargetID != second.ID || refused.Metadata["cloud_account_id"] != demoAccountID {
+		t.Fatalf("refusal event = %+v", refused)
+	}
+
+	// No new role while it is not connected, for anyone.
+	requireErrorCode(t, a.sup.do(http.MethodPut, binding, model.PutBindingInput{Role: model.RoleGuest}), http.StatusConflict, model.ErrCodeConflict)
+	jun := a.addPerson(a.sup, "jun", false)
+	requireErrorCode(t, a.sup.do(http.MethodPut, account+"/people/"+jun.person.ID, model.PutBindingInput{Role: model.RoleGuest}), http.StatusConflict, model.ErrCodeConflict)
+	if _, err := a.srv.db.GetBinding(context.Background(), jun.person.ID, second.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a role was written on an unconnected account: %v", err)
+	}
+
+	// The repair removes the old role and says whose it was.
+	free := "acs:ram::7777777777777777:role/cloud-safeguard"
+	requireStatus(t, a.sup.do(http.MethodPatch, account, model.UpdateProviderInput{RoleARN: &free}), http.StatusOK)
+	ev := a.lastEvent("provider.updated")
+	raw, _ := json.Marshal(ev.Metadata)
+	for _, want := range []string{"removed_role_bindings", a.mei.person.ID, `"mei"`, "administrator", "7777777777777777"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("provider.updated does not record %s: %s", want, raw)
+		}
+	}
+	// Connected now: roles can be given again.
+	requireStatus(t, a.sup.do(http.MethodPut, binding, model.PutBindingInput{Role: model.RoleGuest}), http.StatusOK)
+}
+
+// Two approvals at once never put an agent above the limit on active
+// credentials, including a limit that was lowered after the requests were made.
+func TestParallelApprovalsRespectTheLimit(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		a := newAccessEnv(t, model.RoleMember)
+		settings := model.DefaultPolicySettings()
+		settings.MaxConcurrentLeasesPerAgent = 5
+		requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+		a.request(accessInput("ecs", "read"))
+		a.request(accessInput("oss", "read"))
+		first := a.request(accessInput("ecs", "write"))
+		second := a.request(accessInput("oss", "write"))
+		settings.MaxConcurrentLeasesPerAgent = 3
+		requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+
+		codes := make(chan int, 2)
+		start := make(chan struct{})
+		for _, id := range []string{first.ID, second.ID} {
+			go func() {
+				<-start
+				codes <- a.approve(a.mei, id).Code
+			}()
+		}
+		close(start)
+		x, y := <-codes, <-codes
+		if !((x == http.StatusOK && y == http.StatusConflict) || (x == http.StatusConflict && y == http.StatusOK)) {
+			t.Fatalf("round %d: approvals = %d, %d; want one 200 and one 409", round, x, y)
+		}
+		active, err := a.srv.db.CountActiveLeases(context.Background(), a.agent.ID)
+		if err != nil || active != 3 {
+			t.Fatalf("round %d: %d active credentials under a limit of 3 (%v)", round, active, err)
+		}
+		if n := a.minter.requestCount(); n != 3 {
+			t.Fatalf("round %d: minted %d times, want 3", round, n)
+		}
+	}
+}
+
+// What an agent and its owner are shown as limits is what is enforced now.
+func TestShownLimitsAreTheCurrentSettings(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	settings := model.DefaultPolicySettings()
+	settings.MaxLeaseTTLSeconds, settings.MaxConcurrentLeasesPerAgent = 1800, 1
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+
+	rec := a.do(http.MethodGet, "/api/v1/agent/me", a.token, nil)
+	requireStatus(t, rec, http.StatusOK)
+	me := decodeEnvelope[struct {
+		Agent model.Agent `json:"agent"`
+	}](t, rec).Agent
+	if me.MaxTTLSeconds != 1800 || me.MaxConcurrentLeases != 1 {
+		t.Fatalf("agent/me limits = %d s, %d; want 1800, 1", me.MaxTTLSeconds, me.MaxConcurrentLeases)
+	}
+	rec = a.mei.do(http.MethodGet, "/api/v1/me/agents", nil)
+	requireStatus(t, rec, http.StatusOK)
+	mine := decodeEnvelope[listData[model.Agent]](t, rec)
+	if mine.Total != 1 || mine.Items[0].MaxTTLSeconds != 1800 || mine.Items[0].MaxConcurrentLeases != 1 {
+		t.Fatalf("me/agents limits = %+v", mine.Items)
+	}
+	// And they are enforced.
+	in := accessInput("ecs", "read")
+	in.TTLSeconds = 1801
+	requireStatus(t, a.requestRaw(a.token, in), http.StatusBadRequest)
+}
+
+// Revocations at startup and by local recovery name the agent and its owner,
+// one event per credential.
+func TestStartupAndRecoveryRevocationsNameAgentAndOwner(t *testing.T) {
+	ctx := context.Background()
+	env := newTestEnv(t, true)
+	sup := env.supervisorClient()
+	mei := env.addPerson(sup, "mei", false)
+	agent, _, lease := env.ownedAgentWithLease(mei, "mei-agent")
+	if _, err := env.srv.db.SQL().Exec(`UPDATE persons SET status = 'suspended' WHERE id = ?`, mei.person.ID); err != nil {
+		t.Fatal(err)
+	}
+	env.restart()
+	var startup *model.AuditEvent
+	for _, ev := range env.listAudit("lease.revoked") {
+		if ev.TargetID == lease.ID {
+			startup = &ev
+		}
+	}
+	if startup == nil || startup.Metadata["agent_id"] != agent.ID || startup.Metadata["agent_name"] != agent.Name ||
+		startup.Metadata["owner_id"] != mei.person.ID || startup.Metadata["caused_by"] != "startup check" {
+		t.Fatalf("startup revocation = %+v", startup)
+	}
+
+	// Local recovery of a supervisor who has an agent with a credential.
+	supAgent, _ := env.signInAgent(sup, "sup-agent")
+	leases, err := env.srv.db.ListAllLeases(ctx, store.LeaseFilter{AgentID: supAgent.ID})
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("precondition: %d leases, %v", len(leases), err)
+	}
+	now := env.clock.Now()
+	expires := now.Add(10 * time.Minute)
+	held := lease
+	held.ID, held.AgentID, held.AgentName = "lea_sup_held", supAgent.ID, supAgent.Name
+	held.Status, held.CreatedAt, held.IssuedAt, held.ExpiresAt = model.LeaseActive, now, &now, &expires
+	held.RevokedAt, held.RevokeReason = nil, ""
+	if err := env.srv.db.CreateLease(ctx, held); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: env.dir, Username: sup.person.Username}); err != nil {
+		t.Fatal(err)
+	}
+	var recovered *model.AuditEvent
+	for _, ev := range env.listAudit("lease.revoked") {
+		if ev.TargetID == held.ID {
+			recovered = &ev
+		}
+	}
+	if recovered == nil || recovered.Metadata["agent_id"] != supAgent.ID || recovered.Metadata["owner_id"] != sup.person.ID ||
+		recovered.Metadata["caused_by"] != "csg supervisor recover" || recovered.ActorType != "system" {
+		t.Fatalf("recovery revocation = %+v", recovered)
+	}
+	if got := env.getLease(held.ID); got.Status != model.LeaseRevoked {
+		t.Fatalf("credential after recovery = %s", got.Status)
+	}
+	env.verifyAudit()
 }

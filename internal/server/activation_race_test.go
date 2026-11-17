@@ -211,18 +211,34 @@ func TestConcurrentApprovalsMintOnceAndKeepWinnerCredential(t *testing.T) {
 // after its pending row is written but before the automatic issue takes the
 // lock. The automatic issue must not mint over that decision.
 func TestAutomaticIssueSkipsARequestDecidedBeforeItsLock(t *testing.T) {
-	t.Run("the owner approved it", func(t *testing.T) {
+	// The owner cannot get in between: an approval waits for the agent's
+	// request in flight, then finds the request already issued.
+	t.Run("the owner tries to approve it", func(t *testing.T) {
 		a := newAccessEnv(t, model.RoleGuest)
+		approval := make(chan int, 1)
 		a.srv.hookBeforeAutoLock = func(leaseID string) {
-			requireStatus(t, a.approve(a.mei, leaseID), http.StatusOK)
+			started := make(chan struct{})
+			go func() {
+				close(started)
+				approval <- a.approve(a.mei, leaseID).Code
+			}()
+			<-started
+			time.Sleep(50 * time.Millisecond) // let it reach the agent's lock
 		}
-		requireErrorCode(t, a.requestRaw(a.token, accessInput("ecs", "read")), http.StatusConflict, model.ErrCodeConflict)
+		rec := a.requestRaw(a.token, accessInput("ecs", "read"))
+		requireStatus(t, rec, http.StatusCreated)
+		if got := decodeEnvelope[model.AccessRequest](t, rec); got.Status != model.LeaseActive {
+			t.Fatalf("automatic request = %s", got.Status)
+		}
+		if code := <-approval; code != http.StatusConflict {
+			t.Fatalf("approval of a request already issued = %d, want 409", code)
+		}
 		if n := a.minter.requestCount(); n != 1 {
-			t.Fatalf("minted %d times, want 1 (the approval only)", n)
+			t.Fatalf("minted %d times, want 1", n)
 		}
 		leaseID := a.onlyLeaseID()
-		if got := a.getLease(leaseID); got.Status != model.LeaseActive || got.ApprovedBy == "auto" {
-			t.Fatalf("request = %q approved by %q, want active by the owner", got.Status, got.ApprovedBy)
+		if got := a.getLease(leaseID); got.Status != model.LeaseActive || got.ApprovedBy != "auto" {
+			t.Fatalf("request = %q approved by %q, want active by auto", got.Status, got.ApprovedBy)
 		}
 		requireStatus(t, a.credential(leaseID), http.StatusOK)
 	})

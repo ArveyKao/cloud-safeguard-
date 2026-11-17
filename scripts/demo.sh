@@ -107,6 +107,33 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# The demo always starts from a clean data directory. It deletes an existing
+# one only when that directory really is inside this repository's .demo/
+# (after resolving symlinks and ".."). Any other existing path is refused:
+# it could be a real instance, and the demo never guesses from its contents.
+DATA_DIR=${DATA_DIR%/}
+if curl -sf "$SERVER_URL/healthz" >/dev/null 2>&1; then
+  echo "demo: port $PORT already has a healthy service; choose another --port" >&2
+  exit 1
+fi
+if [ -e "$DATA_DIR" ] || [ -L "$DATA_DIR" ]; then
+  DEMO_HOME=$(cd "$ROOT" && pwd -P)/.demo
+  REAL=""
+  if [ -d "$DATA_DIR" ] && [ ! -L "$DATA_DIR" ]; then
+    REAL=$(cd "$DATA_DIR" && pwd -P)
+  fi
+  case "$REAL" in
+    "$DEMO_HOME"/?*) : ;;
+    *)
+      echo "demo: $DATA_DIR already exists and is not inside $DEMO_HOME; refusing to delete it." >&2
+      echo "demo: use a path under .demo/ or one that does not exist yet." >&2
+      exit 2
+      ;;
+  esac
+  echo "removing existing demo data dir: $REAL"
+  rm -rf -- "$REAL"
+fi
+
 echo "Cloud Safeguard demo (mock provider; no real cloud credentials)"
 echo "  repo:       $ROOT"
 echo "  data dir:   $DATA_DIR"
@@ -125,32 +152,6 @@ fi
 echo "built $BIN"
 echo
 
-# The demo always starts from a clean, throwaway data directory. It deletes
-# only a directory that a demo instance lives in: one under this repository's
-# .demo/, or one that holds nothing but an instance's own files. Anything
-# else is refused, never removed.
-if [ -e "$DATA_DIR" ]; then
-  REMOVABLE=0
-  case "$DATA_DIR" in
-    "$ROOT"/.demo/?*)
-      case "$DATA_DIR" in *..*) : ;; *) REMOVABLE=1 ;; esac
-      ;;
-  esac
-  if [ "$REMOVABLE" -ne 1 ] && [ -d "$DATA_DIR" ] && [ ! -L "$DATA_DIR" ]; then
-    OTHER=$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
-      ! -name master.key ! -name csg.db ! -name csg.db-wal ! -name csg.db-shm ! -name server.log | head -1)
-    if [ -z "$OTHER" ] && [ -f "$DATA_DIR/csg.db" ]; then
-      REMOVABLE=1
-    fi
-  fi
-  if [ "$REMOVABLE" -ne 1 ]; then
-    echo "demo: $DATA_DIR exists and is not a demo data directory; refusing to delete it." >&2
-    echo "demo: use a path under $ROOT/.demo/ or a directory that does not exist yet." >&2
-    exit 2
-  fi
-  echo "removing existing demo data dir: $DATA_DIR"
-  rm -rf -- "$DATA_DIR"
-fi
 mkdir -p "$(dirname "$DATA_DIR")" || { echo "demo: cannot create parent of $DATA_DIR" >&2; exit 1; }
 
 echo "== bootstrap =="
@@ -166,10 +167,6 @@ echo "initialized demo data dir (the supervisor's setup code is captured, not pr
 echo
 
 echo "== start server =="
-if curl -sf "$SERVER_URL/healthz" >/dev/null 2>&1; then
-  echo "demo: port $PORT already has a healthy service; choose another --port" >&2
-  exit 1
-fi
 "$BIN" serve --data-dir "$DATA_DIR" --addr "127.0.0.1:$PORT" >"$DATA_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 

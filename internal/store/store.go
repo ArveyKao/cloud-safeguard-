@@ -66,14 +66,17 @@ type Store interface {
 	GetProvider(ctx context.Context, id string) (model.Provider, error)
 	ListProviders(ctx context.Context) ([]model.Provider, error)
 	UpdateProvider(ctx context.Context, p model.Provider) error
-	// UpdateProviderCredential replaces the encrypted broker credential blob.
-	UpdateProviderCredential(ctx context.Context, id, encryptedCredential string) error
+	// SetProviderTestResult records a connection test's outcome only.
+	SetProviderTestResult(ctx context.Context, id string, at time.Time, ok bool) error
+	// RotateProviderCredential replaces the encrypted broker credential and
+	// its masked AccessKey ID only.
+	RotateProviderCredential(ctx context.Context, id, encryptedCredential, maskedAccessKeyID string, now time.Time) error
 	// GetProviderCredential returns the encrypted broker credential blob.
 	GetProviderCredential(ctx context.Context, id string) (string, error)
 	// CountProviderCredentials counts providers that hold a credential.
 	CountProviderCredentials(ctx context.Context) (int, error)
 
-	// ---- Capabilities ----
+	// ---- Capabilities (removed model; kept for upgrades, see entities.go) ----
 	CreateCapability(ctx context.Context, c model.Capability) error
 	GetCapability(ctx context.Context, id string) (model.Capability, error)
 	ListCapabilities(ctx context.Context) ([]model.Capability, error)
@@ -163,7 +166,7 @@ type MigrationReport struct {
 	RevokedAgents []string `json:"revoked_agents,omitempty"`
 	// DeletedAdminToken is true when the schema-8 migration deleted the
 	// admin token of an older version.
-	DeletedAdminToken bool `json:"deleted_admin_token,omitempty"`
+	DeletedAdminToken bool `json:"deleted_admin_token"`
 }
 
 // AgentMigration is one agent's outcome in the schema-2 role migration.

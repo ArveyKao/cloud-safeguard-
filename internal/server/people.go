@@ -284,7 +284,23 @@ func (s *Server) handlePutBinding(w http.ResponseWriter, r *http.Request) {
 		PersonID: person.ID, ProviderID: provider.ID, Role: in.Role,
 		CreatedBy: actor.person.ID, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := s.db.PutBinding(ctx, binding); err != nil {
+	// A provider without a cloud account ID is not connected to anything: a
+	// role on it would do nothing now and would be removed when it gets an
+	// account. Checked and written under the accounts lock, so a role can
+	// never slip in while the account is being given its ID.
+	s.accountsMu.Lock()
+	current, err := s.db.GetProvider(ctx, provider.ID)
+	if err == nil && current.CloudAccountID == "" {
+		s.accountsMu.Unlock()
+		s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
+			"this cloud account is not connected yet (it has no cloud account ID); set its role ARN first")
+		return
+	}
+	if err == nil {
+		err = s.db.PutBinding(ctx, binding)
+	}
+	s.accountsMu.Unlock()
+	if err != nil {
 		s.internalError(w, "put binding", err)
 		return
 	}

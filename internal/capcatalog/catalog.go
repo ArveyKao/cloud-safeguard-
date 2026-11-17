@@ -152,10 +152,10 @@ var builtinSpecs = []model.Capability{
 	},
 }
 
-// Builtin returns the capability catalog shipped with Cloud Safeguard. IDs are
-// stable and documented in docs/CONTRACT.md. The returned slice is a defensive
-// copy: callers may mutate it (the server stamps timestamps on seed) without
-// corrupting the catalog.
+// Builtin returns the capability catalog of v0.1. The running server does
+// not use it: credentials come from the access templates in access.go. It is
+// kept because the schema-2 migration, which an upgrade from v0.1 still runs,
+// needs it. The returned slice is a defensive copy.
 func Builtin() []model.Capability {
 	out := make([]model.Capability, 0, len(builtinSpecs))
 	for _, spec := range builtinSpecs {
@@ -321,9 +321,8 @@ func renderTemplate(cap model.Capability, params map[string]string) ([]byte, err
 
 // SampleParams returns a safe, pattern-conforming value for every declared
 // parameter of a capability. It exists so a capability's policy template can be
-// rendered (and therefore IAM-checked) without a real lease request: the admin
-// API uses it on create/update and the schema-2 migration uses it to decide
-// which custom capabilities must be disabled.
+// rendered (and therefore IAM-checked) without a real request: the schema-2
+// migration uses it to decide which stored capabilities must be disabled.
 func SampleParams(cap model.Capability) map[string]string {
 	samples := make(map[string]string, len(cap.Params))
 	for _, p := range cap.Params {

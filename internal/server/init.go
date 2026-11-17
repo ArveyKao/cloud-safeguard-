@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,11 +71,19 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, err error) 
 	if len(opts.MasterKey) > 0 && len(opts.MasterKey) != 32 {
 		return InitResult{}, vault.ErrInvalidKey
 	}
+	if raw := strings.TrimSpace(os.Getenv("CSG_MASTER_KEY")); raw != "" && len(opts.MasterKey) == 0 {
+		if key, err := base64.StdEncoding.DecodeString(raw); err != nil || len(key) != 32 {
+			return InitResult{}, errors.New("server: CSG_MASTER_KEY must be 32 bytes, base64-encoded")
+		}
+	}
 	dir := opts.DataDir
 	keyPath := filepath.Join(dir, "master.key")
 	dbPath := filepath.Join(dir, store.DBFileName)
 
-	switch keyPresent, dbPresent := fileExists(keyPath), fileExists(dbPath); {
+	// Anything at these paths, a dangling symlink included, belongs to
+	// someone else: Init then creates nothing, so its cleanup can only
+	// remove files it made itself.
+	switch keyPresent, dbPresent := pathExists(keyPath), pathExists(dbPath); {
 	case keyPresent && dbPresent:
 		return InitResult{}, fmt.Errorf(
 			"data directory %q is already initialized; refusing to touch it (`csg serve` upgrades it, and `csg supervisor recover` issues a new setup code)",
@@ -87,6 +96,15 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, err error) 
 		return InitResult{}, fmt.Errorf(
 			"data directory %q holds a database but no master.key; refusing to touch it. Restore master.key (or set CSG_MASTER_KEY); without the key the stored secrets cannot be read",
 			dir)
+	}
+	// What Init may remove again if it fails: only paths that did not exist
+	// before it started, and the directory only if Init made it.
+	dirExisted := pathExists(dir)
+	var mine []string
+	for _, name := range []string{"master.key", store.DBFileName, store.DBFileName + "-wal", store.DBFileName + "-shm"} {
+		if path := filepath.Join(dir, name); !pathExists(path) {
+			mine = append(mine, path)
+		}
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return InitResult{}, fmt.Errorf("server: create data dir: %w", err)
@@ -102,8 +120,11 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, err error) 
 			db.Close()
 		}
 		if err != nil {
-			for _, name := range []string{"master.key", store.DBFileName, store.DBFileName + "-wal", store.DBFileName + "-shm"} {
-				_ = os.Remove(filepath.Join(dir, name))
+			for _, path := range mine {
+				_ = os.Remove(path)
+			}
+			if !dirExisted {
+				_ = os.Remove(dir) // only succeeds when it is empty
 			}
 		}
 	}()
@@ -246,6 +267,13 @@ func seedDemoProvider(ctx context.Context, db *store.DB, v *vault.Vault, now tim
 	return provider.ID, nil
 }
 
+// pathExists reports whether anything is at path, without following a
+// symlink.
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil || !errors.Is(err, fs.ErrNotExist)
+}
+
 // fileExists reports whether path exists and is a regular file.
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
@@ -371,12 +399,24 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 		return zero, err
 	}
 	defer db.Close()
-	if err := verifyVaultKey(ctx, db, v); err != nil {
+	// Recovery may be the first command to open an older database, which
+	// upgrades it: record that at once, before anything can stop recovery,
+	// since no later command will see the upgrade.
+	if err := auditMigrationReport(ctx, db); err != nil {
 		return zero, err
 	}
-	// Recovery may be the first command to open an older database, which
-	// upgrades it: record that here, since `csg serve` will see no upgrade.
-	if err := auditMigrationReport(ctx, db); err != nil {
+	// A directory from before the key check that never stored a secret has
+	// nothing to test the key against. When the key is the directory's own
+	// master.key it gets its check now. A key supplied from outside cannot
+	// be told from a wrong one, and a check written with a wrong key would
+	// lock out the right one: that still fails closed, and `csg serve`
+	// (which writes the check with the key it is started with) comes first.
+	suppliedKey := len(opts.MasterKey) > 0 || strings.TrimSpace(os.Getenv("CSG_MASTER_KEY")) != ""
+	if err := verifyVaultKey(ctx, db, v); errors.Is(err, errVaultKeyUnverifiable) && !suppliedKey {
+		if err := ensureVaultKeyCheck(ctx, db, v); err != nil {
+			return zero, err
+		}
+	} else if err != nil {
 		return zero, err
 	}
 
@@ -418,6 +458,21 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 			return zero, err
 		}
 		out = model.PersonWithSetupCode{Person: person, SetupCode: code, SetupExpiresAt: expires}
+	}
+	// One lease.revoked event per credential, like every other revocation.
+	for _, id := range revokedLeases {
+		metadata := map[string]any{"actor": "system", "reason": "agent's owner was reset by local recovery",
+			"caused_by": "csg supervisor recover", "owner_id": out.Person.ID}
+		if lease, err := db.GetLease(ctx, id); err == nil {
+			metadata["agent_id"], metadata["agent_name"] = lease.AgentID, lease.AgentName
+		}
+		if err := db.AppendAudit(ctx, &model.AuditEvent{
+			ActorType: "system", ActorID: "system", ActorName: model.ProductName,
+			Action: "lease.revoked", Status: "denied", Severity: "warning",
+			TargetType: "lease", TargetID: id, Metadata: metadata,
+		}); err != nil {
+			return zero, err
+		}
 	}
 	ev := model.AuditEvent{
 		ActorType: "system", ActorID: "system", ActorName: model.ProductName,

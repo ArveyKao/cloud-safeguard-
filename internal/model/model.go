@@ -354,7 +354,9 @@ const (
 	LeaseDenied LeaseStatus = "denied"
 	// LeaseExpired ran past its TTL or approval window.
 	LeaseExpired LeaseStatus = "expired"
-	// LeaseRevoked was killed by an agent or admin before its TTL.
+	// LeaseRevoked was ended before its deadline: by the agent, its owner,
+	// a supervisor, or the control plane when the owner's role no longer
+	// allows it.
 	LeaseRevoked LeaseStatus = "revoked"
 	// LeaseFailed could not mint credentials (provider error).
 	LeaseFailed LeaseStatus = "failed"
@@ -421,7 +423,7 @@ type Lease struct {
 	Status              LeaseStatus    `json:"status"`
 	Decision            PolicyDecision `json:"decision"`
 	BreakGlass          bool           `json:"break_glass"`
-	// ApprovedBy is "auto", an admin actor label, or empty.
+	// ApprovedBy is "auto", "owner:<person id>", or empty.
 	ApprovedBy    string `json:"approved_by,omitempty"`
 	ApprovalNote  string `json:"approval_note,omitempty"`
 	DeniedReason  string `json:"denied_reason,omitempty"`
@@ -465,7 +467,8 @@ type DenyLeaseInput struct {
 	Reason string `json:"reason"`
 }
 
-// RevokeLeaseInput is the request body for lease revocation (agent or admin).
+// RevokeLeaseInput is the request body for revoking a credential (the agent,
+// its owner or a supervisor).
 type RevokeLeaseInput struct {
 	Reason string `json:"reason"`
 }
@@ -504,7 +507,7 @@ type AuditEvent struct {
 	Seq        int64          `json:"seq"`
 	ID         string         `json:"id"`
 	Time       time.Time      `json:"time"`
-	ActorType  string         `json:"actor_type"` // agent | admin | system
+	ActorType  string         `json:"actor_type"` // agent | person | system
 	ActorID    string         `json:"actor_id"`
 	ActorName  string         `json:"actor_name"`
 	Action     string         `json:"action"`

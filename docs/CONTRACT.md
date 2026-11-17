@@ -10,7 +10,8 @@ are the wire contract).
 
 > **Read §17 first.** The admin token and the agent model of §3, §4, §6, §7, §9, §11 and §16
 > were removed on 2026-11-15 (§17.7a). Those sections are kept as the record of v0.1 and are
-> no longer the running behaviour. What still applies from them is listed in §17.7a.
+> no longer the running behaviour. §2 is rewritten for the current authentication. What
+> still applies from the others is listed in §17.7a.
 
 ---
 
@@ -33,13 +34,13 @@ are the wire contract).
 
 ## 2. Authentication, errors, envelopes
 
-**Bearer tokens.** `Authorization: Bearer <token>` on every `/api/v1/*` request.
-- Agent endpoints require a token with prefix `csg_agt_`; admin endpoints require `csg_adm_`.
-  A token of the wrong kind is rejected **401** `unauthorized`.
-- Agent token resolution: SHA-256 of token → `agents.token_hash`; unknown → 401. Agent
-  status `suspended` or `revoked` → **403** `forbidden` on all agent endpoints.
-- Admin token: single hash stored in meta `admin_token_hash`; compare constant-time; invalid
-  → 401. Successful admin login/audit is recorded as `auth.admin_login`.
+**Who calls what** (§17.3). People use a console session (cookie plus CSRF token) on
+`/api/v1/auth/`, `/api/v1/me/` and `/api/v1/supervisor/`. Agents send
+`Authorization: Bearer <token>` on `/api/v1/agent/`. There is no admin token.
+- An agent token has the prefix `csg_agt_`. Anything else is rejected **401** `unauthorized`.
+- Agent token resolution: SHA-256 of token → `agents.token_hash`; unknown → 401. An agent
+  that is `suspended` or `revoked`, has no owner, or whose owner is not active → **403**
+  `forbidden` on all agent endpoints.
 - Each authenticated agent request refreshes `last_seen_at` at most once per 60 s.
 
 **Success envelope.** Every `/api/v1` response is `{"data": <payload>}` (HTTP 200/201).
@@ -55,8 +56,9 @@ Codes: `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_fo
 Default `limit` 50, max 200; `offset` default 0.
 
 **Never returned by any API:** provider AccessKey ID/Secret plaintext, lease credential
-plaintext outside the credential endpoint, admin token (except in `csg init` output),
-agent token except at creation/rotation, master key.
+plaintext outside the credential endpoint, an agent token except once to the agent when its
+sign-in is approved, a setup code except once when it is issued, passwords, TOTP secrets,
+the master key.
 
 ## 3. Agent API (`/api/v1/agent`, bearer = agent token)
 
@@ -970,7 +972,10 @@ agent or the request.
 - Suspending a person suspends their agents and revokes their pending and active leases.
 - Removing or lowering a binding revokes that person's agents' leases on that account that the
   new role does not permit. Real STS credentials stay valid until expiry.
-- Every audit event names the person (owner, approver or supervisor) as well as the agent.
+- Every audit event about a request or credential names the agent and its owner, and the
+  person who caused it when there is one (the owner, an approver or a supervisor). Events
+  the control plane causes itself (a deadline, the check at start, local recovery) are
+  recorded as `system` with what triggered them, one event per credential.
   A `lease.revoked` event caused by a person's action (suspension, reset, an owner revoking
   an agent, a re-sign-in) is recorded as the control plane's, with `caused_by`, `owner_id`,
   `agent_id` and `agent_name` in its metadata.
@@ -1033,19 +1038,28 @@ Agent CLI, same flow from a terminal:
   holds at once and the requests per minute.
 - Upgrade (schema version 8). The migration deletes the admin token, revokes every agent
   without an owner and clears the role and grants stored on every agent; the
-  `schema.migrated` audit event says whether an admin token was deleted and lists the
-  revoked agents, whichever command opens the database first (`csg serve` or
-  `csg supervisor recover`). At every start the server revokes each pending or active lease
+  `schema.migrated` audit event says whether an admin token was deleted
+  (`deleted_admin_token`, true or false) and lists the revoked agents. It is written by
+  whichever command opens the database first, `csg serve` or `csg supervisor recover`,
+  before that command can stop for any other reason. At every start the server revokes each pending or active lease
   that is not an access request, with one `lease.revoked` event each. People sign their
   agents in again with `csg login`. An install that never had a supervisor does not start
-  until `csg supervisor recover --username NAME` creates one.
+  until `csg supervisor recover --username NAME` creates one. Recovery works on a directory
+  that never stored a secret (it then writes the key check with the directory's own
+  `master.key`; a key supplied from outside is still refused until `csg serve` has run once).
 - Supervisors are Administrator on every cloud account (§17.1). A cloud account must be
   added with a RAM role ARN; a request without one is refused. A provider an older upgrade
   left without a cloud account ID can be given one by setting a role ARN in an account that
-  is not connected yet (the roles set on it before are removed), or disabled.
+  is not connected yet, or disabled. Giving it one removes the roles set on it before, in
+  the same step, and the audit event lists them; a refused attempt changes nothing and is
+  recorded. No role can be given on a provider that has no cloud account ID.
+- Edits of a cloud account are applied one at a time. A connection test and a key
+  replacement write only their own fields, so they never undo an edit made meanwhile.
+- The limit on active credentials per agent is exact under parallel requests and parallel
+  approvals.
 - The connection test of an `sts` account checks the AccessKey (`GetCallerIdentity`) and then
   assumes the role once for 15 minutes with a policy that allows nothing useful.
-- A path that matches no route answers 404 for every method. Under `/api/v1/agent/`,
+- A path under `/api/` that matches no route answers 404 for every method. Under `/api/v1/agent/`,
   `/api/v1/me/` and `/api/v1/supervisor/` the caller is authenticated first, so without a
   valid credential the answer is 401 whatever the path.
 - Still in force from §1–§16: the file layout and configuration (§1), envelopes and error

@@ -316,6 +316,12 @@ func (s *Server) handleListMyAgents(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, "list agents", err)
 		return
 	}
+	for i := range agents {
+		if agents[i], err = s.withLiveLimits(r.Context(), agents[i]); err != nil {
+			s.internalError(w, "read settings", err)
+			return
+		}
+	}
 	writeList(s, w, http.StatusOK, agents, len(agents))
 }
 

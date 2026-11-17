@@ -102,10 +102,17 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   fails; limits are the supervisor's current settings, not a copy made at agent sign-in; an
   agent without an owner is refused everywhere; every role write re-checks the person's
   agents; the connection test also assumes the role; the console wizard, QUICKSTART and the
-  access templates share one role policy (tested); the demo script deletes only demo
-  directories. Found on the way: the STS client read the AssumeRole credential from the top
+  access templates share one role policy (tested). Found on the way: the STS client read the AssumeRole credential from the top
   level of the response, but Alibaba Cloud nests it under `Credentials`, so real mode could
   never have issued anything. Fixed; still unverified against a live account.
+- **Second review round, of dfb2b7a (2026-11-16):** rejected with two blockers and five
+  majors, all fixed: recovery now works on a v0.1 directory that never stored a secret, and
+  the upgrade is recorded whichever command runs first; the demo script deletes a directory
+  only when it really is inside `.demo/` (symlinks and ".." resolved); cloud-account edits
+  are serialized and a connection test or key replacement writes only its own fields;
+  giving an account its ID and removing its old roles is one transaction; approvals hold
+  the agent's lock, so parallel approvals cannot exceed the limit; startup and recovery
+  revocations name the agent and owner. Awaiting the third round.
 - **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
   for everything except adding a cloud account, which stays console-only; (2) remote MCP over
   HTTPS with OAuth-style sign-in so an agent connects with just a URL.

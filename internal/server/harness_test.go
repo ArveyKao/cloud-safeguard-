@@ -60,6 +60,9 @@ type fakeMinter struct {
 	// use it to change control-plane state between the authorization checks and
 	// the final activation write, reproducing a concurrent revoke or demotion.
 	onMint func(req provider.MintRequest)
+	// onTest runs at the start of Test without the lock held: a connection
+	// test in flight.
+	onTest func()
 }
 
 func (m *fakeMinter) Mint(ctx context.Context, req provider.MintRequest) (model.Credential, error) {
@@ -89,6 +92,12 @@ func (m *fakeMinter) Mint(ctx context.Context, req provider.MintRequest) (model.
 }
 
 func (m *fakeMinter) Test(ctx context.Context, req provider.MintRequest) error {
+	m.mu.Lock()
+	hook := m.onTest
+	m.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.fail

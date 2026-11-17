@@ -58,6 +58,9 @@ var (
 // the broker AccessKey and a per-lease inline policy.
 type stsMinter struct{}
 
+// STSMaxPolicyLength is the longest session policy AssumeRole accepts.
+const STSMaxPolicyLength = 2048
+
 // assumeRoleResponse is the JSON body of a successful AssumeRole call. The
 // credential is nested under "Credentials", next to "AssumedRoleUser" and
 // "RequestId".
@@ -96,6 +99,11 @@ func (stsMinter) Mint(ctx context.Context, req MintRequest) (model.Credential, e
 	}
 	if !json.Valid(req.PolicyJSON) {
 		return model.Credential{}, fmt.Errorf("provider sts: policy is not valid JSON")
+	}
+	// Alibaba Cloud refuses a session policy longer than 2048 characters.
+	// Refuse it here with a clear message instead of a cloud error.
+	if n := len(compactJSON(req.PolicyJSON)); n > STSMaxPolicyLength {
+		return model.Credential{}, fmt.Errorf("provider sts: the policy is %d characters; the limit is %d", n, STSMaxPolicyLength)
 	}
 
 	now := time.Now().UTC()
