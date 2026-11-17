@@ -85,16 +85,18 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, err error) 
 	// someone else: Init then creates nothing, so its cleanup can only
 	// remove files it made itself.
 	keyPresent := pathExists(keyPath)
-	dbPresent := pathExists(dbPath) || pathExists(dbPath+"-wal") || pathExists(dbPath+"-shm")
+	dbFilePresent := pathExists(dbPath)
+	// A -wal or -shm file without the database is what is left of one.
+	dbPresent := dbFilePresent || pathExists(dbPath+"-wal") || pathExists(dbPath+"-shm")
 	switch {
-	case keyPresent && dbPresent:
+	case keyPresent && dbFilePresent:
 		return InitResult{}, fmt.Errorf(
 			"data directory %q is already initialized; refusing to touch it (`csg serve` upgrades it, and `csg supervisor recover` issues a new setup code)",
 			dir)
 	case keyPresent:
 		return InitResult{}, fmt.Errorf(
-			"data directory %q holds a master.key but no database: it is the remains of an interrupted setup or of a lost database; refusing to touch it. Restore %s, or remove master.key if nothing was ever stored with it, then run csg init again",
-			dir, store.DBFileName)
+			"data directory %q holds a master.key but no database: it is the remains of an interrupted setup or of a lost database; refusing to touch it. Restore %s, or remove master.key (and any %s-wal or -shm file) if nothing was ever stored with it, then run csg init again",
+			dir, store.DBFileName, store.DBFileName)
 	case dbPresent:
 		return InitResult{}, fmt.Errorf(
 			"data directory %q holds a database (or its -wal/-shm files) but no master.key; refusing to touch it. Restore master.key (or set CSG_MASTER_KEY); without the key the stored secrets cannot be read",
@@ -305,7 +307,8 @@ func auditMigrationReport(ctx context.Context, db *store.DB) error {
 	if err := json.Unmarshal(raw, &metadata); err != nil {
 		return fmt.Errorf("decode migration report: %w", err)
 	}
-	if err := db.AppendAudit(ctx, &model.AuditEvent{
+	// The event and "the report is recorded" are one transaction.
+	return db.RecordMigrationAudit(ctx, &model.AuditEvent{
 		ActorType:  "system",
 		ActorID:    "system",
 		ActorName:  model.ProductName,
@@ -315,11 +318,7 @@ func auditMigrationReport(ctx context.Context, db *store.DB) error {
 		TargetType: "store",
 		TargetID:   "schema",
 		Metadata:   metadata,
-	}); err != nil {
-		return err
-	}
-	// Recorded: the store need not keep it any longer.
-	return db.ClearMigrationReport(ctx)
+	})
 }
 
 // bootstrapHook runs just before the first supervisor is created; tests
@@ -374,8 +373,13 @@ type RecoverOptions struct {
 	DataDir string
 	// Username is the supervisor to restore; it is created when missing.
 	Username string
-	// MasterKey optionally overrides the master key loaded from DataDir.
+	// MasterKey optionally supplies the master key instead of DataDir's
+	// master.key or $CSG_MASTER_KEY. It must be the key the data was
+	// encrypted with.
 	MasterKey []byte
+	// TrustMasterKey accepts the supplied key for a directory that holds
+	// nothing to verify it against (see checkVaultKey).
+	TrustMasterKey bool
 }
 
 // RecoverSupervisor restores console access for a locked-out supervisor
@@ -407,12 +411,8 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 	}
 	defer db.Close()
 	// The key first: recovery is refused with a key that is not this
-	// directory's. A directory that never stored a secret has nothing to
-	// test a key against; then only the directory's own master.key is
-	// written into the key check, and a key from the environment is
-	// accepted without writing anything (holding the directory is the
-	// authority here, and nothing recovery does needs the key).
-	if err := checkVaultKey(ctx, db, v, opts.DataDir, key, false); err != nil {
+	// directory's (see checkVaultKey).
+	if err := checkVaultKey(ctx, db, v, opts.DataDir, key, opts.TrustMasterKey); err != nil {
 		return zero, err
 	}
 	// Recovery may be the first command to open an older database, which
@@ -499,36 +499,48 @@ const (
 
 var errWrongMasterKey = errors.New("server: the master key does not match this data directory")
 
-// checkVaultKey verifies key against the data directory and decides whether
-// a missing key check may be written with it.
+// checkVaultKey verifies key against the data directory. It never guesses.
 //
-// A directory that holds nothing encrypted (an install from before the key
-// check that never stored a secret) cannot tell a right key from a wrong
-// one. Writing the check with a wrong key would lock the right one out, so:
-//   - a key that equals the directory's own master.key is the right key by
-//     definition, and the check is written with it;
-//   - any other key (from $CSG_MASTER_KEY, with no master.key to compare
-//     with) is written only when trustUnanchored is set, which `csg serve`
-//     does once it is about to serve; until then nothing is written.
-//
-// A key that differs from an existing master.key never gets this far:
-// loadMasterKeyForServe refuses it.
-func checkVaultKey(ctx context.Context, db *store.DB, v *vault.Vault, dataDir string, key []byte, trustUnanchored bool) error {
+//   - Something encrypted exists (the key check, a cloud account's stored
+//     AccessKey or a TOTP secret): the key must decrypt it. A key supplied
+//     from outside wins over a master.key file that differs.
+//   - Nothing encrypted exists (an install from before the key check that
+//     never stored a secret), and the directory has a master.key: that file
+//     is the key. It is written into the key check; any other key is
+//     refused.
+//   - Nothing encrypted exists and there is no master.key: the key from the
+//     environment cannot be told from a mistyped one, and a check written
+//     with a wrong key would lock the right one out. It is refused unless
+//     the operator says to trust it (trust), which is recorded in the audit
+//     log.
+func checkVaultKey(ctx context.Context, db *store.DB, v *vault.Vault, dataDir string, key []byte, trust bool) error {
 	err := verifyVaultKey(ctx, db, v)
 	if err == nil || !errors.Is(err, errVaultKeyUnverifiable) {
 		return err
 	}
-	if !trustUnanchored && !keyIsDirectorysOwn(dataDir, key) {
-		return nil
+	stored, readErr := os.ReadFile(filepath.Join(dataDir, "master.key"))
+	switch {
+	case readErr == nil:
+		if len(stored) != len(key) || subtle.ConstantTimeCompare(stored, key) != 1 {
+			return fmt.Errorf("%w: nothing in it is encrypted yet, and the key supplied is not the one in its master.key", errWrongMasterKey)
+		}
+	case !errors.Is(readErr, fs.ErrNotExist):
+		return fmt.Errorf("server: read master key: %w", readErr)
+	case !trust:
+		return errVaultKeyUnverifiable
 	}
-	return ensureVaultKeyCheck(ctx, db, v)
-}
-
-// keyIsDirectorysOwn reports whether key is exactly the contents of the data
-// directory's master.key.
-func keyIsDirectorysOwn(dataDir string, key []byte) bool {
-	stored, err := os.ReadFile(filepath.Join(dataDir, "master.key"))
-	return err == nil && len(stored) == len(key) && subtle.ConstantTimeCompare(stored, key) == 1
+	if err := ensureVaultKeyCheck(ctx, db, v); err != nil {
+		return err
+	}
+	if readErr != nil {
+		return db.AppendAudit(ctx, &model.AuditEvent{
+			ActorType: "system", ActorID: "system", ActorName: model.ProductName,
+			Action: "vault.master_key_trusted", Status: "ok", Severity: "critical",
+			TargetType: "store", TargetID: "vault",
+			Metadata: map[string]any{"reason": "no key check and no master.key; the operator chose to trust the supplied key"},
+		})
+	}
+	return nil
 }
 
 // ensureVaultKeyCheck verifies the stored key check, or writes it when the
@@ -548,7 +560,7 @@ func ensureVaultKeyCheck(ctx context.Context, db *store.DB, v *vault.Vault) erro
 
 // errVaultKeyUnverifiable means the data directory holds nothing encrypted
 // to test a key against.
-var errVaultKeyUnverifiable = errors.New("server: cannot verify the master key: this data directory has no key check yet; start `csg serve` once with the right key")
+var errVaultKeyUnverifiable = errors.New("server: cannot verify the master key: this data directory has no key check, no master.key and nothing encrypted to test the key against. If the key in $CSG_MASTER_KEY is the right one, run this command once with --trust-master-key")
 
 // verifyVaultKey proves that v holds the master key this data directory was
 // encrypted with. It fails closed: errWrongMasterKey when a stored secret

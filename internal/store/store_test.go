@@ -1056,3 +1056,73 @@ func TestUpdateLeaseIfStatus(t *testing.T) {
 		t.Fatal("UpdateLeaseIfStatus with empty expected status = nil, want error")
 	}
 }
+
+// A report that was never written to the audit log is kept across opens,
+// and a later upgrade is merged into it instead of replacing it.
+func TestMigrationReportIsKeptAndMerged(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.MigrationReport() != nil {
+		t.Fatal("a fresh database has a migration report")
+	}
+	setVersion := func(v string) {
+		t.Helper()
+		if _, err := db.SQL().Exec(`UPDATE meta SET value = ? WHERE key = 'schema_version'`, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An upgrade from 7 that is not recorded...
+	if _, err := db.SQL().Exec(`INSERT INTO meta(key, value) VALUES('admin_token_hash', 'abc')`); err != nil {
+		t.Fatal(err)
+	}
+	setVersion("7")
+	db.Close()
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	first := db.MigrationReport()
+	if first == nil || first.FromVersion != 7 || first.ToVersion != CurrentSchemaVersion || !first.DeletedAdminToken {
+		t.Fatalf("report = %+v", first)
+	}
+	db.Close()
+	// ...survives a plain reopen...
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if again := db.MigrationReport(); again == nil || again.FromVersion != 7 || !again.DeletedAdminToken {
+		t.Fatalf("report after a reopen = %+v", again)
+	}
+	// ...and a second upgrade before it is recorded keeps what it said.
+	setVersion("7")
+	db.Close()
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	merged := db.MigrationReport()
+	if merged == nil || merged.FromVersion != 7 || merged.ToVersion != CurrentSchemaVersion || !merged.DeletedAdminToken {
+		t.Fatalf("merged report = %+v (the second upgrade deleted no admin token; the first did)", merged)
+	}
+	// Recording it forgets it, in the database too.
+	ev := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "schema.migrated", Status: "ok", Severity: "warning"}
+	if err := db.RecordMigrationAudit(ctx, &ev); err != nil {
+		t.Fatal(err)
+	}
+	if db.MigrationReport() != nil {
+		t.Fatal("the report is still there after it was recorded")
+	}
+	db.Close()
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.MigrationReport() != nil {
+		t.Fatal("the report came back after a reopen")
+	}
+	if events, _, err := db.ListAudit(ctx, AuditFilter{Action: "schema.migrated", Limit: 10}); err != nil || len(events) != 1 {
+		t.Fatalf("schema.migrated events = %d, %v", len(events), err)
+	}
+}

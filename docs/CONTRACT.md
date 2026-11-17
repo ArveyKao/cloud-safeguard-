@@ -22,7 +22,8 @@ are the wire contract).
 - Default data dir for the binary: `./data`; demo: `.demo/data`. `csg init` creates it
   with mode 0700 (best effort), database `<dataDir>/csg.db`, master key `<dataDir>/master.key`
   (0600).
-- Env vars: `CSG_MASTER_KEY` (base64 std, 32 bytes, overrides key file),
+- Env vars: `CSG_MASTER_KEY` (base64 std, 32 bytes; used instead of the key file and proved
+  against the data, see §17.7a),
   `CSG_SERVER` (CLI), `CSG_TOKEN` (CLI), `CSG_DATA_DIR` (CLI default for init/serve).
 - HTTP: loopback by default `127.0.0.1:8787`; timeouts 10 s; max request body 1 MiB; JSON
   error recovery on panics; access log lines `method path status duration_ms` (no bodies,
@@ -1040,20 +1041,26 @@ Agent CLI, same flow from a terminal:
   without an owner and clears the role and grants stored on every agent; the
   `schema.migrated` audit event says whether an admin token was deleted
   (`deleted_admin_token`, true or false) and lists the revoked agents. The report is kept
-  in the database until it has been written to the audit log, so it is recorded exactly
-  once by the first command that gets past the master-key check, `csg serve` or
-  `csg supervisor recover`, even if an earlier command ran the upgrade and then stopped.
+  in the database, written in the same transaction as each upgrade step, until it has been
+  written to the audit log; the event and forgetting the report are one transaction too. So
+  it is recorded exactly once by the first command that gets past the master-key check,
+  `csg serve` or `csg supervisor recover`, even if an earlier command ran the upgrade and
+  then stopped or was killed.
   At every start the server revokes each pending or active lease
   that is not an access request, with one `lease.revoked` event each. People sign their
   agents in again with `csg login`. An install that never had a supervisor does not start
   until `csg supervisor recover --username NAME` creates one.
-- The master key. A key given in `$CSG_MASTER_KEY` must equal the directory's `master.key`
-  when that file exists; otherwise the command is refused before anything is written. A
-  directory that never stored a secret has no key check to test a key against. Its check
-  is written with the directory's own `master.key` by the first command that opens it. If
-  the key exists only in the environment, nothing is written until `csg serve` is about to
-  serve (a supervisor exists): a mistyped key on a failed start or a recovery therefore
-  cannot become the directory's key, and recovery works with the key from the environment.
+- The master key. `csg serve` and `csg supervisor recover` only read it: from
+  `$CSG_MASTER_KEY` when that is set (a value of only spaces counts as not set), otherwise
+  from `master.key`. They never create a key. The key is then proved against the data:
+  - when something encrypted exists (the key check, a stored AccessKey, a TOTP secret) the
+    key must decrypt it, and a supplied key that does wins over a `master.key` that does not;
+  - when nothing encrypted exists (a directory from before the key check that never stored a
+    secret) and there is a `master.key`, that file is the key and the key check is written
+    with it; any other key is refused;
+  - when nothing encrypted exists and there is no `master.key`, the key cannot be told from
+    a mistyped one. The command is refused unless it is run once with `--trust-master-key`,
+    which writes the key check and a `vault.master_key_trusted` audit event.
 - Supervisors are Administrator on every cloud account (§17.1). A cloud account must be
   added with a RAM role ARN; a request without one is refused. A provider an older upgrade
   left without a cloud account ID can be given one by setting a role ARN in an account that

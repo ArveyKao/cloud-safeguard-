@@ -82,6 +82,7 @@ issues a new setup code.
 // runServe implements `csg serve`.
 func (a *App) runServe(args []string) error {
 	fs := a.newFlagSet("serve", `Usage: csg serve [--data-dir DIR] [--addr 127.0.0.1:8787] [--public-url URL] [--trusted-proxy ADDRS]
+                 [--trust-master-key]
 
 Runs the control plane (HTTP API, embedded console, mock cloud) until SIGINT or
 SIGTERM, then shuts down gracefully.
@@ -90,6 +91,7 @@ SIGTERM, then shuts down gracefully.
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address (loopback only by default)")
 	publicURL := fs.String("public-url", "", "origin people open the console at, e.g. https://csg.example.com (set it behind a TLS proxy)")
 	trustedProxy := fs.String("trusted-proxy", "", "comma-separated addresses or CIDR ranges of reverse proxies whose X-Forwarded-For is trusted")
+	trustKey := fs.Bool("trust-master-key", false, trustMasterKeyHelp)
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -101,7 +103,7 @@ SIGTERM, then shuts down gracefully.
 		return usagef("--data-dir must not be empty")
 	}
 
-	srv, err := server.New(server.Config{Addr: *addr, DataDir: *dataDir, PublicOrigin: *publicURL, TrustedProxies: strings.Split(*trustedProxy, ",")})
+	srv, err := server.New(server.Config{Addr: *addr, DataDir: *dataDir, PublicOrigin: *publicURL, TrustedProxies: strings.Split(*trustedProxy, ","), TrustMasterKey: *trustKey})
 	if err != nil {
 		return fmt.Errorf("cannot start control plane: %v", err)
 	}
@@ -143,7 +145,7 @@ func (a *App) runSupervisor(args []string) error {
 	if len(args) == 0 || args[0] != "recover" {
 		return usagef("usage: csg supervisor recover --username NAME [--data-dir DIR] [--json]")
 	}
-	fs := a.newFlagSet("supervisor recover", `Usage: csg supervisor recover --username NAME [--data-dir DIR] [--json]
+	fs := a.newFlagSet("supervisor recover", `Usage: csg supervisor recover --username NAME [--data-dir DIR] [--trust-master-key] [--json]
 
 Restores console access for a locked-out supervisor. Run it on the server
 host: it needs the data directory and its master key. The named person
@@ -155,6 +157,7 @@ at critical severity.
 `)
 	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
 	username := fs.String("username", "", "supervisor to restore (required)")
+	trustKey := fs.Bool("trust-master-key", false, trustMasterKeyHelp)
 	jsonOut := fs.Bool("json", false, "print the result as JSON")
 	positionals, err := parseFlags(fs, args[1:])
 	if err != nil {
@@ -166,7 +169,7 @@ at critical severity.
 	if strings.TrimSpace(*username) == "" {
 		return usagef("--username is required")
 	}
-	out, err := server.RecoverSupervisor(context.Background(), server.RecoverOptions{DataDir: *dataDir, Username: *username})
+	out, err := server.RecoverSupervisor(context.Background(), server.RecoverOptions{DataDir: *dataDir, Username: *username, TrustMasterKey: *trustKey})
 	if err != nil {
 		return fmt.Errorf("cannot recover supervisor: %v", err)
 	}
@@ -176,3 +179,7 @@ at critical severity.
 	a.printSetupCode("Supervisor restored", out)
 	return nil
 }
+
+// trustMasterKeyHelp describes --trust-master-key, which only matters for a
+// data directory that holds nothing to verify a key against.
+const trustMasterKeyHelp = "accept the key in $CSG_MASTER_KEY as this data directory's key when nothing can verify it (an old directory with no master.key and nothing stored); recorded in the audit log"

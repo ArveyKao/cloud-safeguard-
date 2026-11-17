@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -872,49 +873,80 @@ func TestWrongKeyCannotLockOutAnOldDirectory(t *testing.T) {
 		}
 	})
 
+	// The key exists only in the environment and the directory holds
+	// nothing to test it against: a wrong key cannot be told from the right
+	// one, so no command adopts it on its own, with or without a supervisor.
+	// The operator says once that the key is to be trusted.
 	for _, order := range []string{"serve first", "recover first"} {
 		t.Run("key only in the environment, "+order, func(t *testing.T) {
 			dir, right := emptyV01Dir(t, true)
-			// A wrong key first: with no master.key it cannot be told from
-			// the right one, so it must leave nothing behind.
-			t.Setenv("CSG_MASTER_KEY", wrong)
-			if _, err := New(Config{DataDir: dir}); !errors.Is(err, ErrNoSupervisor) {
-				t.Fatalf("serve with a wrong key = %v, want ErrNoSupervisor", err)
-			}
-			if keyCheckExists(t, dir) {
-				t.Fatal("serve wrote a key check before it had a supervisor to serve")
-			}
-			t.Setenv("CSG_MASTER_KEY", right)
-			if order == "serve first" {
-				if _, err := New(Config{DataDir: dir}); !errors.Is(err, ErrNoSupervisor) {
-					t.Fatalf("serve with the right key = %v, want ErrNoSupervisor", err)
+			refused := func(what string, err error) {
+				t.Helper()
+				if !errors.Is(err, errVaultKeyUnverifiable) || !strings.Contains(err.Error(), "--trust-master-key") {
+					t.Fatalf("%s = %v, want a refusal that names --trust-master-key", what, err)
+				}
+				if keyCheckExists(t, dir) {
+					t.Fatalf("%s wrote a key check", what)
 				}
 			}
-			out, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"})
-			if err != nil || out.SetupCode == "" {
-				t.Fatalf("recover with the right key: %v", err)
+			for _, key := range []string{wrong, right} {
+				t.Setenv("CSG_MASTER_KEY", key)
+				_, err := New(Config{DataDir: dir})
+				refused("serve without trust", err)
+				_, err = RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"})
+				refused("recover without trust", err)
 			}
-			if keyCheckExists(t, dir) {
-				t.Fatal("recovery wrote a key check with a key it cannot verify")
+			if _, err := os.Lstat(filepath.Join(dir, "master.key")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("a refused command created master.key: %v", err)
 			}
+
+			t.Setenv("CSG_MASTER_KEY", right)
+			if order == "serve first" {
+				// Trusted: the check is written, then it refuses for want of
+				// a supervisor.
+				if _, err := New(Config{DataDir: dir, TrustMasterKey: true}); !errors.Is(err, ErrNoSupervisor) {
+					t.Fatalf("trusted serve = %v, want ErrNoSupervisor", err)
+				}
+				if !keyCheckExists(t, dir) {
+					t.Fatal("trusted serve wrote no key check")
+				}
+				if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"}); err != nil {
+					t.Fatalf("recover after the key was trusted: %v", err)
+				}
+			} else {
+				if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root", TrustMasterKey: true}); err != nil {
+					t.Fatalf("trusted recover: %v", err)
+				}
+				if !keyCheckExists(t, dir) {
+					t.Fatal("trusted recover wrote no key check")
+				}
+			}
+			// From here the key is verifiable: a typo is refused by serve and
+			// by recover, with or without the trust option, and the right
+			// key needs no option.
+			t.Setenv("CSG_MASTER_KEY", wrong)
+			for _, trust := range []bool{false, true} {
+				if _, err := New(Config{DataDir: dir, TrustMasterKey: trust}); !errors.Is(err, errWrongMasterKey) {
+					t.Fatalf("serve with a wrong key (trust %v) = %v", trust, err)
+				}
+				if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root", TrustMasterKey: trust}); !errors.Is(err, errWrongMasterKey) {
+					t.Fatalf("recover with a wrong key (trust %v) = %v", trust, err)
+				}
+			}
+			t.Setenv("CSG_MASTER_KEY", right)
 			srv, err := New(Config{DataDir: dir})
 			if err != nil {
-				t.Fatalf("serve after recovery: %v", err)
+				t.Fatalf("serve with the right key: %v", err)
 			}
+			defer srv.Close()
 			if migrated := srv.listAuditFor(t, "schema.migrated"); len(migrated) != 1 || migrated[0].Metadata["deleted_admin_token"] != true {
 				t.Fatalf("schema.migrated = %+v", migrated)
 			}
-			srv.Close()
-			// Serving took the key as the directory's: now a wrong one is refused.
-			if !keyCheckExists(t, dir) {
-				t.Fatal("serving wrote no key check")
+			if trusted := srv.listAuditFor(t, "vault.master_key_trusted"); len(trusted) != 1 || trusted[0].Severity != "critical" {
+				t.Fatalf("vault.master_key_trusted events = %+v", trusted)
 			}
-			t.Setenv("CSG_MASTER_KEY", wrong)
-			if _, err := New(Config{DataDir: dir}); !errors.Is(err, errWrongMasterKey) {
-				t.Fatalf("serve with a wrong key after the check exists = %v", err)
-			}
-			if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "root"}); !errors.Is(err, errWrongMasterKey) {
-				t.Fatalf("recover with a wrong key after the check exists = %v", err)
+			if res, err := srv.db.VerifyAudit(ctx); err != nil || !res.OK {
+				t.Fatalf("audit chain = %+v, %v", res, err)
 			}
 		})
 	}
@@ -997,5 +1029,180 @@ func TestOwnerRevocationNamesTheOwner(t *testing.T) {
 	if m["caused_by"] != "person:"+a.mei.person.ID || m["caused_by_username"] != "mei" || m["cause"] != "owner_revoked" ||
 		m["agent_id"] != a.agent.ID || m["owner_id"] != a.mei.person.ID {
 		t.Fatalf("owner revocation metadata = %+v", m)
+	}
+}
+
+// ---- regression tests for the fourth review round (commit c6a744a) ----
+
+// Loading the key never creates one. A whitespace-only $CSG_MASTER_KEY is
+// "not set"; an unusable one is an error; neither leaves a master.key behind,
+// in an initialized directory or an empty one.
+func TestLoadingTheKeyNeverCreatesOne(t *testing.T) {
+	ctx := context.Background()
+	noKeyFile := func(dir, when string) {
+		t.Helper()
+		if _, err := os.Lstat(filepath.Join(dir, "master.key")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s: master.key exists (%v)", when, err)
+		}
+	}
+	// An install whose key lives only in the environment.
+	right := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	t.Setenv("CSG_MASTER_KEY", right)
+	dir := t.TempDir()
+	if _, err := Init(ctx, InitOptions{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	noKeyFile(dir, "after init with the key in the environment")
+
+	for _, env := range []string{" ", "\t\n", "not-base64!!", "c2hvcnQ="} {
+		t.Setenv("CSG_MASTER_KEY", env)
+		if srv, err := New(Config{DataDir: dir}); err == nil {
+			srv.Close()
+			t.Fatalf("serve started with CSG_MASTER_KEY=%q", env)
+		}
+		if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "admin"}); err == nil {
+			t.Fatalf("recover ran with CSG_MASTER_KEY=%q", env)
+		}
+		noKeyFile(dir, "after a refused command")
+	}
+	// The right key still works afterwards.
+	t.Setenv("CSG_MASTER_KEY", right)
+	srv, err := New(Config{DataDir: dir})
+	if err != nil {
+		t.Fatalf("serve with the right key after the refused commands: %v", err)
+	}
+	srv.Close()
+
+	// A directory that was never initialized stays empty, so csg init can
+	// still be run on it.
+	empty := t.TempDir()
+	for _, env := range []string{"", " "} {
+		t.Setenv("CSG_MASTER_KEY", env)
+		if _, err := New(Config{DataDir: empty}); !errors.Is(err, ErrNotInitialized) {
+			t.Fatalf("serve on an empty directory (CSG_MASTER_KEY=%q) = %v", env, err)
+		}
+		if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: empty, Username: "admin"}); !errors.Is(err, ErrNotInitialized) {
+			t.Fatalf("recover on an empty directory (CSG_MASTER_KEY=%q) = %v", env, err)
+		}
+	}
+	if entries, _ := os.ReadDir(empty); len(entries) != 0 {
+		t.Fatalf("a refused command left %d files in an empty directory", len(entries))
+	}
+	t.Setenv("CSG_MASTER_KEY", "")
+	if _, err := Init(ctx, InitOptions{DataDir: empty}); err != nil {
+		t.Fatalf("init after the refused commands: %v", err)
+	}
+}
+
+// A supplied key that the data proves right wins over a master.key file
+// that is not this data's key (a database restored next to another key). A
+// supplied key the data proves wrong is refused, whatever the file says.
+func TestSuppliedKeyIsProvedAgainstTheDataNotTheFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if _, err := Init(ctx, InitOptions{DataDir: dir, Demo: true}); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, "master.key")
+	right, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := bytes.Repeat([]byte{3}, 32)
+	if err := os.WriteFile(keyPath, stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The stale file alone is the wrong key.
+	if _, err := New(Config{DataDir: dir}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("serve with a stale master.key = %v", err)
+	}
+	// The right key, by configuration and by environment.
+	srv, err := New(Config{DataDir: dir, MasterKey: right})
+	if err != nil {
+		t.Fatalf("serve with the right key supplied next to a stale file: %v", err)
+	}
+	srv.Close()
+	t.Setenv("CSG_MASTER_KEY", base64.StdEncoding.EncodeToString(right))
+	if srv, err = New(Config{DataDir: dir}); err != nil {
+		t.Fatalf("serve with the right key in the environment next to a stale file: %v", err)
+	}
+	srv.Close()
+	if _, err := RecoverSupervisor(ctx, RecoverOptions{DataDir: dir, Username: "admin"}); err != nil {
+		t.Fatalf("recover with the right key in the environment next to a stale file: %v", err)
+	}
+	// The file was not touched.
+	if after, _ := os.ReadFile(keyPath); !bytes.Equal(after, stale) {
+		t.Fatal("a command rewrote master.key")
+	}
+	// A wrong supplied key is refused even when it equals the file.
+	t.Setenv("CSG_MASTER_KEY", base64.StdEncoding.EncodeToString(stale))
+	if _, err := New(Config{DataDir: dir}); !errors.Is(err, errWrongMasterKey) {
+		t.Fatalf("serve with a wrong key that equals master.key = %v", err)
+	}
+}
+
+// The upgrade's audit event and "it is recorded" are one transaction: when
+// forgetting the kept report fails, no event is written, and the next start
+// writes exactly one.
+func TestUpgradeIsRecordedExactlyOnceEvenWhenInterrupted(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if _, err := Init(ctx, InitOptions{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rawExec(t, dir, `UPDATE meta SET value = '7' WHERE key = 'schema_version'`,
+		`CREATE TRIGGER block_clear BEFORE DELETE ON meta WHEN old.key = 'pending_migration_report'
+		 BEGIN SELECT RAISE(ABORT, 'injected failure'); END`)
+	count := func() (events, pending int) {
+		raw, err := sql.Open("sqlite", filepath.Join(dir, store.DBFileName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		if err := raw.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'schema.migrated'`).Scan(&events); err != nil {
+			t.Fatal(err)
+		}
+		if err := raw.QueryRow(`SELECT COUNT(*) FROM meta WHERE key = 'pending_migration_report'`).Scan(&pending); err != nil {
+			t.Fatal(err)
+		}
+		return events, pending
+	}
+	if srv, err := New(Config{DataDir: dir}); err == nil {
+		srv.Close()
+		t.Fatal("the server started although the upgrade could not be recorded")
+	}
+	if events, pending := count(); events != 0 || pending != 1 {
+		t.Fatalf("after the interrupted start: %d events, %d kept reports; want 0, 1", events, pending)
+	}
+	rawExec(t, dir, `DROP TRIGGER block_clear`)
+	for start := 1; start <= 2; start++ {
+		srv, err := New(Config{DataDir: dir})
+		if err != nil {
+			t.Fatalf("start %d: %v", start, err)
+		}
+		srv.Close()
+		if events, pending := count(); events != 1 || pending != 0 {
+			t.Fatalf("start %d: %d events, %d kept reports; want 1, 0", start, events, pending)
+		}
+	}
+}
+
+// With only the database's -wal or -shm left next to a master.key, init
+// does not call the directory initialized: csg serve would say it is not.
+func TestInitMessageForSidecarsNextToAKey(t *testing.T) {
+	for _, name := range []string{store.DBFileName + "-wal", store.DBFileName + "-shm"} {
+		dir := t.TempDir()
+		for _, file := range []string{"master.key", name} {
+			if err := os.WriteFile(filepath.Join(dir, file), bytes.Repeat([]byte{1}, 32), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, err := Init(context.Background(), InitOptions{DataDir: dir})
+		if err == nil || strings.Contains(err.Error(), "already initialized") || !strings.Contains(err.Error(), "no database") {
+			t.Fatalf("Init with master.key and %s = %v", name, err)
+		}
+		if _, err := New(Config{DataDir: dir}); !errors.Is(err, ErrNotInitialized) {
+			t.Fatalf("serve on the same directory = %v", err)
+		}
 	}
 }

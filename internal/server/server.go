@@ -10,7 +10,7 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -20,6 +20,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,8 +57,13 @@ type Config struct {
 	Addr string
 	// DataDir holds the SQLite database, master.key and runtime files.
 	DataDir string
-	// MasterKey optionally overrides the master key loaded from DataDir.
+	// MasterKey optionally supplies the master key instead of DataDir's
+	// master.key or $CSG_MASTER_KEY. It must be the key the data was
+	// encrypted with; the data directory is checked against it.
 	MasterKey []byte
+	// TrustMasterKey accepts the supplied key for a directory that holds
+	// nothing to verify it against (see checkVaultKey).
+	TrustMasterKey bool
 	// Version overrides the reported version (default model.Version).
 	Version string
 	// MinterFactory optionally overrides provider minters (tests inject fakes).
@@ -231,11 +237,8 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	// Refuse to run with a master key other than the one this data
-	// directory was encrypted with. A directory from before the key check
-	// that never stored a secret gets its check here only when the key is
-	// its own master.key; a key from the environment is not written yet (see
-	// checkVaultKey), so a wrong one cannot lock the right one out.
-	if err := checkVaultKey(context.Background(), db, v, cfg.DataDir, key, false); err != nil {
+	// directory was encrypted with (see checkVaultKey).
+	if err := checkVaultKey(context.Background(), db, v, cfg.DataDir, key, cfg.TrustMasterKey); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -250,12 +253,6 @@ func New(cfg Config) (*Server, error) {
 	// version that had only the admin token is in this state. Refuse to run
 	// rather than serve a console nobody can enter.
 	if err := requireSupervisor(context.Background(), db, cfg.DataDir); err != nil {
-		db.Close()
-		return nil, err
-	}
-	// About to serve: a directory with no master.key and nothing encrypted
-	// takes the key it is started with as its key from now on.
-	if err := checkVaultKey(context.Background(), db, v, cfg.DataDir, key, true); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -340,47 +337,30 @@ func notInitializedErr(dataDir string) error {
 
 // loadMasterKeyForServe loads the master key without creating one.
 func loadMasterKeyForServe(cfg Config) ([]byte, error) {
-	key, err := resolveMasterKey(cfg)
-	if err != nil {
-		return nil, err
-	}
-	// A key from the configuration or the environment must be the one in
-	// the directory's master.key when that file exists. Otherwise a mistyped
-	// $CSG_MASTER_KEY could be taken for the directory's key.
-	stored, err := os.ReadFile(filepath.Join(cfg.DataDir, "master.key"))
-	switch {
-	case err == nil:
-		if len(stored) != len(key) || subtle.ConstantTimeCompare(stored, key) != 1 {
-			return nil, fmt.Errorf("%w: the key supplied is not the one in its master.key", errWrongMasterKey)
-		}
-	case !errors.Is(err, fs.ErrNotExist):
-		return nil, fmt.Errorf("server: read master key: %w", err)
-	}
-	return key, nil
-}
-
-func resolveMasterKey(cfg Config) ([]byte, error) {
+	// Read-only: this never creates a key. A key that is supplied wins over
+	// the file; checkVaultKey then proves it against the data.
 	if len(cfg.MasterKey) > 0 {
 		if len(cfg.MasterKey) != 32 {
 			return nil, vault.ErrInvalidKey
 		}
 		return append([]byte(nil), cfg.MasterKey...), nil
 	}
-	if os.Getenv("CSG_MASTER_KEY") == "" {
-		keyPath := filepath.Join(cfg.DataDir, "master.key")
-		if _, err := os.Stat(keyPath); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil, notInitializedErr(cfg.DataDir)
-			}
-			return nil, fmt.Errorf("server: stat master key: %w", err)
+	if raw := strings.TrimSpace(os.Getenv("CSG_MASTER_KEY")); raw != "" {
+		key, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(key) != 32 {
+			return nil, errors.New("server: CSG_MASTER_KEY must be 32 bytes, base64-encoded")
 		}
+		return key, nil
 	}
-	key, err := vault.LoadOrCreateKey(cfg.DataDir)
+	key, err := os.ReadFile(filepath.Join(cfg.DataDir, "master.key"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, notInitializedErr(cfg.DataDir)
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("server: read master key: %w", err)
 	}
 	if len(key) != 32 {
-		return nil, vault.ErrInvalidKey
+		return nil, fmt.Errorf("server: master.key is %d bytes: %w", len(key), vault.ErrInvalidKey)
 	}
 	return key, nil
 }

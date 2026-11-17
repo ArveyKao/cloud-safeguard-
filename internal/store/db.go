@@ -347,6 +347,14 @@ func (db *DB) applyMigrations(ctx context.Context) error {
 	if version > CurrentSchemaVersion {
 		return fmt.Errorf("store: database schema version %d is newer than supported version %d", version, CurrentSchemaVersion)
 	}
+	// A report an earlier upgrade left behind because it was never written
+	// to the audit log (a fresh database has no meta table yet).
+	var pending *MigrationReport
+	if version > 0 {
+		if pending, err = db.pendingMigrationReport(ctx); err != nil {
+			return err
+		}
+	}
 	var report *MigrationReport
 	if version > 0 && version < CurrentSchemaVersion {
 		// Only an upgrade of an existing database is reported; a fresh
@@ -378,41 +386,51 @@ func (db *DB) applyMigrations(ctx context.Context) error {
 			tx.Rollback()
 			return fmt.Errorf("store: record schema version: %w", err)
 		}
+		// The report so far is stored in the same transaction as the step it
+		// describes. It must outlive this process: the command that runs the
+		// upgrade may stop, or be killed, before it can write the audit event.
+		if report != nil {
+			raw, err := json.Marshal(mergeMigrationReports(pending, report))
+			if err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: encode migration report: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO meta(key, value) VALUES(?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaPendingMigrationReport, string(raw)); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: keep migration report: %w", err)
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("store: commit migration %d: %w", v+1, err)
 		}
 	}
-	// The report must outlive this process: the command that ran the
-	// upgrade may stop (a wrong master key, for one) before it can write the
-	// audit event. It is kept in the database until ClearMigrationReport.
-	pending, err := db.pendingMigrationReport(ctx)
-	if err != nil {
-		return err
-	}
-	switch {
-	case report != nil && pending != nil:
-		// An earlier upgrade was never recorded: one report for both.
-		report.FromVersion = pending.FromVersion
-		report.DisabledCapabilities = append(pending.DisabledCapabilities, report.DisabledCapabilities...)
-		report.Agents = append(pending.Agents, report.Agents...)
-		report.RevokedAgents = append(pending.RevokedAgents, report.RevokedAgents...)
-		report.DeletedAdminToken = report.DeletedAdminToken || pending.DeletedAdminToken
-	case report == nil:
-		report = pending
-	}
-	if report != nil {
-		raw, err := json.Marshal(report)
-		if err != nil {
-			return fmt.Errorf("store: encode migration report: %w", err)
-		}
-		if _, err := db.sql.ExecContext(ctx,
-			`INSERT INTO meta(key, value) VALUES(?, ?)
-			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaPendingMigrationReport, string(raw)); err != nil {
-			return fmt.Errorf("store: keep migration report: %w", err)
-		}
-	}
-	db.migration = report
+	db.migration = mergeMigrationReports(pending, report)
 	return nil
+}
+
+// mergeMigrationReports is one report for an earlier upgrade that was never
+// recorded (pending) followed by the one that just ran (report). Either may
+// be nil.
+func mergeMigrationReports(pending, report *MigrationReport) *MigrationReport {
+	switch {
+	case pending == nil && report == nil:
+		return nil
+	case pending == nil:
+		merged := *report
+		return &merged
+	case report == nil:
+		merged := *pending
+		return &merged
+	}
+	merged := *report
+	merged.FromVersion = pending.FromVersion
+	merged.DisabledCapabilities = append(append([]string(nil), pending.DisabledCapabilities...), report.DisabledCapabilities...)
+	merged.Agents = append(append([]AgentMigration(nil), pending.Agents...), report.Agents...)
+	merged.RevokedAgents = append(append([]string(nil), pending.RevokedAgents...), report.RevokedAgents...)
+	merged.DeletedAdminToken = pending.DeletedAdminToken || report.DeletedAdminToken
+	return &merged
 }
 
 // metaPendingMigrationReport holds the report of an upgrade that has not
@@ -435,16 +453,6 @@ func (db *DB) pendingMigrationReport(ctx context.Context) (*MigrationReport, err
 		return nil, fmt.Errorf("store: corrupt migration report: %w", err)
 	}
 	return &report, nil
-}
-
-// ClearMigrationReport forgets the kept report, once the caller has written
-// it to the audit log.
-func (db *DB) ClearMigrationReport(ctx context.Context) error {
-	if _, err := db.sql.ExecContext(ctx, `DELETE FROM meta WHERE key = ?`, metaPendingMigrationReport); err != nil {
-		return mapErr(err)
-	}
-	db.migration = nil
-	return nil
 }
 
 // schemaVersion reads the current schema version; 0 when the database is fresh.

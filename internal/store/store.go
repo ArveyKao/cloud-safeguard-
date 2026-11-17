@@ -180,7 +180,7 @@ type AgentMigration struct {
 }
 
 // MigrationReport returns what an upgrade changed and has not been written to
-// the audit log yet, or nil. It survives restarts until ClearMigrationReport.
+// the audit log yet, or nil. It survives restarts until RecordMigrationAudit.
 func (db *DB) MigrationReport() *MigrationReport { return db.migration }
 
 // DBFileName is the SQLite database file inside the data directory.

@@ -397,6 +397,7 @@ make demo
 | `404` on `/mock-cloud/` | No mock account exists (the instance was created without `--demo`). |
 | The Alibaba Cloud CLI uses an old key | Set `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` and remove the old profile. |
 | The server refuses to start after `CSG_MASTER_KEY` changed | The key does not match the data directory. Restore the original key. |
+| `cannot verify the master key … --trust-master-key` | An old directory with no `master.key` and nothing stored yet: nothing can tell the right key from a mistyped one. Check `CSG_MASTER_KEY`, then run the command once with `--trust-master-key`. |
 | Commands such as `csg providers` or `csg request` are unknown | They were removed with the admin token. Cloud accounts, people and limits are managed in the console; agents use `csg access`. |
 
 ---

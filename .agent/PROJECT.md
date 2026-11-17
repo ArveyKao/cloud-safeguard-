@@ -121,6 +121,15 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   upgrade report is now kept in the database until it is audited. Minor items fixed too
   (deterministic parallel-approval test, demo delete race, `-wal`/`-shm` remnants, owner
   revocation attribution). Awaiting the fourth round.
+- **Fourth review round, of c6a744a (2026-11-16):** the stricter key rule had its own traps
+  (a whitespace-only `$CSG_MASTER_KEY` made `csg serve` create a random `master.key`; a
+  correct key was refused next to a stale key file; an environment-only key could still be
+  adopted from a typo once a supervisor existed). Replaced by one rule: `serve` and
+  `recover` only read the key and prove it against the data; a supplied key the data proves
+  right wins over the file; a directory with nothing encrypted takes its own `master.key`;
+  with no `master.key` either, the operator must pass `--trust-master-key` once (audited).
+  The upgrade record is written in the upgrade's own transaction and audited atomically.
+  Awaiting the fifth round.
 - **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
   for everything except adding a cloud account, which stays console-only; (2) remote MCP over
   HTTPS with OAuth-style sign-in so an agent connects with just a URL.

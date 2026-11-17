@@ -85,6 +85,26 @@ func newAuditID() (string, error) {
 // AppendAudit assigns Seq/ID/Time when zero, computes the hash chain and
 // persists the event, mutating ev in place.
 func (db *DB) AppendAudit(ctx context.Context, ev *model.AuditEvent) error {
+	return db.appendAudit(ctx, ev, nil)
+}
+
+// RecordMigrationAudit appends the audit event of a schema upgrade and
+// forgets the kept migration report in the same transaction, so the upgrade
+// is recorded exactly once whatever interrupts the caller.
+func (db *DB) RecordMigrationAudit(ctx context.Context, ev *model.AuditEvent) error {
+	err := db.appendAudit(ctx, ev, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE key = ?`, metaPendingMigrationReport)
+		return err
+	})
+	if err == nil {
+		db.migration = nil
+	}
+	return err
+}
+
+// appendAudit appends ev; alongside, when not nil, runs in the same
+// transaction after the event is inserted.
+func (db *DB) appendAudit(ctx context.Context, ev *model.AuditEvent, alongside func(tx *sql.Tx) error) error {
 	if ev == nil {
 		return errors.New("store: nil audit event")
 	}
@@ -152,6 +172,12 @@ func (db *DB) AppendAudit(ctx context.Context, ev *model.AuditEvent) error {
 	); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("store: insert audit event: %w", mapErr(err))
+	}
+	if alongside != nil {
+		if err := alongside(tx); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("store: alongside audit append: %w", mapErr(err))
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit audit event: %w", err)
