@@ -148,7 +148,10 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   let a limit be raised without a code (decision and write now under one lock, same for
   roles); approvals not yet collected survived a suspend or reset (now ended, and the
   approver can withdraw one); lowering administrator → member asked for a code (fixed).
-  Awaiting the second round.
+  Second round (2026-11-17): fixed except a narrow race between adopting a provider and a
+  role change; the reviewer judged the branch fit as the base for remote MCP once that was
+  closed. Closed (account edits that change the role ARN take the role lock), plus the
+  small items. Not reviewed again.
 - **Agreed next (owner, 2026-11-14):** (1) a person sign-in for `csg` with supervisor commands
   for everything except adding a cloud account, which stays console-only; (2) remote MCP over
   HTTPS with OAuth-style sign-in so an agent connects with just a URL.

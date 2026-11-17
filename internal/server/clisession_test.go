@@ -514,47 +514,6 @@ func TestCLISessionRespectsTheSupervisorFlag(t *testing.T) {
 
 // ---- regression tests for the independent review of commit b3b8bd7 ----
 
-// Two settings changes at once, neither with a code: the limit can end up
-// lowered, never raised back above where the lowering put it.
-func TestSettingsDecisionAndWriteAreOneStep(t *testing.T) {
-	for round := 0; round < 20; round++ {
-		a := newAccessEnv(t, model.RoleMember)
-		cli := a.signInCLI(a.sup)
-		high := model.DefaultPolicySettings()
-		low := high
-		low.MaxLeaseTTLSeconds = 1800
-		start := make(chan struct{})
-		results := make(chan struct {
-			high bool
-			code int
-		}, 2)
-		for _, body := range []model.PolicySettings{high, low} {
-			go func() {
-				<-start
-				results <- struct {
-					high bool
-					code int
-				}{body.MaxLeaseTTLSeconds == high.MaxLeaseTTLSeconds, cli.do(http.MethodPut, "/api/v1/supervisor/settings", body).Code}
-			}()
-		}
-		close(start)
-		lowWritten := false
-		for i := 0; i < 2; i++ {
-			r := <-results
-			if !r.high && r.code == http.StatusOK {
-				lowWritten = true
-			}
-		}
-		got, _ := a.srv.db.GetPolicySettings(context.Background())
-		if lowWritten && got.MaxLeaseTTLSeconds != low.MaxLeaseTTLSeconds {
-			t.Fatalf("round %d: the limit went back up to %d without a code", round, got.MaxLeaseTTLSeconds)
-		}
-		if len(a.listAudit("auth.step_up")) != 0 {
-			t.Fatalf("round %d: a code was used although none was sent", round)
-		}
-	}
-}
-
 // A deterministic version: the lowering commits while the other request is
 // between its read and its write. With the lock, the second request reads
 // the lowered value and asks for a code.
@@ -662,8 +621,7 @@ func TestApprovedSignInCanBeWithdrawnBeforePickup(t *testing.T) {
 	a.requireActor(a.lastEvent("cli_signin.cancelled"), a.mei)
 	// Once collected it is a session: withdrawing is too late, ending it is
 	// done in Settings.
-	collected := a.signInCLI(a.mei)
-	_ = collected
+	a.signInCLI(a.mei) // a collected sign-in is a session, listed in Settings
 	second := a.startCLISignIn("laptop")
 	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/cli-signins/"+second.UserCode+"/approve", nil), http.StatusOK)
 	a.pollCLISignIn(second.DeviceCode)
@@ -708,4 +666,127 @@ func TestConnectingAProviderIsConsoleOnly(t *testing.T) {
 		t.Fatal("a command-line session connected a provider")
 	}
 	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+second.ID, model.UpdateProviderInput{RoleARN: &arn}), http.StatusOK)
+}
+
+// Adopting a provider removes its roles; a role change that read the role
+// before the adoption must not then write a raise without a code.
+func TestAdoptionAndARoleChangeAreSerialized(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", newMockAccount("second", "6543210987654321"))
+	requireStatus(t, rec, http.StatusCreated)
+	second := decodeEnvelope[model.Provider](t, rec)
+	// As an old upgrade leaves it: no cloud account, with a role on it.
+	a.bindDirect(a.mei.person.ID, model.RoleAdministrator) // on the demo account, for the request below
+	if _, err := a.srv.db.SQL().Exec(`INSERT INTO role_bindings(person_id, provider_id, role, created_by, created_at, updated_at)
+		VALUES(?, ?, 'administrator', '', 0, 0)`, a.mei.person.ID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.srv.db.SQL().Exec(`UPDATE providers SET cloud_account_id = '', role_arn = 'not-a-role' WHERE id = ?`, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	cli := a.signInCLI(a.sup)
+	binding := "/api/v1/supervisor/accounts/" + second.ID + "/people/" + a.mei.person.ID
+	arn := "acs:ram::7777777777777777:role/cloud-safeguard"
+
+	// The adoption holds the role lock: a role change waits for it, then
+	// sees no role and asks for a code for member.
+	a.srv.bindingsMu.Lock()
+	adopted := make(chan int, 1)
+	changed := make(chan int, 1)
+	go func() {
+		adopted <- a.sup.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+second.ID, model.UpdateProviderInput{RoleARN: &arn}).Code
+	}()
+	time.Sleep(50 * time.Millisecond)
+	a.srv.bindingsMu.Unlock()
+	if code := <-adopted; code != http.StatusOK {
+		t.Fatalf("adoption = %d", code)
+	}
+	go func() { changed <- cli.do(http.MethodPut, binding, model.PutBindingInput{Role: model.RoleMember}).Code }()
+	if code := <-changed; code != http.StatusForbidden {
+		t.Fatalf("member after the adoption removed the role, without a code = %d, want 403", code)
+	}
+	if _, err := a.srv.db.GetBinding(context.Background(), a.mei.person.ID, second.ID); err == nil {
+		t.Fatal("a role was written without a code after the adoption")
+	}
+	// The handler holds bindingsMu while it adopts: prove the lock is taken.
+	other := "acs:ram::8888888888888888:role/cloud-safeguard"
+	if _, err := a.srv.db.SQL().Exec(`UPDATE providers SET cloud_account_id = '', role_arn = 'x' WHERE id = ?`, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	a.srv.bindingsMu.Lock()
+	go func() {
+		adopted <- a.sup.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+second.ID, model.UpdateProviderInput{RoleARN: &other}).Code
+	}()
+	select {
+	case code := <-adopted:
+		a.srv.bindingsMu.Unlock()
+		t.Fatalf("the adoption did not wait for the role lock (%d)", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+	a.srv.bindingsMu.Unlock()
+	if code := <-adopted; code != http.StatusOK {
+		t.Fatalf("second adoption = %d", code)
+	}
+}
+
+// Connecting a provider from the command line is refused as console-only
+// before any code is asked for, so no code is spent on it.
+func TestAdoptionFromTheCommandLineIsRefusedBeforeTheCode(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	rec := a.sup.do(http.MethodPost, "/api/v1/supervisor/accounts", newMockAccount("second", "6543210987654321"))
+	requireStatus(t, rec, http.StatusCreated)
+	second := decodeEnvelope[model.Provider](t, rec)
+	if _, err := a.srv.db.SQL().Exec(`UPDATE providers SET cloud_account_id = '' WHERE id = ?`, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	cli := a.signInCLI(a.sup)
+	arn := "acs:ram::7777777777777777:role/cloud-safeguard"
+	requireErrorCode(t, cli.do(http.MethodPatch, "/api/v1/supervisor/accounts/"+second.ID, model.UpdateProviderInput{RoleARN: &arn}),
+		http.StatusForbidden, model.ErrCodeConsoleOnly)
+	requireErrorCode(t, cli.withCode(http.MethodPatch, "/api/v1/supervisor/accounts/"+second.ID, model.UpdateProviderInput{RoleARN: &arn}),
+		http.StatusForbidden, model.ErrCodeConsoleOnly)
+	if len(a.listAudit("auth.step_up")) != 0 {
+		t.Fatal("a code was spent on a console-only request")
+	}
+}
+
+// Giving a role to someone with none: guest is free, more needs a code.
+func TestRoleFromNothing(t *testing.T) {
+	a := newAccessEnv(t, "")
+	cli := a.signInCLI(a.sup)
+	path := "/api/v1/supervisor/accounts/" + a.providerID + "/people/" + a.mei.person.ID
+	requireErrorCode(t, cli.do(http.MethodPut, path, model.PutBindingInput{Role: model.RoleMember}), http.StatusForbidden, model.ErrCodeAuthenticatorCodeRequired)
+	if _, err := a.srv.db.GetBinding(context.Background(), a.mei.person.ID, a.providerID); err == nil {
+		t.Fatal("member was given without a code")
+	}
+	requireStatus(t, cli.do(http.MethodPut, path, model.PutBindingInput{Role: model.RoleGuest}), http.StatusOK)
+}
+
+// Local recovery ends the approvals its person gave that were not collected.
+func TestRecoveryEndsUncollectedApprovals(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	start := a.startCLISignIn("laptop")
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/me/cli-signins/"+start.UserCode+"/approve", nil), http.StatusOK)
+	if _, err := RecoverSupervisor(context.Background(), RecoverOptions{DataDir: a.dir, Username: a.sup.person.Username}); err != nil {
+		t.Fatal(err)
+	}
+	if res := a.pollCLISignIn(start.DeviceCode); res.Status == model.SignInApproved || res.Token != "" {
+		t.Fatalf("the approval survived local recovery: %+v", res)
+	}
+}
+
+// The approver can see an approval that was not collected (to withdraw it);
+// nobody else can.
+func TestApproverSeesAnUncollectedApproval(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	start := a.startCLISignIn("laptop")
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/cli-signins/"+start.UserCode+"/approve", nil), http.StatusOK)
+	rec := a.mei.do(http.MethodGet, "/api/v1/me/cli-signins/"+start.UserCode, nil)
+	requireStatus(t, rec, http.StatusOK)
+	if v := decodeEnvelope[model.CLISignIn](t, rec); v.Status != model.SignInApproved {
+		t.Fatalf("approver sees %+v", v)
+	}
+	requireStatus(t, a.sup.do(http.MethodGet, "/api/v1/me/cli-signins/"+start.UserCode, nil), http.StatusNotFound)
+	a.pollCLISignIn(start.DeviceCode) // collected
+	requireStatus(t, a.mei.do(http.MethodGet, "/api/v1/me/cli-signins/"+start.UserCode, nil), http.StatusNotFound)
 }

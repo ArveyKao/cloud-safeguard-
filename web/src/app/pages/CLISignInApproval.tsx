@@ -23,6 +23,27 @@ export function CLISignInApprovalPage({ code, person }: { code: string; person: 
   }
   const s: CLISignIn | null = signIn.data
   if (!s) return null
+  // Opened again after approving, before csg picked it up.
+  if (s.status === 'approved' && !done) {
+    return (
+      <>
+        <PageHead title="You approved this sign-in" lead="csg has not picked it up yet." />
+        <Card>
+          <dl className="facts">
+            <div><dt>Code</dt><dd className="mono">{s.user_code}</dd></div>
+            <div><dt>Client name</dt><dd>{s.client_name}</dd></div>
+            <div><dt>Started from</dt><dd className="mono">{s.remote_addr}</dd></div>
+          </dl>
+          <p className="muted small">Approved by mistake? Withdraw it now; it expires {ago(s.expires_at)} otherwise.</p>
+          <ErrorNote error={action.error} />
+          <div className="row-actions left">
+            <Button onClick={leave}>Back to Inbox</Button>
+            <Button busy={action.busy} onClick={() => action.run(async () => { await api.cancelCLISignIn(code); setDone('cancelled') })}>Withdraw approval</Button>
+          </div>
+        </Card>
+      </>
+    )
+  }
 
   if (done) {
     return (

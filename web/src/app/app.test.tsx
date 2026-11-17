@@ -175,6 +175,19 @@ describe('agent sign-in', () => {
     expect(changes().map((c) => c.path)).toEqual(['/me/cli-signins/CLI-CODE/approve', '/me/cli-signins/CLI-CODE/cancel'])
   })
 
+  it('offers to withdraw an approval when the page is opened again', async () => {
+    routes['GET /me/cli-signins/CLI-CODE'] = { user_code: 'CLI-CODE', client_name: 'laptop', status: 'approved',
+      remote_addr: '10.0.0.7', created_at: '', expires_at: new Date(Date.now() + 600_000).toISOString() }
+    routes['POST /me/cli-signins/CLI-CODE/cancel'] = { status: 'denied' }
+    const me = { id: 'per_1', username: 'mei', display_name: '', status: 'active', supervisor: false } as unknown as Person
+    wrap(<CLISignInApprovalPage code="CLI-CODE" person={me} />)
+    await screen.findByText('You approved this sign-in')
+    expect(screen.queryByRole('button', { name: 'Approve sign-in' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Withdraw approval' }))
+    await screen.findByText('Approval withdrawn')
+    expect(changes().map((c) => c.path)).toEqual(['/me/cli-signins/CLI-CODE/cancel'])
+  })
+
   it('remembers a sign-in link once, and only for ten minutes', () => {
     rememberSignIn('ABC-DEFG')
     expect(takeSignIn()).toEqual({ code: 'ABC-DEFG', kind: 'agent' })

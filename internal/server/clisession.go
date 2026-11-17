@@ -177,16 +177,30 @@ func (s *Server) pendingCLISignIn(w http.ResponseWriter, r *http.Request) (store
 	return signIn, true
 }
 
-// handleGetCLISignIn shows a pending command-line sign-in to its approver.
+// handleGetCLISignIn shows a pending command-line sign-in to whoever is
+// about to decide it, and an approved one that was not collected yet to the
+// person who approved it (so it can still be withdrawn after a reload).
 func (s *Server) handleGetCLISignIn(w http.ResponseWriter, r *http.Request) {
+	view := func(signIn store.CLISignIn, status model.SignInStatus) model.CLISignIn {
+		return model.CLISignIn{
+			UserCode: formatUserCode(signIn.UserCode), ClientName: signIn.ClientName, Status: status,
+			RemoteAddr: signIn.RemoteAddr, CreatedAt: signIn.CreatedAt, ExpiresAt: signIn.ExpiresAt,
+		}
+	}
+	if code, ok := normalizeUserCode(r.PathValue("code")); ok {
+		actor, _ := sessionFromContext(r.Context())
+		signIn, err := s.db.GetCLISignInByUserCode(r.Context(), code)
+		if err == nil && signIn.Status == model.SignInApproved && signIn.PersonID == actor.person.ID &&
+			cliSignInState(signIn, s.nowUTC()) == model.SignInApproved {
+			s.writeData(w, http.StatusOK, view(signIn, model.SignInApproved))
+			return
+		}
+	}
 	signIn, ok := s.pendingCLISignIn(w, r)
 	if !ok {
 		return
 	}
-	s.writeData(w, http.StatusOK, model.CLISignIn{
-		UserCode: formatUserCode(signIn.UserCode), ClientName: signIn.ClientName, Status: model.SignInPending,
-		RemoteAddr: signIn.RemoteAddr, CreatedAt: signIn.CreatedAt, ExpiresAt: signIn.ExpiresAt,
-	})
+	s.writeData(w, http.StatusOK, view(signIn, model.SignInPending))
 }
 
 func (s *Server) handleApproveCLISignIn(w http.ResponseWriter, r *http.Request) {

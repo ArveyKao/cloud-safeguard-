@@ -204,18 +204,19 @@ without use) and is saved in `~/.config/cloud-safeguard/person.json`, apart from
 ./build/csg me requests --status pending
 ./build/csg me deny lea_... --reason "not now"
 ./build/csg supervisor people                       # supervisors only
-./build/csg supervisor roles set demo-aliyun mei member
+./build/csg supervisor roles set demo-aliyun mei administrator    # mei is a guest or member now
 #  → "this change raises access: run it again with --code …"
-./build/csg supervisor roles set demo-aliyun mei member --code 123456
+./build/csg supervisor roles set demo-aliyun mei administrator --code 123456
 ```
 
 Agents often run on the same machine and could read that file, so the session is guarded:
 
 - reading, and anything that lowers access (deny, revoke, lower a role or remove it,
   suspend, disable an account, set your mode to read), works as is;
-- anything that raises access (add or reset a person, make a supervisor, give a role above
-  guest, enable or reconfigure an account, replace its AccessKey, raise a level or a limit,
-  set your mode above read) needs a fresh code from your authenticator app. In a terminal
+- anything that raises access (add or reset a person, make a supervisor, give a role higher
+  than the person has now, enable or reconfigure an account, replace its AccessKey, raise a
+  level or a limit, set your mode above read) needs a fresh code from your authenticator
+  app. Giving guest to someone with no role needs none. In a terminal
   csg asks for it; otherwise pass `--code`. Wrong codes count towards the sign-in lockout;
 - approving requests and sign-ins, and adding a cloud account, work in the console only.
 

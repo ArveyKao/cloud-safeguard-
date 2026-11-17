@@ -163,6 +163,23 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, "invalid request body: "+err.Error())
 		return
 	}
+	if in.RoleARN != nil {
+		// A new role ARN can connect a provider that has no cloud account
+		// yet, which removes the roles set on it. Role changes decide on the
+		// role a person has now (see bindingsMu), so none may run meanwhile.
+		// Lock order: bindingsMu, then a person's lock, then accountsMu.
+		s.bindingsMu.Lock()
+		defer s.bindingsMu.Unlock()
+		// Connecting a provider to its first cloud account is adding one:
+		// refused from the command line before any code is asked for.
+		if isCLIRequest(r) {
+			if prov, err := s.db.GetProvider(r.Context(), r.PathValue("id")); err == nil && prov.CloudAccountID == "" {
+				s.writeError(w, http.StatusForbidden, model.ErrCodeConsoleOnly,
+					"connecting a provider to a cloud account can only be done in the console, never from the command line")
+				return
+			}
+		}
+	}
 	// Only disabling or renaming lowers nothing else; any other change of a
 	// cloud account (its role, its region, enabling it) may raise access.
 	if in.RoleARN != nil || in.Region != nil || (in.Status != nil && *in.Status != model.ProviderDisabled) {
@@ -218,8 +235,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			s.badRequest(w, "role_arn must be a RAM role ARN such as acs:ram::1234567890123456:role/cloud-safeguard")
 			return
 		case prov.CloudAccountID == "" && isCLIRequest(r):
-			// Giving a provider its first cloud account makes a new account
-			// usable: that is adding a cloud account, done in the console.
+			// Checked before the code too; repeated here under the lock.
 			s.writeError(w, http.StatusForbidden, model.ErrCodeConsoleOnly,
 				"connecting a provider to a cloud account can only be done in the console, never from the command line")
 			return
