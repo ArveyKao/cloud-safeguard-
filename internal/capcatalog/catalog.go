@@ -249,7 +249,7 @@ func RenderPolicy(cap model.Capability, params map[string]string) ([]byte, error
 	if err := CheckPolicy(cap.Access, rendered); err != nil {
 		return nil, err
 	}
-	withDeny, err := appendDenyStatement(rendered)
+	withDeny, err := appendDenyStatement(rendered, DenyStatementFor(cap.ProviderType))
 	if err != nil {
 		return nil, fmt.Errorf("policy template of capability %s cannot carry the mandatory deny statement: %v", cap.ID, err)
 	}

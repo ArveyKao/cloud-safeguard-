@@ -174,7 +174,7 @@ type Server struct {
 
 // defaultMinterFactory resolves the real provider minters.
 func defaultMinterFactory(p model.Provider) (provider.Minter, error) {
-	return provider.New(p.Mode)
+	return provider.NewFor(p.Type, p.Mode)
 }
 
 // New opens the store, loads the vault and builds the HTTP handler. It does not

@@ -51,6 +51,7 @@ type handler struct {
 	signingKey []byte
 	now        func() time.Time
 	state      *cloudState
+	s3         *s3State
 }
 
 // authContext is the validated identity behind one mock-cloud request.
@@ -86,6 +87,7 @@ func NewHandler(deps Deps) http.Handler {
 		signingKey: deps.SigningKey,
 		now:        time.Now,
 		state:      newCloudState(),
+		s3:         newS3State(),
 	}
 
 	mux := http.NewServeMux()
@@ -159,6 +161,7 @@ func NewHandler(deps Deps) http.Handler {
 		resource: func(_ *http.Request, _ *authContext) string { return "*" },
 		handle:   handleRAMListUsers,
 	}))
+	h.registerAWS(mux)
 	mux.HandleFunc("/", h.handleUnknownRoute)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

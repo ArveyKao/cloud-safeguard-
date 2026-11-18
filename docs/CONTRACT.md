@@ -1289,17 +1289,38 @@ one rule per cloud account, which only that person sets.
   `External` mode), refreshing first when the key has less than 5 minutes left, so a
   long-running SDK keeps itself supplied within the window.
 
-### 17.13 AWS (decided 2026-11-17, not built yet)
+### 17.13 AWS (decided and implemented 2026-11-17)
 
 - A cloud account of type `aws` is reached the same way as Alibaba Cloud: one broker identity
   that can only call `sts:AssumeRole` on one role (for example `csg-access`), and every key is
   `AssumeRole` with a session policy rendered from a fixed read/write/full template, so the
   key can do only what both the role and the session policy allow. No users, policies or keys
   are created per request.
-- The role should allow everything agents may ever need there and no IAM; the console
-  recommends AWS `PowerUserAccess` (and for Alibaba Cloud `AdministratorAccess` with an
-  explicit deny of `ram:*` and `sts:*`). The connection test warns when the role allows IAM.
-- First resource type: `s3` (bucket; objects are items). `resource_name` is the bucket name.
+- The role allows exactly what the templates can ask for and denies `iam:*`,
+  `organizations:*` and `sts:AssumeRole`; the console and QUICKSTART §2.9 show it, and a test
+  keeps it in step with the templates. Not `AdministratorAccess` or `PowerUserAccess`: the
+  broker key could reach everything they allow. The connection test calls
+  `GetCallerIdentity`, assumes the role once with a policy that allows nothing useful, and
+  once more with a policy that allows only `iam:GetAccountSummary`; if that call succeeds,
+  the role allows IAM and the test passes with a warning (`warning` in the result, audited).
+- First resource type: `s3` (bucket; objects are items). `resource_name` is the bucket name
+  (3-63 lowercase letters, digits, dots and dashes). read = `s3:Get*`, `s3:List*`; write adds
+  `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload`; full adds `s3:CreateBucket`,
+  `s3:DeleteBucket`. Bucket policies, ACLs and ownership are in no template.
+- Policies use version `2012-10-17` and the resources `arn:aws:s3:::BUCKET` and
+  `arn:aws:s3:::BUCKET/*`. Every session policy also carries
+  `{"Effect":"Deny","Action":["iam:*","organizations:*","sso:*","sso-directory:*","identitystore:*","sts:AssumeRole*","sts:GetFederationToken","sts:GetSessionToken"],"Resource":"*"}`,
+  and the IAM guard refuses the identity services of every cloud (RAM, IAM, Organizations,
+  Identity Center) in any capability.
+- STS is called at the account's region (`sts.REGION.amazonaws.com`, `us-east-1` by default),
+  signed with Signature Version 4; validity 900 s to the role's maximum session duration.
+  The account ID is the 12 digits of the role ARN (`arn:aws:iam::ACCOUNT:role/NAME`).
+- The credential is handed over as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN`, `AWS_REGION` and `AWS_DEFAULT_REGION` (plus `CSG_*`), in the
+  envelope, `--export`, `csg exec`, the MCP credential file and the one-time link.
+- Mock mode: the mock cloud serves `GET /v1/s3/buckets/{bucket}/objects`, `GET|PUT|DELETE
+  /v1/s3/buckets/{bucket}/objects/{key}` and `GET /v1/iam/users` (always refused), with the
+  fixture bucket `claudecode`.
 - The broker identity may later come from the platform instead of a stored key (instance
   role, OIDC federation); the agent side does not change.
 
@@ -1342,7 +1363,8 @@ create a cloud user with an access key for them, under strict control.
 | Person sign-in for `csg` with guarded sessions (§17.9) | implemented, schema version 9 |
 | Remote MCP over HTTPS with OAuth sign-in (§17.10) | done; tried with Claude Code 2.1.221 (sign-in, tools, credential link) |
 | Approval mode per cloud account (§17.11), refresh (§17.12) | implemented, schema version 11 |
-| AWS (§17.13), long-lived credentials (§17.14) | decided, not built |
+| AWS (§17.13) | implemented with S3; tested against a fake STS and in mock mode, not against live AWS |
+| Long-lived credentials (§17.14) | decided, not built |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
 | Console redesign (sign-in, Inbox, Agents, Cloud accounts, Activity, People, Settings) | implemented; the admin-token console is removed |

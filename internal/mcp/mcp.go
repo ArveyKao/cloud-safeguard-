@@ -116,7 +116,7 @@ func (s *Server) Tools() []Tool {
 				"then tell the user and call check_status later. You can never get IAM or RAM management.",
 			InputSchema: schema([]string{"cloud_account_id", "resource", "permission", "ttl_seconds"}, map[string]any{
 				"cloud_account_id": str("Cloud account ID, from list_accounts."),
-				"resource":         str("Resource type, from list_accounts (for example ecs, dns, oss)."),
+				"resource":         str("Resource type, from list_accounts (for example ecs, dns, oss on Alibaba Cloud, s3 on AWS)."),
 				"permission":       map[string]any{"type": "string", "enum": []string{"read", "write", "full"}},
 				"ttl_seconds":      map[string]any{"type": "integer", "minimum": 1, "description": "How long one key stays valid. Ask for no more than the task needs; refresh_credential gives a new key later."},
 				"max_lifetime_seconds": map[string]any{"type": "integer", "minimum": 1,

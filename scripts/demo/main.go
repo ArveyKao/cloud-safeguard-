@@ -1,11 +1,11 @@
-// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S12)
+// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S13)
 // against a running control plane in mock mode. scripts/demo.sh builds csg,
 // bootstraps a throwaway data directory, starts the server and runs this.
 //
 // People act through the same HTTP API the console uses (setup, sign-in with
 // an authenticator code, approvals); the agent acts through the real csg
 // binary. No secret is printed: setup codes, passwords, tokens and
-// credentials stay in memory, and S12 checks that none of them reached the
+// credentials stay in memory, and S13 checks that none of them reached the
 // server log or this program's own output.
 package main
 
@@ -90,7 +90,8 @@ func main() {
 		{"S9 a supervisor on the command line: raising access needs a code, approving stays in the console", d.s9person},
 		{"S10 an MCP client connects by URL: the owner approves in the console, the credential reaches a shell through a one-time link", d.s10remote},
 		{"S11 approval mode per account, and a credential refreshed under the same request", d.s11modeRefresh},
-		{"S12 audit chain verifies and no secret leaked", d.s9},
+		{"S12 an AWS account: read on one S3 bucket lists and reads it, never writes, never reaches IAM", d.s12aws},
+		{"S13 audit chain verifies and no secret leaked", d.s9},
 	}
 	failed := 0
 	for _, s := range scenarios {
@@ -107,7 +108,7 @@ func main() {
 	}
 }
 
-// say prints and remembers what was printed, for the leak check in S12.
+// say prints and remembers what was printed, for the leak check in S13.
 func (d *demo) say(format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
 	d.printed.WriteString(text)
@@ -816,6 +817,74 @@ func (d *demo) s11modeRefresh() error {
 		return err
 	}
 	return d.bind(model.RoleGuest)
+}
+
+func (d *demo) s12aws() error {
+	var settings model.PolicySettings
+	if err := d.must(d.sup, http.MethodGet, "/api/v1/supervisor/settings", nil, &settings, http.StatusOK); err != nil {
+		return err
+	}
+	raised := settings
+	raised.LeasesPerMinutePerAgent = 60
+	if err := d.must(d.sup, http.MethodPut, "/api/v1/supervisor/settings", raised, nil, http.StatusOK); err != nil {
+		return err
+	}
+	defer func() { _ = d.must(d.sup, http.MethodPut, "/api/v1/supervisor/settings", settings, nil, http.StatusOK) }()
+
+	const awsAccount = "123456789012"
+	var prov model.Provider
+	if err := d.must(d.sup, http.MethodPost, "/api/v1/supervisor/accounts", model.CreateProviderInput{
+		Name: "demo-aws", Type: model.ProviderAWS, Mode: model.ModeMock, Region: "us-east-1",
+		RoleARN: "arn:aws:iam::" + awsAccount + ":role/cloud-safeguard"}, &prov, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := d.must(d.sup, http.MethodPut, "/api/v1/supervisor/accounts/"+prov.ID+"/people/"+d.mei.id,
+		model.PutBindingInput{Role: model.RoleMember}, nil, http.StatusOK); err != nil {
+		return err
+	}
+	stdout, stderr, code := d.agent(nil, "access", "request", "--account", awsAccount, "--resource", "s3", "--name", "claudecode",
+		"--permission", "read", "--ttl", "10m", "--json")
+	var read model.AccessRequest
+	if code != 0 || json.Unmarshal([]byte(stdout), &read) != nil || read.Status != model.LeaseActive {
+		return fmt.Errorf("s3 read request exit %d: %s", code, firstLine(stderr))
+	}
+	// The credential comes as the AWS variables.
+	exports, _, code := d.agent(nil, "credential", "--lease", read.ID, "--export")
+	if code != 0 || !strings.Contains(exports, "export AWS_ACCESS_KEY_ID=") || !strings.Contains(exports, "export AWS_SESSION_TOKEN=") ||
+		strings.Contains(exports, "ALIBABA_CLOUD") {
+		return errors.New("the AWS credential did not come as AWS_ variables")
+	}
+	token, err := d.credentialToken(read.ID)
+	if err != nil {
+		return err
+	}
+	s3 := func(args ...string) (string, int) {
+		out, errOut, code := d.agent([]string{"CSG_SERVER=" + d.server, "AWS_SESSION_TOKEN=" + token}, append([]string{"mock", "request"}, args...)...)
+		return out + errOut, code
+	}
+	if out, code := s3("GET", "/v1/s3/buckets/claudecode/objects"); code != 0 || !strings.Contains(out, "notes/plan.txt") {
+		return fmt.Errorf("listing claudecode failed: %s", firstLine(out))
+	}
+	if out, code := s3("GET", "/v1/s3/buckets/claudecode/objects/README.md"); code != 0 {
+		return fmt.Errorf("reading an object failed: %s", firstLine(out))
+	}
+	for _, c := range [][]string{
+		{"PUT", "/v1/s3/buckets/claudecode/objects/new.txt", `{"Body":"x"}`},
+		{"GET", "/v1/s3/buckets/other-team-bucket/objects"},
+		{"GET", "/v1/iam/users"},
+	} {
+		if out, code := s3(c...); code == 0 || !strings.Contains(out, "Forbidden") {
+			return fmt.Errorf("a read key on claudecode was allowed %s %s", c[0], c[1])
+		}
+	}
+	if _, errOut, code := d.agent(nil, "revoke", "--lease", read.ID); code != 0 {
+		return fmt.Errorf("csg revoke exit %d: %s", code, firstLine(errOut))
+	}
+	if out, code := s3("GET", "/v1/s3/buckets/claudecode/objects"); code == 0 || !strings.Contains(out, "InvalidSecurityToken") {
+		return errors.New("a revoked AWS key still works")
+	}
+	d.say("      an AWS account (mock): read on bucket claudecode listed and read it; writing, another bucket and IAM were refused\n")
+	return nil
 }
 
 func (d *demo) s10remote() error {

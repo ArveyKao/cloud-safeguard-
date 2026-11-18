@@ -153,6 +153,29 @@ var resourceSpecs = []resourceSpec{
 		write:       []string{"oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
 		full:        []string{"oss:PutBucket", "oss:DeleteBucket"},
 	},
+	{
+		provider: model.ProviderAWS,
+		resource: "s3",
+		title:    "S3 buckets",
+		service:  "s3",
+		// The bucket for bucket actions, its objects for object actions.
+		resources:   []string{"arn:aws:s3:::{{resource_name}}", "arn:aws:s3:::{{resource_name}}/*"},
+		namePattern: `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`,
+		nameHint:    "a bucket name such as claudecode",
+		read:        []string{"s3:Get*", "s3:List*"},
+		// Bucket policies, ACLs and ownership are deliberately absent: they
+		// can open a bucket to other accounts or to everyone.
+		write: []string{"s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
+		full:  []string{"s3:CreateBucket", "s3:DeleteBucket"},
+	},
+}
+
+// policyVersion is the policy language version of a cloud.
+func policyVersion(provider model.ProviderType) string {
+	if provider == model.ProviderAWS {
+		return "2012-10-17"
+	}
+	return "1"
 }
 
 // writeActions is the classification table: every action that counts as
@@ -220,7 +243,7 @@ func buildAccessTemplates() map[string]AccessTemplate {
 				actions = append(actions, spec.full...)
 			}
 			doc := map[string]any{
-				"Version": "1",
+				"Version": policyVersion(spec.provider),
 				"Statement": []any{map[string]any{
 					"Effect": "Allow", "Action": actions, "Resource": spec.resources,
 				}},

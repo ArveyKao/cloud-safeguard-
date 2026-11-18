@@ -263,10 +263,10 @@ End it with `csg person logout`, or from the console in **Settings → Command-l
 make demo
 ```
 
-It starts its own instance on port 18787 and runs twelve scenarios end to end (setup, agent
+It starts its own instance on port 18787 and runs thirteen scenarios end to end (setup, agent
 sign-in, automatic read, least privilege, denial, approval, revocation on a role change,
 the supervisor's emergency stop, a supervisor on the command line, remote MCP, approval
-mode per account with refresh, audit and a secret-leak check), then prints `all S1-S12 scenarios passed`.
+mode per account with refresh, an AWS account, audit and a secret-leak check), then prints `all S1-S13 scenarios passed`.
 
 ## 1.15 Clean up
 
@@ -430,6 +430,74 @@ their deadline; no agent or script changes.
   tighten the role's policy ([SECURITY.md](SECURITY.md)).
 - **The session name is `csg-<agent id>-<request id>`.** Filter ActionTrail by it to match
   cloud actions to a request.
+
+## 2.9 An AWS account
+
+> ⚠️ Not yet run against a live AWS account. The STS calls are tested against a fake
+> endpoint. References: [AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
+> (the session policy intersects the role's policy),
+> [session policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html#policies_session).
+
+The same shape as Alibaba Cloud, in IAM. The console's **Add cloud account → AWS** shows
+these with your 12-digit account ID filled in.
+
+1. An IAM user `cloud-safeguard-broker` with an access key, whose only permission is:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::<account-id>:role/cloud-safeguard" }
+  ]
+}
+```
+
+2. An IAM role `cloud-safeguard` trusted by that user only:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "sts:AssumeRole", "Principal": { "AWS": "arn:aws:iam::<account-id>:user/cloud-safeguard-broker" } }
+  ]
+}
+```
+
+3. The role's permissions, the outer limit of every credential. This is everything the
+   built-in templates can ask for (S3 today):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:Get*", "s3:List*", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+        "s3:CreateBucket", "s3:DeleteBucket",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    },
+    { "Effect": "Deny", "Action": ["iam:*", "organizations:*", "sts:AssumeRole"], "Resource": "*" }
+  ]
+}
+```
+
+Do not attach `AdministratorAccess` or `PowerUserAccess`: the broker's access key could then
+reach everything they allow. The connection test warns when the role can use IAM.
+
+Each request is one `AssumeRole` call to the region's STS endpoint with a session policy
+for that request (for example read on the bucket `claudecode` only), and every session
+policy also denies IAM, Organizations, Identity Center and any other STS credential. The
+credential arrives as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`
+(with `AWS_REGION`), which the AWS CLI and SDKs read; or use
+`credential_process = csg credential --lease ID --process aws` in `~/.aws/config`.
+
+```bash
+./build/csg exec --account <account-id> --resource s3 --permission read --name claudecode --ttl 15m \
+  -- aws s3 ls s3://claudecode
+```
 
 ---
 

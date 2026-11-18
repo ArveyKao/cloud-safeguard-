@@ -29,7 +29,8 @@ func (a *App) runMockRequest(args []string) error {
 	fs := a.newFlagSet("mock request", `Usage: csg mock request METHOD /v1/PATH [JSON_BODY] [--json] [--server URL]
 
 Calls the built-in mock cloud using the short-lived token in
-$ALIBABA_CLOUD_SECURITY_TOKEN (fetch one with: eval "$(csg credential --lease ID --export)").
+$ALIBABA_CLOUD_SECURITY_TOKEN, or $AWS_SESSION_TOKEN for an AWS mock account
+(fetch one with: eval "$(csg credential --lease ID --export)").
 Prints the response body; exits 1 on HTTP >= 400.
 `)
 	serverFlag := fs.String("server", "", "control plane URL (default: $CSG_SERVER or saved config)")
@@ -63,7 +64,10 @@ Prints the response body; exits 1 on HTTP >= 400.
 	}
 	mockToken := strings.TrimSpace(a.Getenv("ALIBABA_CLOUD_SECURITY_TOKEN"))
 	if mockToken == "" {
-		return usagef("ALIBABA_CLOUD_SECURITY_TOKEN is not set: fetch a lease credential first (csg credential --lease ID --export)")
+		mockToken = strings.TrimSpace(a.Getenv("AWS_SESSION_TOKEN"))
+	}
+	if mockToken == "" {
+		return usagef("ALIBABA_CLOUD_SECURITY_TOKEN or AWS_SESSION_TOKEN is not set: fetch a lease credential first (csg credential --lease ID --export)")
 	}
 
 	if !strings.HasPrefix(requestPath, "/") {

@@ -476,3 +476,31 @@ func TestRejectDuplicateKeysUsesUnicodeFolding(t *testing.T) {
 		t.Fatal("RejectDuplicateKeys accepted keys that encoding/json treats as equal")
 	}
 }
+
+// AWS identity services are refused like RAM, at every level, in any
+// capability (CONTRACT §17.13), and every AWS template carries the AWS deny.
+func TestAWSIdentityServicesAreRefused(t *testing.T) {
+	for _, action := range []string{"iam:PassRole", "iam:*", "IAM:CreateUser", "organizations:ListAccounts", "sso:CreatePermissionSet",
+		"sso-directory:CreateUser", "identitystore:CreateUser", "sts:AssumeRole", "sts:GetFederationToken"} {
+		doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["` + action + `"],"Resource":["*"]}]}`
+		for _, access := range []model.AccessLevel{model.AccessRead, model.AccessWrite, model.AccessAdmin} {
+			if err := CheckPolicy(access, []byte(doc)); err == nil {
+				t.Errorf("%s accepted at %s", action, access)
+			}
+		}
+	}
+	if DenyStatementFor(model.ProviderAWS) != AWSDenyStatement || DenyStatementFor(model.ProviderAliyun) != DenyStatement {
+		t.Fatal("deny statement per cloud")
+	}
+	tpl, ok := LookupAccessTemplate(model.ProviderAWS, "s3", PermissionFull)
+	if !ok {
+		t.Fatal("no s3 full template")
+	}
+	raw, err := RenderPolicy(tpl.Capability, map[string]string{ResourceNameParam: "claudecode"})
+	if err != nil || !strings.Contains(string(raw), AWSDenyStatement) || strings.Contains(string(raw), `"ram:*"`) {
+		t.Fatalf("rendered %s %v", raw, err)
+	}
+	if _, ok := LookupAccessTemplate(model.ProviderAWS, "ecs", PermissionRead); ok {
+		t.Fatal("an Alibaba resource type on AWS")
+	}
+}

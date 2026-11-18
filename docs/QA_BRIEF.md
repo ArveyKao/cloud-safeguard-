@@ -26,7 +26,7 @@ every problem as a GitHub issue.
 
 ```bash
 go build -o build/csg ./cmd/csg
-./scripts/demo.sh            # must end with "all S1-S12 scenarios passed"
+./scripts/demo.sh            # must end with "all S1-S13 scenarios passed"
 go test ./...                # must pass
 ./build/csg init --demo --data-dir ./build/qa-data
 ./build/csg serve --data-dir ./build/qa-data
@@ -50,6 +50,10 @@ is listed in CONTRACT §17.8; `docs/QUICKSTART.md` walks through the whole flow.
 - Approval modes per cloud account (Read, Write, Full, with an optional expiry), set by the
   person on the Cloud accounts page, decide what is issued without approval; a mode never
   exceeds the role there, and a mode on one account changes nothing on another.
+- An AWS account (mock): read on bucket `claudecode` lists and reads it; writing, another
+  bucket and `/v1/iam/users` are refused; the credential comes as `AWS_*` variables. The
+  add-account wizard has an AWS choice that shows the IAM user, trust and permission
+  policies with the account ID filled in.
 - A credential can be refreshed (`csg access refresh ID`, MCP `refresh_credential`): a new
   key under the same request, at most once a minute, within its refresh window (8 hours
   unless the agent declares another, at most the supervisor's limit). A revoked or expired

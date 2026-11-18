@@ -19,11 +19,31 @@ import (
 // every access level, forever.
 const DenyStatement = `{"Effect":"Deny","Action":["ram:*","sts:AssumeRole*"],"Resource":"*"}`
 
+// AWSDenyStatement is the same deny for AWS (CONTRACT §17.13): IAM, the
+// account's organization and identity center, and every way of getting
+// other credentials from STS.
+const AWSDenyStatement = `{"Effect":"Deny","Action":["iam:*","organizations:*","sso:*","sso-directory:*","identitystore:*","sts:AssumeRole*","sts:GetFederationToken","sts:GetSessionToken"],"Resource":"*"}`
+
+// DenyStatementFor is the deny statement appended for a provider type.
+func DenyStatementFor(provider model.ProviderType) string {
+	if provider == model.ProviderAWS {
+		return AWSDenyStatement
+	}
+	return DenyStatement
+}
+
 // Services whose actions are governed by the IAM prohibition.
 const (
 	ramService = "ram"
 	stsService = "sts"
 )
+
+// identityServices are the identity-management services of every supported
+// cloud: no capability may allow any of their actions, whatever the cloud
+// of the capability.
+var identityServices = map[string]bool{
+	"ram": true, "iam": true, "organizations": true, "sso": true, "sso-directory": true, "identitystore": true,
+}
 
 // stsReadAction is the single STS action any capability may allow.
 const stsReadAction = "GetCallerIdentity"
@@ -156,8 +176,8 @@ func checkAllowAction(access model.AccessLevel, action string) error {
 		return fmt.Errorf("action %q is not a valid IAM action: expected service:Action using letters, digits, '-', '_' and wildcards", action)
 	}
 	// Rule 2.
-	if strings.EqualFold(service, ramService) {
-		return fmt.Errorf("action %q targets RAM (identity management), which no capability may allow", action)
+	if identityServices[strings.ToLower(service)] {
+		return fmt.Errorf("action %q targets %s (identity management), which no capability may allow", action, strings.ToUpper(service))
 	}
 	if strings.ContainsAny(service, "*?") {
 		return fmt.Errorf("action %q uses a wildcard service part, which no capability may allow", action)
@@ -337,7 +357,7 @@ func RejectDuplicateKeys(data []byte) error {
 // list, preserving every other field. The returned document is compact, with
 // Version first and Statement second so rendered policies stay stable and
 // comparable.
-func appendDenyStatement(policyJSON []byte) ([]byte, error) {
+func appendDenyStatement(policyJSON []byte, deny string) ([]byte, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(policyJSON, &fields); err != nil {
 		return nil, fmt.Errorf("document is not a JSON object: %v", err)
@@ -349,7 +369,7 @@ func appendDenyStatement(policyJSON []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	statements = append(statements, json.RawMessage(DenyStatement))
+	statements = append(statements, json.RawMessage(deny))
 	encoded, err := json.Marshal(statements)
 	if err != nil {
 		return nil, fmt.Errorf("cannot re-encode statements: %v", err)

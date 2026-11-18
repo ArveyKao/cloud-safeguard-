@@ -51,7 +51,23 @@ type Minter interface {
 	Test(ctx context.Context, req MintRequest) error
 }
 
-// New returns the Minter for a provider mode.
+// NewFor returns the Minter for a provider type and mode. Mock mode is the
+// same for every cloud; sts mode calls the cloud's own STS.
+func NewFor(t model.ProviderType, mode model.ProviderMode) (Minter, error) {
+	if mode == model.ModeSTS {
+		switch t {
+		case model.ProviderAliyun:
+			return stsMinter{}, nil
+		case model.ProviderAWS:
+			return awsMinter{}, nil
+		default:
+			return nil, fmt.Errorf("%w %q", ErrUnsupportedProvider, t)
+		}
+	}
+	return New(mode)
+}
+
+// New returns the Minter for a provider mode (Alibaba Cloud for sts).
 func New(mode model.ProviderMode) (Minter, error) {
 	switch mode {
 	case model.ModeSTS:

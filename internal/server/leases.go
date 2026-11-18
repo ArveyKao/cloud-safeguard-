@@ -454,17 +454,30 @@ func (s *Server) credentialEnvelope(credential model.Credential, lease model.Lea
 		scheme = "https"
 	}
 	baseURL := scheme + "://" + r.Host
-	return model.CredentialEnvelope{
-		Credential: credential,
-		Env: []model.EnvVar{
-			{Name: "ALIBABA_CLOUD_ACCESS_KEY_ID", Value: credential.AccessKeyID},
-			{Name: "ALIBABA_CLOUD_ACCESS_KEY_SECRET", Value: credential.AccessKeySecret},
-			{Name: "ALIBABA_CLOUD_SECURITY_TOKEN", Value: credential.SecurityToken},
-			{Name: "CSG_LEASE_ID", Value: lease.ID},
-			{Name: "CSG_SERVER", Value: baseURL},
-			{Name: "CSG_CAPABILITY", Value: lease.CapabilityID},
-		},
+	env := []model.EnvVar{
+		{Name: "ALIBABA_CLOUD_ACCESS_KEY_ID", Value: credential.AccessKeyID},
+		{Name: "ALIBABA_CLOUD_ACCESS_KEY_SECRET", Value: credential.AccessKeySecret},
+		{Name: "ALIBABA_CLOUD_SECURITY_TOKEN", Value: credential.SecurityToken},
 	}
+	// An AWS credential uses the names the AWS CLI and SDKs read (§17.13).
+	if prov, err := s.db.GetProvider(r.Context(), lease.ProviderID); err == nil && prov.Type == model.ProviderAWS {
+		region := prov.Region
+		if region == "" {
+			region = provider.AWSDefaultRegion
+		}
+		env = []model.EnvVar{
+			{Name: "AWS_ACCESS_KEY_ID", Value: credential.AccessKeyID},
+			{Name: "AWS_SECRET_ACCESS_KEY", Value: credential.AccessKeySecret},
+			{Name: "AWS_SESSION_TOKEN", Value: credential.SecurityToken},
+			{Name: "AWS_REGION", Value: region},
+			{Name: "AWS_DEFAULT_REGION", Value: region},
+		}
+	}
+	env = append(env,
+		model.EnvVar{Name: "CSG_LEASE_ID", Value: lease.ID},
+		model.EnvVar{Name: "CSG_SERVER", Value: baseURL},
+		model.EnvVar{Name: "CSG_CAPABILITY", Value: lease.CapabilityID})
+	return model.CredentialEnvelope{Credential: credential, Env: env}
 }
 
 // handleAgentRevokeLease implements POST /api/v1/agent/leases/{id}/revoke.

@@ -29,9 +29,11 @@ const (
 )
 
 var (
-	remoteMCPVersions  = []string{"2025-06-18", "2025-03-26"}
-	credentialLinkRE   = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
-	shellEnvNames      = []string{"ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET", "ALIBABA_CLOUD_SECURITY_TOKEN", "CSG_LEASE_ID", "CSG_SERVER", "CSG_CAPABILITY"}
+	remoteMCPVersions = []string{"2025-06-18", "2025-03-26"}
+	credentialLinkRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+	shellEnvNames     = []string{"ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET", "ALIBABA_CLOUD_SECURITY_TOKEN",
+		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION",
+		"CSG_LEASE_ID", "CSG_SERVER", "CSG_CAPABILITY"}
 	errBackendInternal = errors.New("internal error")
 )
 

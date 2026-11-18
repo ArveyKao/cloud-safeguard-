@@ -187,7 +187,7 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
         <div>
           <b className="account-name">{account.name}</b>
           <div className="muted small">
-            Alibaba Cloud · <span className="mono">{account.cloud_account_id || 'no account ID'}</span> · {account.region}
+            {account.type === 'aws' ? 'AWS' : 'Alibaba Cloud'} · <span className="mono">{account.cloud_account_id || 'no account ID'}</span> · {account.region}
             {account.mode === 'mock' && ' · demo'}
           </div>
         </div>
@@ -239,7 +239,8 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
           <div className="row-actions left">
             <Button busy={action.busy} onClick={() => action.run(async () => {
               const result = await api.testAccount(account.id)
-              toast(result.ok ? 'Connection works' : `Connection failed: ${result.message}`, result.ok ? 'ok' : 'error')
+              toast(result.ok ? (result.warning ? `Connection works, but ${result.warning}` : 'Connection works') : `Connection failed: ${result.message}`,
+                result.ok && !result.warning ? 'ok' : 'error')
               onChange()
             })}>Test connection</Button>
             <Button onClick={() => setRotating(true)}>Replace AccessKey</Button>

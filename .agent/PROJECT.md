@@ -171,7 +171,14 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   `csg credential --process aws|aliyun`, MCP `refresh_credential`. Schema 11. Demo S11.
   Next pieces decided (CONTRACT §17.13, §17.14): AWS via STS + session policy, then
   long-lived cloud users and keys for supervisors and people they allow (no expiry, shown
-  once in the console, never given to the agent).
+  once in the console, never given to the agent). Review: no blocker, 3 major and 9 minor
+  fixed in 1aef024.
+- **Piece 5, AWS (2026-11-17):** provider type `aws`; STS AssumeRole with a per-request
+  session policy, Signature Version 4 written in-house (verified against the AWS
+  documentation's example), no SDK dependency. S3 templates; AWS deny statement; the IAM
+  guard refuses IAM, Organizations and Identity Center for every cloud. Connection test
+  warns when the role allows IAM. `AWS_*` variables. Mock S3 and IAM routes; console wizard
+  AWS choice; demo S12. Not run against live AWS.
 - **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
   README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
   Alibaba Cloud is untested.
@@ -191,7 +198,7 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console (target surface = api; browser E2E covers the console).
   No production deployment requested.
 - **Address / artifact:** `build/csg` (single binary), demo on `http://127.0.0.1:18787`.
-- **Final demo:** `make demo` → S1–S12 pass; console screenshots captured by verifier.
+- **Final demo:** `make demo` → S1–S13 pass; console screenshots captured by verifier.
 - **Evidence / review:** `scripts/demo.sh` transcript, `go test ./...`, `npm run build`,
   verifier report `changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md`, canonical
   `arvey-develop delivery check --phase complete` PASS.

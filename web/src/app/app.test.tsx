@@ -7,6 +7,7 @@ import { ToastProvider } from './ui'
 import { InboxPage } from './pages/Inbox'
 import { PeoplePage } from './pages/People'
 import { AccountsPage } from './pages/Accounts'
+import { AddAccountPage } from './pages/AddAccount'
 import { SignInApprovalPage } from './pages/SignInApproval'
 import { rememberSignIn, takeSignIn } from './App'
 import { CLISignInApprovalPage } from './pages/CLISignInApproval'
@@ -159,6 +160,30 @@ describe('approval mode', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Switch' }))
     await waitFor(() => expect(changes().map((c) => c.method + ' ' + c.path)).toEqual(['PUT /me/accounts/prv_1/mode']))
     expect((changes()[0].body as { mode: string }).mode).toBe('full')
+  })
+})
+
+describe('add an AWS account', () => {
+  it('shows the IAM setup and creates an aws account with its role ARN', async () => {
+    routes['POST /supervisor/accounts'] = { id: 'prv_9', name: 'prod', type: 'aws', mode: 'sts', region: 'eu-west-1', access_key_id_masked: 'AKIA****', status: 'active', created_at: '' }
+    routes['POST /supervisor/accounts/prv_9/test'] = { ok: true, message: 'ok', warning: 'the role allows IAM', tested_at: '' }
+    wrap(<AddAccountPage />)
+    fireEvent.click(screen.getByRole('radio', { name: 'AWS' }))
+    fireEvent.change(screen.getByLabelText(/^Account ID/), { target: { value: '123456789012' } })
+    fireEvent.change(screen.getByLabelText(/^Name/), { target: { value: 'prod' } })
+    fireEvent.change(screen.getByLabelText(/^Region/), { target: { value: 'eu-west-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(screen.getAllByText(/arn:aws:iam::123456789012:role\/cloud-safeguard/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/acs:ram::/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'I created them' }))
+    fireEvent.change(screen.getByLabelText(/^Access key ID/), { target: { value: 'AKIAEXAMPLE' } })
+    fireEvent.change(screen.getByLabelText(/^Secret access key/), { target: { value: 'placeholder' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect and test' }))
+    await screen.findByText('the role allows IAM')
+    const sent = changes()[0].body as Record<string, string>
+    expect(sent.type).toBe('aws')
+    expect(sent.role_arn).toBe('arn:aws:iam::123456789012:role/cloud-safeguard')
+    expect(sent.region).toBe('eu-west-1')
   })
 })
 

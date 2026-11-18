@@ -40,10 +40,10 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	in.Region = strings.TrimSpace(in.Region)
 	in.RoleARN = strings.TrimSpace(in.RoleARN)
 	if in.Type == "" {
-		in.Type = model.ProviderAliyun // single supported vendor; CLI may omit it
+		in.Type = model.ProviderAliyun // the original vendor; older clients omit it
 	}
 	if !in.Type.Valid() {
-		s.badRequest(w, "type must be aliyun")
+		s.badRequest(w, "type must be aliyun or aws")
 		return
 	}
 	if !in.Mode.Valid() {
@@ -69,6 +69,9 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			in.AccessKeyID = "LTAI5tMock" + suffix
+			if in.Type == model.ProviderAWS {
+				in.AccessKeyID = "AKIAMOCK" + suffix
+			}
 		}
 		if in.AccessKeySecret == "" {
 			placeholder, err := randomBase64URL(24)
@@ -83,7 +86,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	// Roles and requests are bound to the cloud account the role lives in; an
 	// account without one could never issue anything.
 	if model.CloudAccountIDFromRoleARN(in.Type, in.RoleARN) == "" {
-		s.badRequest(w, "role_arn must be a RAM role ARN such as acs:ram::1234567890123456:role/cloud-safeguard")
+		s.badRequest(w, "role_arn must be a role ARN such as "+model.RoleARNExample(in.Type))
 		return
 	}
 
@@ -231,7 +234,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		account := model.CloudAccountIDFromRoleARN(prov.Type, *in.RoleARN)
 		switch {
 		case account == "":
-			s.badRequest(w, "role_arn must be a RAM role ARN such as acs:ram::1234567890123456:role/cloud-safeguard")
+			s.badRequest(w, "role_arn must be a role ARN such as "+model.RoleARNExample(prov.Type))
 			return
 		case prov.CloudAccountID == "" && isCLIRequest(r):
 			// Checked before the code too; repeated here under the lock.
@@ -385,6 +388,7 @@ func (s *Server) handleRotateAccount(w http.ResponseWriter, r *http.Request) {
 type providerTestResult struct {
 	OK       bool      `json:"ok"`
 	Message  string    `json:"message"`
+	Warning  string    `json:"warning,omitempty"`
 	TestedAt time.Time `json:"tested_at"`
 }
 
@@ -399,7 +403,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
-	ok, message := s.testProvider(r.Context(), prov)
+	ok, message, warning := s.testProvider(r.Context(), prov)
 	now := s.nowUTC()
 	// The test can take seconds. Only its result is written: writing the row
 	// read before it would undo a disable that happened meanwhile.
@@ -407,30 +411,34 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
-	s.actorAudit(r.Context(), "provider.tested", "ok", "info", "provider", prov.ID, map[string]any{
-		"ok":      ok,
-		"message": message,
-	})
-	s.writeData(w, http.StatusOK, providerTestResult{OK: ok, Message: message, TestedAt: now})
+	metadata := map[string]any{"ok": ok, "message": message}
+	severity := "info"
+	if warning != "" {
+		metadata["warning"] = warning
+		severity = "warning"
+	}
+	s.actorAudit(r.Context(), "provider.tested", "ok", severity, "provider", prov.ID, metadata)
+	s.writeData(w, http.StatusOK, providerTestResult{OK: ok, Message: message, Warning: warning, TestedAt: now})
 }
 
 // testProvider decrypts the broker credential and runs the provider's Test.
-func (s *Server) testProvider(ctx context.Context, prov model.Provider) (bool, string) {
+// A passed test may carry a warning for the supervisor.
+func (s *Server) testProvider(ctx context.Context, prov model.Provider) (ok bool, message, warning string) {
 	encCred, err := s.db.GetProviderCredential(ctx, prov.ID)
 	if err != nil {
-		return false, "provider has no stored credential"
+		return false, "provider has no stored credential", ""
 	}
 	plain, err := s.vault.Decrypt(encCred, providerAAD(prov.ID))
 	if err != nil {
-		return false, "provider credential cannot be decrypted"
+		return false, "provider credential cannot be decrypted", ""
 	}
 	var broker brokerCredential
 	if err := json.Unmarshal(plain, &broker); err != nil {
-		return false, "provider credential is malformed"
+		return false, "provider credential is malformed", ""
 	}
 	minter, err := s.minterFactory(prov)
 	if err != nil {
-		return false, sanitizeMessage(err.Error())
+		return false, sanitizeMessage(err.Error()), ""
 	}
 	err = minter.Test(ctx, provider.MintRequest{
 		Provider:              prov,
@@ -440,10 +448,14 @@ func (s *Server) testProvider(ctx context.Context, prov model.Provider) (bool, s
 		SessionName:           "csg-provider-test",
 		SigningKey:            s.signingKey,
 	})
-	if err != nil {
-		return false, sanitizeMessage(err.Error())
+	var testWarning *provider.TestWarning
+	if errors.As(err, &testWarning) {
+		return true, "provider configuration is valid", sanitizeMessage(testWarning.Message)
 	}
-	return true, "provider configuration is valid"
+	if err != nil {
+		return false, sanitizeMessage(err.Error()), ""
+	}
+	return true, "provider configuration is valid", ""
 }
 
 // ================= audit =================

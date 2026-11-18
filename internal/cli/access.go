@@ -174,7 +174,7 @@ type accessFlags struct {
 func addAccessFlags(fs *flagSet) accessFlags {
 	return accessFlags{
 		account:    fs.String("account", "", "cloud account ID (required)"),
-		resource:   fs.String("resource", "", "resource type: ecs, dns or oss (required)"),
+		resource:   fs.String("resource", "", "resource type: ecs, dns, oss (Alibaba Cloud) or s3 (AWS) (required)"),
 		permission: fs.String("permission", "", "read, write or full (required)"),
 		ttl:        fs.String("ttl", "", "validity period, e.g. 15m (required)"),
 		name:       fs.String("name", "", "one resource (instance ID, domain, bucket); default all"),

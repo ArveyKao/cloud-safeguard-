@@ -81,7 +81,7 @@ func TestEveryAccessTemplateRendersWithinItsLevel(t *testing.T) {
 				t.Errorf("%s with %q: %v", id, name, err)
 				continue
 			}
-			if !strings.Contains(string(raw), `"ram:*"`) {
+			if !strings.Contains(string(raw), DenyStatementFor(tpl.Capability.ProviderType)) {
 				t.Errorf("%s: no IAM deny statement", id)
 			}
 			for _, action := range templateActions(t, raw) {
@@ -200,6 +200,10 @@ func TestAccessTemplateActionsAreExactlyAsReviewed(t *testing.T) {
 		"aliyun.access.oss.write": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
 		"aliyun.access.oss.full": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload",
 			"oss:PutBucket", "oss:DeleteBucket"},
+		"aws.access.s3.read":  {"s3:Get*", "s3:List*"},
+		"aws.access.s3.write": {"s3:Get*", "s3:List*", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
+		"aws.access.s3.full": {"s3:Get*", "s3:List*", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+			"s3:CreateBucket", "s3:DeleteBucket"},
 	}
 	if len(want) != len(accessTemplates) {
 		t.Fatalf("%d templates reviewed, %d defined", len(want), len(accessTemplates))
@@ -254,49 +258,66 @@ func TestReservedIDWithLooserParamsIsRefused(t *testing.T) {
 // there fails in the cloud, and an extra one widens what a leaked broker key
 // could reach.
 func TestDocumentedRolePolicyMatchesTheTemplates(t *testing.T) {
-	want := map[string]bool{"sts:GetCallerIdentity": true} // the connection test
-	for _, spec := range resourceSpecs {
-		for _, list := range [][]string{spec.read, spec.write, spec.full} {
-			for _, action := range list {
-				want[action] = true
+	for _, cloud := range []struct {
+		provider model.ProviderType
+		// first is the first action of the role's Allow list in the files.
+		first  string
+		quoted *regexp.Regexp
+		deny   *regexp.Regexp
+	}{
+		{model.ProviderAliyun, "ecs:Describe*", regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram|s3|iam):[A-Za-z*]+)["']`),
+			regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']ram:\*["'],\s*["']sts:AssumeRole["']\]`)},
+		{model.ProviderAWS, "s3:Get*", regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram|s3|iam):[A-Za-z*]+)["']`),
+			regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']iam:\*["'],\s*["']organizations:\*["'],\s*["']sts:AssumeRole["']\]`)},
+	} {
+		want := map[string]bool{"sts:GetCallerIdentity": true} // the connection test
+		for _, spec := range resourceSpecs {
+			if spec.provider != cloud.provider {
+				continue
+			}
+			for _, list := range [][]string{spec.read, spec.write, spec.full} {
+				for _, action := range list {
+					want[action] = true
+				}
 			}
 		}
-	}
-	quoted := regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram):[A-Za-z*]+)["']`)
-	for _, file := range []string{"../../web/src/app/rolePolicy.ts", "../../docs/QUICKSTART.md"} {
-		raw, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatal(err)
-		}
-		text := string(raw)
-		// Only the role's Allow list: it starts with ecs:Describe* and ends
-		// with the connection test's action.
-		start := strings.Index(text, "ecs:Describe*")
-		end := strings.Index(text, "sts:GetCallerIdentity")
-		if start < 0 || end < start {
-			t.Fatalf("%s: cannot find the role's permission policy", file)
-		}
-		end += len("sts:GetCallerIdentity") + 1
-		got := map[string]bool{}
-		for _, m := range quoted.FindAllStringSubmatch(text[start-1:end], -1) {
-			got[m[1]] = true
-		}
-		for action := range want {
-			if !got[action] {
-				t.Errorf("%s: the role policy does not allow %s, which a template can ask for", file, action)
+		for _, file := range []string{"../../web/src/app/rolePolicy.ts", "../../docs/QUICKSTART.md"} {
+			raw, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		for action := range got {
-			if !want[action] {
-				t.Errorf("%s: the role policy allows %s, which no template asks for", file, action)
+			text := string(raw)
+			// Only the role's Allow list: it starts with the cloud's first
+			// action and ends with the connection test's action.
+			start := strings.Index(text, cloud.first)
+			if start < 0 {
+				t.Fatalf("%s: cannot find the %s role's permission policy", file, cloud.provider)
 			}
-			if strings.HasSuffix(action, ":*") {
-				t.Errorf("%s: the role policy has the wildcard %s", file, action)
+			end := strings.Index(text[start:], "sts:GetCallerIdentity")
+			if end < 0 {
+				t.Fatalf("%s: the %s role's permission policy has no end", file, cloud.provider)
 			}
-		}
-		deny := regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']ram:\*["'],\s*["']sts:AssumeRole["']\]`)
-		if !deny.MatchString(text) {
-			t.Errorf("%s: the role policy does not deny ram:* and sts:AssumeRole", file)
+			end += start + len("sts:GetCallerIdentity") + 1
+			got := map[string]bool{}
+			for _, m := range cloud.quoted.FindAllStringSubmatch(text[start-1:end], -1) {
+				got[m[1]] = true
+			}
+			for action := range want {
+				if !got[action] {
+					t.Errorf("%s: the %s role policy does not allow %s, which a template can ask for", file, cloud.provider, action)
+				}
+			}
+			for action := range got {
+				if !want[action] {
+					t.Errorf("%s: the %s role policy allows %s, which no template asks for", file, cloud.provider, action)
+				}
+				if strings.HasSuffix(action, ":*") {
+					t.Errorf("%s: the %s role policy has the wildcard %s", file, cloud.provider, action)
+				}
+			}
+			if !cloud.deny.MatchString(text) {
+				t.Errorf("%s: the %s role policy does not carry its deny", file, cloud.provider)
+			}
 		}
 	}
 }

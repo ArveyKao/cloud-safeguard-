@@ -17,7 +17,7 @@ let onSignedOut: (() => void) | null = null
 export function setCsrf(token: string) { csrf = token }
 export function setSignedOutHandler(fn: (() => void) | null) { onSignedOut = fn }
 
-export interface TestResult { ok: boolean; message: string; tested_at: string }
+export interface TestResult { ok: boolean; message: string; warning?: string; tested_at: string }
 
 async function call<T>(method: string, path: string, body?: unknown, retried = false): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json' }

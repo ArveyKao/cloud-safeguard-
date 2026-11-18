@@ -101,7 +101,7 @@ func TestInitRefusesAnInitializedDirAndLeavesItIntact(t *testing.T) {
 	if err != nil || len(providers) != 1 {
 		t.Fatalf("providers = %d, %v", len(providers), err)
 	}
-	if ok, message := srv.testProvider(context.Background(), providers[0]); !ok {
+	if ok, message, _ := srv.testProvider(context.Background(), providers[0]); !ok {
 		t.Fatalf("the demo account's credential no longer decrypts: %s", message)
 	}
 	people, err := srv.db.ListPersons(context.Background())

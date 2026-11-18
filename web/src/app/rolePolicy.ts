@@ -49,3 +49,38 @@ export const rolePermissions = () => json({
     { Effect: 'Deny', Action: ['ram:*', 'sts:AssumeRole'], Resource: '*' },
   ],
 })
+
+// ---- AWS (CONTRACT §17.13): an IAM user that may only assume one role ----
+
+export const awsRoleArn = (accountId: string) => `arn:aws:iam::${accountId}:role/${ROLE_NAME}`
+
+/** Everything the AWS access templates can ask for, and nothing else. */
+export const AWS_ROLE_ACTIONS = [
+  's3:Get*', 's3:List*', 's3:PutObject', 's3:DeleteObject', 's3:AbortMultipartUpload',
+  's3:CreateBucket', 's3:DeleteBucket',
+  'sts:GetCallerIdentity',
+]
+
+/** Attached to the IAM user: its only permission. */
+export const awsBrokerPolicy = (accountId: string) => json({
+  Version: '2012-10-17',
+  Statement: [{ Effect: 'Allow', Action: 'sts:AssumeRole', Resource: awsRoleArn(accountId) }],
+})
+
+/** The role's trust policy: only the IAM user may assume it. */
+export const awsTrustPolicy = (accountId: string) => json({
+  Version: '2012-10-17',
+  Statement: [{
+    Effect: 'Allow', Action: 'sts:AssumeRole',
+    Principal: { AWS: `arn:aws:iam::${accountId}:user/${BROKER_USER}` },
+  }],
+})
+
+/** Attached to the role: the outer limit of every credential. */
+export const awsRolePermissions = () => json({
+  Version: '2012-10-17',
+  Statement: [
+    { Effect: 'Allow', Action: AWS_ROLE_ACTIONS, Resource: '*' },
+    { Effect: 'Deny', Action: ['iam:*', 'organizations:*', 'sts:AssumeRole'], Resource: '*' },
+  ],
+})

@@ -169,10 +169,11 @@ type ProviderType string
 
 const (
 	ProviderAliyun ProviderType = "aliyun"
+	ProviderAWS    ProviderType = "aws"
 )
 
 // Valid reports whether the provider type is supported.
-func (p ProviderType) Valid() bool { return p == ProviderAliyun }
+func (p ProviderType) Valid() bool { return p == ProviderAliyun || p == ProviderAWS }
 
 // ProviderMode selects how a provider mints short-lived credentials.
 //
@@ -641,14 +642,29 @@ const (
 
 var aliyunRoleARN = regexp.MustCompile(`^acs:ram::([0-9]{6,32}):role/[A-Za-z0-9._/-]+$`)
 
+// awsRoleARN is an IAM role ARN in the standard partition: a 12-digit
+// account and a role name (with an optional path).
+var awsRoleARN = regexp.MustCompile(`^arn:aws:iam::([0-9]{12}):role/[A-Za-z0-9+=,.@_/-]{1,512}$`)
+
 // CloudAccountIDFromRoleARN extracts the cloud account ID from a role ARN,
 // or returns "" when the ARN does not have the provider type's form.
 func CloudAccountIDFromRoleARN(t ProviderType, roleARN string) string {
-	if t != ProviderAliyun {
+	pattern := aliyunRoleARN
+	if t == ProviderAWS {
+		pattern = awsRoleARN
+	} else if t != ProviderAliyun {
 		return ""
 	}
-	if m := aliyunRoleARN.FindStringSubmatch(roleARN); m != nil {
+	if m := pattern.FindStringSubmatch(roleARN); m != nil {
 		return m[1]
 	}
 	return ""
+}
+
+// RoleARNExample is an example role ARN of a provider type, for messages.
+func RoleARNExample(t ProviderType) string {
+	if t == ProviderAWS {
+		return "arn:aws:iam::123456789012:role/cloud-safeguard"
+	}
+	return "acs:ram::1234567890123456:role/cloud-safeguard"
 }

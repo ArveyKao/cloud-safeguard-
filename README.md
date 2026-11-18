@@ -109,7 +109,7 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | People sign in to the console with a password and an authenticator app; no SSO | ✅ |
 | Roles per cloud account (Guest, Member, Administrator); supervisors manage the platform | ✅ |
 | Agents sign in with a short code a person approves; no token is copied by hand | ✅ |
-| Access requests: cloud account, resource type (ECS, DNS, OSS), read / write / full, validity, optional resource name | ✅ |
+| Access requests: cloud account, resource type (ECS, DNS, OSS on Alibaba Cloud; S3 on AWS), read / write / full, validity, optional resource name | ✅ |
 | Approval modes per person and cloud account (Read, Write, Full) | ✅ |
 | Refresh: a new key under the same request within its refresh window (default 8 hours); SDK credential process output | ✅ |
 | Only the agent's owner approves; supervisors can deny or revoke anything, never approve for someone else | ✅ |
@@ -122,7 +122,7 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | Real Alibaba Cloud `sts` mode | ✅ implemented, unit-tested against a fake STS endpoint; not yet run against a live account |
 | `csg` sign-in for people, with supervisor commands (raising access needs an authenticator code) | ✅ |
 | Remote MCP over HTTPS: an agent connects with just a URL, signs in through the console (OAuth), and gets credentials through one-time links | ✅ tried with Claude Code |
-| AWS (STS with a session policy; S3 first) | 🔜 next (CONTRACT §17.13) |
+| AWS accounts: STS AssumeRole with a session policy per request; S3 buckets | ✅ mock-tested and against a fake STS; not yet run against a live AWS account |
 | Long-lived credentials (a cloud user and key) for supervisors and people they allow | 🔜 next (CONTRACT §17.14) |
 | GCP, SSO, chat approvals, credential-free proxy mode | 🔜 later |
 
@@ -177,9 +177,9 @@ never approve itself:
 ./build/csg supervisor roles set 1234567890123456 mei member --code 123456
 ```
 
-Or run the whole scripted demo (twelve scenarios: setup, agent sign-in, automatic read, least
+Or run the whole scripted demo (thirteen scenarios: setup, agent sign-in, automatic read, least
 privilege, denial, approval, revocation, emergency stop, a supervisor on the command line,
-remote MCP, approval mode per account with refresh, audit) in one command:
+remote MCP, approval mode per account with refresh, an AWS account, audit) in one command:
 
 ```bash
 make demo
@@ -259,7 +259,7 @@ cloud-safeguard/
 │   ├── token/          # bearer token generation and hashing
 │   └── cli/            # csg commands and the MCP server
 ├── web/                # React + Vite console, embedded into the binary
-├── scripts/demo.sh     # end-to-end demo (S1–S12), driven by scripts/demo/
+├── scripts/demo.sh     # end-to-end demo (S1–S13), driven by scripts/demo/
 ├── docs/               # SPEC, CONTRACT, PRODUCT, SECURITY, ARCHITECTURE, QUICKSTART, API, DECISIONS
 └── Makefile            # build / test / demo entry points
 ```
