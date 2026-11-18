@@ -186,7 +186,12 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   confirms → cloud user, policy and key, secret shown once; revoke and automatic deletion;
   `revoke_failed` with retry. Schema 12. Mock cloud accepts active long-lived mock keys.
   MCP `request_long_lived_credential`, `csg access long-lived`, `csg me/supervisor
-  long-lived`. Demo S13. Not run against a live cloud.
+  long-lived`. Demo S13. Not run against a live cloud. Review of 2c0ce85: 3 blockers (local
+  recovery, create racing a lost right, crash cleanup), 3 majors (AWS boundary step, RAM key
+  wording, managed-identity key) and minors, all fixed in the follow-up commit: full
+  list-and-delete cleanup, recheck after create, startup recovery and a recheck every sweep.
+  Open question for a live test: whether AWS needs `iam:PutUserPermissionsBoundary` (added)
+  and how RAM evaluates the two-resource attach statement.
 - **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
   README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
   Alibaba Cloud is untested.

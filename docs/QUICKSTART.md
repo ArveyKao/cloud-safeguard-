@@ -509,9 +509,11 @@ Cloud Safeguard can create a cloud user with an access key. It is off until a su
 turns it on per account, and only supervisors and people they allow can use it.
 
 1. **Turn it on (supervisor, console):** Cloud accounts → the account → *Long-lived keys* →
-   *Turn on…*. Create a separate IAM/RAM user with only the policy the dialog shows (on AWS
-   also the boundary policy `cloud-safeguard-boundary`, the role permissions of 2.9) and
-   paste its key. The broker key is never used for this.
+   *Turn on…*. On AWS, first create the customer managed policy `cloud-safeguard-boundary`
+   with the content the dialog shows (the role permissions of 2.9): every user made here is
+   bounded by it. Then create a separate IAM/RAM user, not under path `/csg/` and not named
+   `csg-…` (such a key is refused), with only the policy the dialog shows, and paste its key.
+   The broker key is never used for this.
 2. **Allow a person (supervisor):** People → *Allow long-lived keys* (or
    `csg supervisor people allow-long-lived NAME --code CODE`).
 3. **Ask:** in the console (Cloud accounts → *+ New long-lived key*), or an agent with
@@ -521,11 +523,12 @@ turns it on per account, and only supervisors and people they allow can use it.
    secret is shown once; Cloud Safeguard keeps only the user name and key ID.
 5. **Revoke:** Cloud accounts → *Long-lived keys* → *Revoke*, or `csg me long-lived revoke ID`.
    It is also deleted automatically when the owner loses the role, the permission or is
-   suspended, or the account is disabled.
+   suspended or reset (also by `csg supervisor recover`, within a minute), or the account is
+   disabled. If the cloud refuses a deletion it shows *deletion failed*; a supervisor retries.
 
 > ⚠️ Not yet run against a live cloud: the IAM and RAM calls are tested against fakes. On
-> Alibaba Cloud there is no permissions boundary, so the second key is as sensitive as an
-> administrator's.
+> Alibaba Cloud there is no permissions boundary and the second key may write `csg`
+> policies with any content, so treat it as an account administrator's key.
 
 ---
 

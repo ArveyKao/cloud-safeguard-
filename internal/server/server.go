@@ -324,7 +324,12 @@ func New(cfg Config) (*Server, error) {
 		db.Close()
 		return nil, fmt.Errorf("server: re-check leases at startup: %w", err)
 	}
-	s.startSweeper()
+	interrupted, err := s.interruptedLongLived(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: recover long-lived credentials: %w", err)
+	}
+	s.startSweeper(interrupted)
 	return s, nil
 }
 
@@ -485,12 +490,16 @@ func (s *Server) Close() error {
 }
 
 // startSweeper launches the background lease sweeper (every sweepInterval).
-func (s *Server) startSweeper() {
+// It first deletes the long-lived credentials a crash interrupted and those
+// whose owner lost the right while the server was down (cloud calls, so not
+// before serving).
+func (s *Server) startSweeper(interrupted []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.sweepCancel = cancel
 	s.sweepDone = make(chan struct{})
 	go func() {
 		defer close(s.sweepDone)
+		s.recoverLongLived(ctx, interrupted)
 		ticker := time.NewTicker(sweepInterval)
 		defer ticker.Stop()
 		for {

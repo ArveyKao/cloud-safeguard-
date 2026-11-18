@@ -213,9 +213,13 @@ type fakeUserAdmin struct {
 	mu                   sync.Mutex
 	createErr, deleteErr error
 	deleted              []string
+	onCreate             func() // runs while the cloud calls would
 }
 
 func (f *fakeUserAdmin) CreateUser(_ context.Context, req provider.UserRequest) (provider.UserCreated, error) {
+	if f.onCreate != nil {
+		f.onCreate()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.createErr != nil {
@@ -321,5 +325,191 @@ func TestLongLivedCreateRechecks(t *testing.T) {
 	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/long-lived-requests/"+key+"/create", nil), http.StatusConflict)
 	if a.llStatus(asked.ID) != model.LongLivedFailed {
 		t.Fatalf("status %s", a.llStatus(asked.ID))
+	}
+}
+
+// A failed create whose cleanup failed too is never shown as gone: it is
+// revoke_failed, named, and a supervisor's retry deletes it.
+func TestLongLivedFailedCleanupCanBeRetried(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	fake := &fakeUserAdmin{}
+	a.srv.userAdminFactory = func(model.Provider) (provider.UserAdmin, error) { return fake, nil }
+	a.enableLongLived()
+	fake.createErr = &provider.CleanupError{Cause: errors.New("create access key: Throttling"), Cleanup: errors.New("delete user: Throttling")}
+	asked, key := a.askLongLived(llInput())
+	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/long-lived-requests/"+key+"/create", nil), http.StatusBadGateway)
+	row, _ := a.srv.db.GetLongLived(context.Background(), asked.ID)
+	if row.Status != model.LongLivedRevokeFailed || row.CloudUser != provider.CloudUserName(asked.ID) || row.CloudPolicy != row.CloudUser {
+		t.Fatalf("after a failed cleanup %+v", row)
+	}
+	if ev := a.lastEvent("long_lived.create_failed"); ev.Severity != "critical" || ev.Metadata["cleanup_failed"] != true {
+		t.Fatalf("audit %+v", ev)
+	}
+	// The second key stays while it may exist.
+	requireStatus(t, a.sup.do(http.MethodDelete, supAccounts+"/"+a.providerID+"/user-admin", nil), http.StatusConflict)
+	requireStatus(t, a.sup.do(http.MethodPost, "/api/v1/supervisor/long-lived/"+asked.ID+"/revoke", nil), http.StatusOK)
+	if a.llStatus(asked.ID) != model.LongLivedRevoked || len(fake.deleted) != 1 || fake.deleted[0] != row.CloudUser+"/"+row.CloudUser+"/" {
+		t.Fatalf("retry %v", fake.deleted)
+	}
+}
+
+// The right removed while the cloud calls run: the automatic deletion skips
+// a credential still being created, so creating checks again afterwards,
+// deletes it, and never shows the secret.
+func TestLongLivedRightLostWhileCreating(t *testing.T) {
+	for name, remove := range map[string]func(a *accessEnv){
+		"flag removed": func(a *accessEnv) {
+			no := false
+			requireStatus(a.t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+a.mei.person.ID, model.UpdatePersonInput{LongLived: &no}), http.StatusOK)
+		},
+		"account disabled": func(a *accessEnv) {
+			requireStatus(a.t, a.sup.do(http.MethodPatch, supAccounts+"/"+a.providerID, map[string]any{"status": "disabled"}), http.StatusOK)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAccessEnv(t, model.RoleMember)
+			fake := &fakeUserAdmin{}
+			a.srv.userAdminFactory = func(model.Provider) (provider.UserAdmin, error) { return fake, nil }
+			a.enableLongLived()
+			asked, key := a.askLongLived(llInput())
+			fake.onCreate = func() { remove(a) }
+			rec := a.mei.do(http.MethodPost, "/api/v1/me/long-lived-requests/"+key+"/create", nil)
+			requireStatus(t, rec, http.StatusConflict)
+			if strings.Contains(rec.Body.String(), "fake-long-secret") {
+				t.Fatal("the secret was shown")
+			}
+			if a.llStatus(asked.ID) != model.LongLivedRevoked || len(fake.deleted) != 1 {
+				t.Fatalf("status %s, deleted %v", a.llStatus(asked.ID), fake.deleted)
+			}
+		})
+	}
+}
+
+// A crash leaves a credential creating or revoking: at startup it becomes
+// revoke_failed and is deleted; an active one whose owner lost the right
+// while the server was down is deleted too.
+func TestLongLivedStartupRecovery(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	fake := &fakeUserAdmin{}
+	a.srv.userAdminFactory = func(model.Provider) (provider.UserAdmin, error) { return fake, nil }
+	a.enableLongLived()
+	ctx := context.Background()
+	creating, _ := a.askLongLived(llInput())
+	if err := a.srv.db.ClaimLongLivedForCreate(ctx, creating.ID, a.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_, key := a.askLongLived(llInput())
+	revoking := a.createLongLived(key)
+	if err := a.srv.db.ClaimLongLivedForRevoke(ctx, revoking.Credential.ID, "by hand", a.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_, key = a.askLongLived(llInput())
+	lost := a.createLongLived(key)
+	_, key = a.askLongLived(llInput())
+	alsoLost := a.createLongLived(key)
+	// The owner loses the right "while the server is down": straight in the database.
+	if err := a.srv.db.SetPersonLongLived(ctx, a.mei.person.ID, false, a.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := a.srv.interruptedLongLived(ctx)
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("interrupted %v %v", ids, err)
+	}
+	if a.llStatus(creating.ID) != model.LongLivedRevokeFailed || a.llStatus(revoking.Credential.ID) != model.LongLivedRevokeFailed {
+		t.Fatal("not marked")
+	}
+	a.srv.recoverLongLived(ctx, ids)
+	for _, id := range []string{creating.ID, revoking.Credential.ID, lost.Credential.ID, alsoLost.Credential.ID} {
+		if a.llStatus(id) != model.LongLivedRevoked {
+			t.Fatalf("%s: %s", id, a.llStatus(id))
+		}
+	}
+	if len(fake.deleted) != 4 || !strings.Contains(strings.Join(fake.deleted, " "), provider.CloudUserName(creating.ID)+"/"+provider.CloudUserName(creating.ID)+"/ ") &&
+		!strings.HasSuffix(strings.Join(fake.deleted, " "), provider.CloudUserName(creating.ID)+"/"+provider.CloudUserName(creating.ID)+"/") {
+		t.Fatalf("deleted %v", fake.deleted)
+	}
+}
+
+// An invalid person update writes nothing, not even the long-lived flag.
+func TestPersonUpdateIsValidatedFirst(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	yes, bad := true, model.PersonStatus("bogus")
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+a.mei.person.ID,
+		model.UpdatePersonInput{LongLived: &yes, Status: &bad}), http.StatusBadRequest)
+	if p, _ := a.srv.db.GetPerson(context.Background(), a.mei.person.ID); p.LongLived {
+		t.Fatal("the flag was set by a refused update")
+	}
+}
+
+// A real restart runs the recovery: a credential left creating is deleted.
+func TestLongLivedRecoveryRunsAtRestart(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	a.enableLongLived()
+	asked, _ := a.askLongLived(llInput())
+	if err := a.srv.db.ClaimLongLivedForCreate(context.Background(), asked.ID, a.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	a.restart()
+	deadline := time.Now().Add(5 * time.Second)
+	for a.llStatus(asked.ID) != model.LongLivedRevoked {
+		if time.Now().After(deadline) {
+			t.Fatalf("after restart: %s", a.llStatus(asked.ID))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Local recovery runs outside the server: the next sweep deletes the reset
+// owner's key (and the next start would too).
+func TestLongLivedDeletedAfterLocalRecovery(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	a.enableLongLived()
+	_, key := a.askLongLived(llInput())
+	secret := a.createLongLived(key)
+	if _, err := RecoverSupervisor(context.Background(), RecoverOptions{DataDir: a.dir, Username: "mei"}); err != nil {
+		t.Fatal(err)
+	}
+	a.srv.sweepOnce(context.Background())
+	if a.llStatus(secret.Credential.ID) != model.LongLivedRevoked {
+		t.Fatalf("after recovery: %s", a.llStatus(secret.Credential.ID))
+	}
+	if ev := a.lastEvent("long_lived.revoked"); ev.Metadata["cause"] != "sweep" {
+		t.Fatalf("audit %+v", ev.Metadata)
+	}
+}
+
+// A created credential has no expiry in its view; a pending one shows the link's.
+func TestLongLivedViewExpiry(t *testing.T) {
+	a := newAccessEnv(t, model.RoleMember)
+	a.enableLongLived()
+	_, key := a.askLongLived(llInput())
+	pending := decodeEnvelope[model.LongLivedCredential](t, a.mei.do(http.MethodGet, "/api/v1/me/long-lived-requests/"+key, nil))
+	if pending.ExpiresAt == nil {
+		t.Fatal("a pending request without its link expiry")
+	}
+	if secret := a.createLongLived(key); secret.Credential.ExpiresAt != nil {
+		t.Fatalf("an active credential with expires_at %v", secret.Credential.ExpiresAt)
+	}
+}
+
+// An unknown account and one without a role answer the same, even with a
+// bad resource: an agent cannot probe which accounts are connected.
+func TestLongLivedNoAccountProbing(t *testing.T) {
+	a := newAccessEnv(t, "")
+	yes := true
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+a.mei.person.ID, model.UpdatePersonInput{LongLived: &yes}), http.StatusOK)
+	unknown := llInput()
+	unknown.CloudAccountID = "999999999999"
+	unknown.Resource = "nope"
+	known := llInput()
+	known.Resource = "nope"
+	r1, r2 := a.mei.do(http.MethodPost, llPath, unknown), a.mei.do(http.MethodPost, llPath, known)
+	requireStatus(t, r1, http.StatusForbidden)
+	requireStatus(t, r2, http.StatusForbidden)
+	m1 := strings.ReplaceAll(r1.Body.String(), "999999999999", "ID")
+	m2 := strings.ReplaceAll(r2.Body.String(), demoAccountID, "ID")
+	if m1 != m2 {
+		t.Fatalf("answers differ:\n%s\n%s", m1, m2)
 	}
 }

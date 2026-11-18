@@ -3,7 +3,7 @@ import { api } from '../api'
 import type { LongLivedCredential, LongLivedSecret, Person, PersonAccount, Provider } from '../types'
 import { navigate } from '../router'
 import { Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, ago, useAction, useConfirm, useLoad, useToast, when } from '../ui'
-import { awsUserAdminPolicy, userAdminPolicy } from '../rolePolicy'
+import { AWS_BOUNDARY_POLICY_NAME, awsBoundaryPolicy, awsUserAdminPolicy, userAdminPolicy } from '../rolePolicy'
 
 // Long-lived credentials (CONTRACT §17.14): cloud users with access keys that
 // do not expire, created only after a person confirms here.
@@ -89,7 +89,7 @@ export function LongLivedConfirmPage({ code }: { code: string }) {
           <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} />
           I asked for this key, and I will store its secret safely.
         </label>
-        <p className="muted small">This link expires {ago(c.expires_at)}.</p>
+        {c.expires_at && <p className="muted small">This link expires {ago(c.expires_at)}.</p>}
         <ErrorNote error={action.error} />
         <div className="row-actions">
           <Button busy={action.busy} onClick={() => action.run(async () => { await api.denyLongLived(code); setDeclined(true) })}>Decline</Button>
@@ -217,9 +217,14 @@ export function UserAdminSection({ account, onChange }: { account: Provider; onC
       </div>
       {open && (
         <Modal title={`Long-lived keys on ${account.name}`} onClose={() => setOpen(false)}>
-          <p className="muted small">Create a separate {account.type === 'aws' ? 'IAM' : 'RAM'} user with an access key and only this policy{account.type === 'aws' ? ', and the boundary policy cloud-safeguard-boundary (the role permissions shown when the account was added)' : ''}.</p>
+          {account.type === 'aws' && <>
+            <p className="muted small"><strong>1.</strong> Create a customer managed policy named <span className="mono">{AWS_BOUNDARY_POLICY_NAME}</span> with this content. Every user made here is bounded by it: it can never do more than the role, and never IAM.</p>
+            <div className="code-block"><pre>{awsBoundaryPolicy()}</pre></div>
+            <p className="muted small"><strong>2.</strong> Create a separate IAM user (not under path <span className="mono">/csg/</span>, and not named <span className="mono">csg-…</span>) with an access key and only this policy.</p>
+          </>}
+          {account.type !== 'aws' && <p className="muted small">Create a separate RAM user (not named <span className="mono">csg-…</span>) with an access key and only this policy.</p>}
           <div className="code-block"><pre>{policy}</pre></div>
-          {account.type !== 'aws' && <p className="note note-warn">RAM has no permissions boundary: this key can create csg users with any policy Cloud Safeguard writes. Keep it as safe as the broker key, or safer.</p>}
+          {account.type !== 'aws' && <p className="note note-warn">RAM has no permissions boundary, and this key may write csg policies with any content: whoever holds it can give a csg user full access to the account. Treat it as an account administrator's key.</p>}
           {account.mode !== 'mock' && <>
             <Field label="Access key ID" value={keyId} onChange={setKeyId} autoComplete="off" />
             <Field label="Secret" value={secret} onChange={setSecret} type="password" autoComplete="off" />

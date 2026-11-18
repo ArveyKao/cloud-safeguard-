@@ -1259,6 +1259,10 @@ func (s *Server) sweepOnce(ctx context.Context) {
 	if err := s.db.ExpireLongLivedRequests(ctx, now); err != nil {
 		s.logf("sweeper: expire long-lived requests: %v", err)
 	}
+	// Changes made outside the server (local recovery, a database edit)
+	// reach long-lived keys here: active ones whose owner lost the right are
+	// deleted. revoke_failed ones are retried by a supervisor, not every sweep.
+	s.revokeLongLivedIn(ctx, "", "", map[string]any{"cause": "sweep", "caused_by": "sweeper"}, model.LongLivedActive)
 	if err := s.db.DeleteOldCredentialLinks(ctx, now); err != nil {
 		s.logf("sweeper: delete old credential links: %v", err)
 	}

@@ -89,31 +89,51 @@ export const awsRolePermissions = () => json({
 
 // ---- long-lived keys (CONTRACT §17.14): a second key per account ----
 
-/** AWS: may only manage csg users, and only with the fixed boundary. */
-export const awsUserAdminPolicy = (accountId: string) => json({
-  Version: '2012-10-17',
-  Statement: [
-    {
-      Effect: 'Allow', Action: 'iam:CreateUser', Resource: `arn:aws:iam::${accountId}:user/csg/*`,
-      Condition: { StringEquals: { 'iam:PermissionsBoundary': `arn:aws:iam::${accountId}:policy/cloud-safeguard-boundary` } },
-    },
-    {
-      Effect: 'Allow',
-      Action: ['iam:PutUserPolicy', 'iam:DeleteUserPolicy', 'iam:CreateAccessKey', 'iam:DeleteAccessKey', 'iam:DeleteUser'],
-      Resource: `arn:aws:iam::${accountId}:user/csg/*`,
-    },
-  ],
-})
+/** The managed policy every csg user is bounded by: the role's permissions. */
+export const AWS_BOUNDARY_POLICY_NAME = 'cloud-safeguard-boundary'
+export const awsBoundaryPolicy = awsRolePermissions
 
-/** Alibaba Cloud: may only manage users and policies named csg-*. */
+/**
+ * AWS: may only manage users named csg-* under path /csg/, may only create
+ * them and write their policies while they carry the fixed boundary. The
+ * key's own IAM user must not be under /csg/ nor named csg-* (refused).
+ */
+export const awsUserAdminPolicy = (accountId: string) => {
+  const users = `arn:aws:iam::${accountId}:user/csg/csg-*`
+  const boundary = { StringEquals: { 'iam:PermissionsBoundary': `arn:aws:iam::${accountId}:policy/${AWS_BOUNDARY_POLICY_NAME}` } }
+  return json({
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Effect: 'Allow', Action: ['iam:CreateUser', 'iam:PutUserPermissionsBoundary', 'iam:PutUserPolicy'],
+        Resource: users, Condition: boundary,
+      },
+      {
+        Effect: 'Allow',
+        Action: ['iam:ListAccessKeys', 'iam:CreateAccessKey', 'iam:DeleteAccessKey', 'iam:DeleteUserPolicy', 'iam:DeleteUser'],
+        Resource: users,
+      },
+    ],
+  })
+}
+
+/**
+ * Alibaba Cloud: may only manage users and policies named csg-*. The key's
+ * own RAM user must not be named csg-* (refused).
+ */
 export const userAdminPolicy = (accountId: string) => json({
   Version: '1',
   Statement: [
     {
       Effect: 'Allow',
-      Action: ['ram:CreateUser', 'ram:DeleteUser', 'ram:CreateAccessKey', 'ram:DeleteAccessKey', 'ram:AttachPolicyToUser', 'ram:DetachPolicyFromUser'],
+      Action: ['ram:CreateUser', 'ram:DeleteUser', 'ram:ListAccessKeys', 'ram:CreateAccessKey', 'ram:DeleteAccessKey'],
       Resource: `acs:ram::${accountId}:user/csg-*`,
     },
-    { Effect: 'Allow', Action: ['ram:CreatePolicy', 'ram:DeletePolicy', 'ram:AttachPolicyToUser', 'ram:DetachPolicyFromUser'], Resource: `acs:ram::${accountId}:policy/csg-*` },
+    { Effect: 'Allow', Action: ['ram:CreatePolicy', 'ram:DeletePolicy'], Resource: `acs:ram::${accountId}:policy/csg-*` },
+    {
+      // Both resources in one statement: only a csg policy onto a csg user.
+      Effect: 'Allow', Action: ['ram:AttachPolicyToUser', 'ram:DetachPolicyFromUser'],
+      Resource: [`acs:ram::${accountId}:user/csg-*`, `acs:ram::${accountId}:policy/csg-*`],
+    },
   ],
 })

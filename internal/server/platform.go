@@ -313,14 +313,15 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	// revoked (the re-check fails on "provider is not active").
 	revoked := []string{}
 	if prov.Status != model.ProviderActive {
+		// Long-lived keys first: they do not depend on the lease re-check.
+		actor, _ := sessionFromContext(r.Context())
+		s.revokeLongLivedOfAccount(r.Context(), prov.ID, map[string]any{"cause": "account_disabled", "caused_by": "person:" + actor.person.ID})
 		ids, err := s.revalidateLeases(r.Context(), store.LeaseFilter{}, "provider "+prov.ID+" disabled")
 		if err != nil {
 			s.writeHandlerError(w, err)
 			return
 		}
 		revoked = ids
-		actor, _ := sessionFromContext(r.Context())
-		s.revokeLongLivedOfAccount(r.Context(), prov.ID, map[string]any{"cause": "account_disabled", "caused_by": "person:" + actor.person.ID})
 	}
 	// Repointing the role or switching an account on or off changes what
 	// credentials can do: record it as a warning.

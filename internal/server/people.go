@@ -176,17 +176,35 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.nowUTC()
+	// Validate everything before writing anything.
+	name := ""
 	if in.DisplayName != nil {
-		name, ok := cleanDisplayName(*in.DisplayName)
-		if !ok {
+		var ok bool
+		if name, ok = cleanDisplayName(*in.DisplayName); !ok {
 			s.badRequest(w, "display_name must be at most 100 characters without control characters")
 			return
 		}
+	}
+	if in.Status != nil && *in.Status != model.PersonActive && *in.Status != model.PersonSuspended {
+		s.badRequest(w, "status must be active or suspended")
+		return
+	}
+	if in.DisplayName != nil {
 		if err := s.db.UpdatePersonDisplayName(ctx, id, name, now); err != nil {
 			s.storeErrorResponse(w, err, "person not found")
 			return
 		}
 	}
+	longLivedRemoved := false
+	revokeIfRemoved := func() {
+		if longLivedRemoved {
+			longLivedRemoved = false
+			s.revokeLongLivedNoLongerAllowed(ctx, id, "", map[string]any{
+				"cause": "permission_removed", "caused_by": "person:" + actor.person.ID, "caused_by_username": actor.person.Username})
+		}
+	}
+	// Last, also when a later step fails: the flag is already removed.
+	defer revokeIfRemoved()
 	if in.LongLived != nil && *in.LongLived != person.LongLived {
 		if err := s.db.SetPersonLongLived(ctx, id, *in.LongLived, now); err != nil {
 			s.storeErrorResponse(w, err, "person not found")
@@ -194,10 +212,9 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		}
 		s.personAudit(ctx, actor.person, "person.long_lived_changed", "ok", "critical", "person", id,
 			map[string]any{"username": person.Username, "long_lived": *in.LongLived})
-		if !*in.LongLived {
-			s.revokeLongLivedNoLongerAllowed(ctx, id, "", map[string]any{
-				"cause": "permission_removed", "caused_by": "person:" + actor.person.ID, "caused_by_username": actor.person.Username})
-		}
+		// Checked after the supervisor and status changes below, so a
+		// request that also removes the supervisor flag deletes the keys too.
+		longLivedRemoved = !*in.LongLived
 	}
 	if in.Status != nil || in.Supervisor != nil {
 		modesBefore, err := raisedModes(ctx, s.db, id, now)
@@ -207,10 +224,6 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		}
 		status, supervisor := person.Status, person.Supervisor
 		if in.Status != nil {
-			if *in.Status != model.PersonActive && *in.Status != model.PersonSuspended {
-				s.badRequest(w, "status must be active or suspended")
-				return
-			}
 			status = *in.Status
 		}
 		if in.Supervisor != nil {

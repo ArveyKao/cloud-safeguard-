@@ -207,7 +207,8 @@ export interface LongLivedCredential {
   failure_reason?: string
   revoke_reason?: string
   created_at: string
-  expires_at: string
+  /** the link's expiry, only while pending */
+  expires_at?: string
 }
 
 export interface LongLivedRequestResult { id: string; status: LongLivedStatus; link: string; expires_at: string }

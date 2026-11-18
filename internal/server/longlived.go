@@ -48,7 +48,7 @@ type longLivedTarget struct {
 }
 
 // parseLongLived checks the fields of a request (§17.4 rules, plus a reason).
-func (s *Server) parseLongLived(ctx context.Context, in model.LongLivedRequestInput) (longLivedTarget, error) {
+func (s *Server) parseLongLived(ctx context.Context, ownerID string, in model.LongLivedRequestInput) (longLivedTarget, error) {
 	accountID := strings.TrimSpace(in.CloudAccountID)
 	resource := strings.TrimSpace(in.Resource)
 	permission := capcatalog.Permission(strings.TrimSpace(in.Permission))
@@ -62,12 +62,20 @@ func (s *Server) parseLongLived(ctx context.Context, in model.LongLivedRequestIn
 	if reason == "" || !utf8.ValidString(reason) || utf8.RuneCountInString(reason) > maxReasonLength {
 		return longLivedTarget{}, errBadRequestAPI(fmt.Sprintf("reason is required, at most %d characters; it is shown to the person who confirms", maxReasonLength))
 	}
+	// An unknown account and one without a role look the same, and both
+	// are answered before the resource is looked at: no probing.
+	noRole := &httpError{status: http.StatusForbidden, code: model.ErrCodeForbidden,
+		message: "no role on cloud account " + sanitizeMessage(accountID)}
 	prov, err := s.db.GetProviderByCloudAccountID(ctx, accountID)
 	if errors.Is(err, store.ErrNotFound) {
-		return longLivedTarget{}, &httpError{status: http.StatusForbidden, code: model.ErrCodeForbidden,
-			message: "no role on cloud account " + sanitizeMessage(accountID)}
+		return longLivedTarget{}, noRole
 	}
 	if err != nil {
+		return longLivedTarget{}, err
+	}
+	if _, err := s.personRole(ctx, ownerID, prov.ID); errors.Is(err, store.ErrNotFound) {
+		return longLivedTarget{}, noRole
+	} else if err != nil {
 		return longLivedTarget{}, err
 	}
 	template, ok := capcatalog.LookupAccessTemplate(prov.Type, resource, permission)
@@ -132,7 +140,7 @@ func (s *Server) longLivedProblem(ctx context.Context, personID, providerID, cap
 
 // createLongLivedRequest stores a pending request and returns its link.
 func (s *Server) createLongLivedRequest(ctx context.Context, r *http.Request, owner model.Person, agent *model.Agent, in model.LongLivedRequestInput) (model.LongLivedRequestResult, error) {
-	target, err := s.parseLongLived(ctx, in)
+	target, err := s.parseLongLived(ctx, owner.ID, in)
 	if err != nil {
 		return model.LongLivedRequestResult{}, err
 	}
@@ -226,11 +234,15 @@ func (s *Server) longLivedView(ctx context.Context, row store.LongLivedRow, now 
 		ID: row.ID, ProviderID: row.ProviderID, OwnerID: row.OwnerID, AgentID: row.AgentID, AgentName: row.AgentName,
 		CapabilityID: row.CapabilityID, Reason: row.Reason, Status: row.Status, CloudUser: row.CloudUser,
 		CloudPolicy: row.CloudPolicy, AccessKeyID: row.AccessKeyID, FailureReason: row.FailureReason,
-		RevokeReason: row.RevokeReason, CreatedAt: row.CreatedAt, ExpiresAt: row.ExpiresAt, DecidedAt: row.DecidedAt,
+		RevokeReason: row.RevokeReason, CreatedAt: row.CreatedAt, DecidedAt: row.DecidedAt,
 		RevokedAt: row.RevokedAt,
 	}
 	if v.Status == model.LongLivedPending && !now.Before(row.ExpiresAt) {
 		v.Status = model.LongLivedExpired
+	}
+	if v.Status == model.LongLivedPending || v.Status == model.LongLivedExpired {
+		expires := row.ExpiresAt
+		v.ExpiresAt = &expires
 	}
 	if row.ResourceName != capcatalog.AllResources {
 		v.ResourceName = row.ResourceName
@@ -371,16 +383,44 @@ func (s *Server) handleCreateLongLived(w http.ResponseWriter, r *http.Request) {
 		Provider: prov, AdminAccessKeyID: key.AccessKeyID, AdminAccessKeySecret: key.AccessKeySecret,
 		CredentialID: row.ID, PolicyJSON: policyJSON, SigningKey: s.signingKey,
 	})
+	if errors.Is(err, provider.ErrCleanupFailed) {
+		// Something may be left in the cloud: never show it as gone.
+		reason := sanitizeMessage("the cloud did not create the credential, and deleting what was made failed: " + err.Error())
+		s.needsDeletion(ctx, row.ID, reason)
+		s.personAudit(ctx, person, "long_lived.create_failed", "failed", "critical", "long_lived", row.ID,
+			map[string]any{"reason": reason, "cloud_user": provider.CloudUserName(row.ID), "cleanup_failed": true})
+		s.writeError(w, http.StatusBadGateway, model.ErrCodeConflict, reason+" A supervisor can retry the deletion.")
+		return
+	}
 	if err != nil {
 		fail(http.StatusBadGateway, "the cloud did not create the credential: "+err.Error())
 		return
 	}
 	if err := s.db.SetLongLivedActive(ctx, row.ID, created.UserName, created.PolicyName, created.AccessKeyID, s.nowUTC()); err != nil {
-		// The row changed under us: delete what was created rather than
-		// leave a key nobody tracks.
-		_ = admin.DeleteUser(ctx, provider.UserRequest{Provider: prov, AdminAccessKeyID: key.AccessKeyID, AdminAccessKeySecret: key.AccessKeySecret,
-			CredentialID: row.ID, UserName: created.UserName, PolicyName: created.PolicyName, AccessKeyID: created.AccessKeyID})
+		// Not recorded: delete what was created rather than leave a key
+		// nobody tracks; if that fails too, keep it named for a retry.
+		if derr := admin.DeleteUser(ctx, provider.UserRequest{Provider: prov, AdminAccessKeyID: key.AccessKeyID, AdminAccessKeySecret: key.AccessKeySecret,
+			CredentialID: row.ID, UserName: created.UserName, PolicyName: created.PolicyName}); derr != nil {
+			s.needsDeletion(ctx, row.ID, "recording the credential failed, and deleting it failed: "+derr.Error())
+		} else if ferr := s.db.SetLongLivedFailed(ctx, row.ID, "recording the credential failed; it was deleted", s.nowUTC()); ferr != nil {
+			s.logf("long-lived %s: record failure: %v", row.ID, ferr)
+		}
 		s.writeHandlerError(w, err)
+		return
+	}
+	// The right may have gone while the cloud calls ran (an automatic
+	// deletion skips a credential that is still being created): check again
+	// and delete it before the secret is shown.
+	if problem, err := s.longLivedProblem(ctx, row.OwnerID, row.ProviderID, row.CapabilityID, row.ResourceName); err != nil || problem != "" {
+		if err != nil {
+			problem = "the permission could not be checked again"
+		}
+		if active, gerr := s.db.GetLongLived(ctx, row.ID); gerr == nil {
+			if _, rerr := s.revokeLongLived(ctx, active, "automatic: "+problem, nil, map[string]any{"cause": "changed_while_creating"}); rerr != nil {
+				s.logf("revoke long-lived %s: %v", row.ID, rerr)
+			}
+		}
+		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, sanitizeMessage(problem+"; the credential was deleted again"))
 		return
 	}
 	s.personAudit(ctx, person, "long_lived.created", "ok", "critical", "long_lived", row.ID, map[string]any{
@@ -406,6 +446,49 @@ func (s *Server) handleCreateLongLived(w http.ResponseWriter, r *http.Request) {
 		Credential: s.longLivedView(ctx, updated, s.nowUTC()), AccessKeyID: created.AccessKeyID,
 		AccessKeySecret: created.AccessKeySecret, Env: env,
 	})
+}
+
+// needsDeletion marks a credential that may exist in the cloud as
+// revoke_failed, named after its ID, so its deletion can be retried.
+func (s *Server) needsDeletion(ctx context.Context, id, reason string) {
+	name := provider.CloudUserName(id)
+	if err := s.db.SetLongLivedNeedsDeletion(ctx, id, name, name, sanitizeMessage(reason), s.nowUTC()); err != nil {
+		s.logf("long-lived %s: mark for deletion: %v", id, err)
+	}
+}
+
+// interruptedLongLived marks credentials left creating or revoking by a
+// crash as revoke_failed and returns them; recoverLongLived deletes them.
+// Run once at startup, before anything can be creating in this process.
+func (s *Server) interruptedLongLived(ctx context.Context) ([]string, error) {
+	rows, err := s.db.ListLongLived(ctx, store.LongLivedFilter{
+		Statuses: []model.LongLivedStatus{model.LongLivedCreating, model.LongLivedRevoking}})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		s.needsDeletion(ctx, row.ID, "interrupted while "+map[model.LongLivedStatus]string{
+			model.LongLivedCreating: "creating", model.LongLivedRevoking: "deleting"}[row.Status]+"; deleted to be sure")
+		ids = append(ids, row.ID)
+	}
+	return ids, nil
+}
+
+// recoverLongLived deletes the interrupted credentials, then deletes every
+// credential whose owner lost the right while the server was down.
+func (s *Server) recoverLongLived(ctx context.Context, interrupted []string) {
+	cause := map[string]any{"cause": "startup_check", "caused_by": "startup check"}
+	for _, id := range interrupted {
+		row, err := s.db.GetLongLived(ctx, id)
+		if err != nil || row.Status != model.LongLivedRevokeFailed {
+			continue
+		}
+		if _, err := s.revokeLongLived(ctx, row, "automatic: interrupted", nil, cause); err != nil {
+			s.logf("revoke long-lived %s: %v", id, err)
+		}
+	}
+	s.revokeLongLivedNoLongerAllowed(ctx, "", "", cause)
 }
 
 // revokeLongLived deletes a credential in the cloud and records the outcome.
@@ -453,8 +536,12 @@ func (s *Server) revokeLongLived(ctx context.Context, row store.LongLivedRow, re
 // revokeLongLivedNoLongerAllowed deletes the credentials of a person (on one
 // account, or all when providerID is empty) that they may no longer hold.
 func (s *Server) revokeLongLivedNoLongerAllowed(ctx context.Context, personID, providerID string, cause map[string]any) []string {
-	rows, err := s.db.ListLongLived(ctx, store.LongLivedFilter{OwnerID: personID, ProviderID: providerID,
-		Statuses: []model.LongLivedStatus{model.LongLivedActive, model.LongLivedRevokeFailed}})
+	return s.revokeLongLivedIn(ctx, personID, providerID, cause, model.LongLivedActive, model.LongLivedRevokeFailed)
+}
+
+// revokeLongLivedIn is revokeLongLivedNoLongerAllowed over the given statuses.
+func (s *Server) revokeLongLivedIn(ctx context.Context, personID, providerID string, cause map[string]any, statuses ...model.LongLivedStatus) []string {
+	rows, err := s.db.ListLongLived(ctx, store.LongLivedFilter{OwnerID: personID, ProviderID: providerID, Statuses: statuses})
 	if err != nil {
 		s.logf("list long-lived credentials of %s: %v", personID, err)
 		return nil
@@ -462,7 +549,11 @@ func (s *Server) revokeLongLivedNoLongerAllowed(ctx context.Context, personID, p
 	var revoked []string
 	for _, row := range rows {
 		problem, err := s.longLivedProblem(ctx, row.OwnerID, row.ProviderID, row.CapabilityID, row.ResourceName)
-		if err != nil || problem == "" {
+		if err != nil {
+			s.logf("long-lived %s: check the owner's right: %v", row.ID, err)
+			continue
+		}
+		if problem == "" {
 			continue
 		}
 		if _, err := s.revokeLongLived(ctx, row, "automatic: "+problem, nil, cause); err != nil {

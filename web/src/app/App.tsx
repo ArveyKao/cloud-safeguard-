@@ -25,6 +25,8 @@ import { SettingsPage } from './pages/Settings'
 // csg signed in as the person, /?mcp-connect=ID for a remote MCP client.
 const SIGNIN_KEY = 'csg.pendingSignIn'
 const SIGNIN_TTL_MS = 10 * 60 * 1000
+// A long-lived link is valid for an hour on the server; keep it as long.
+const LONG_LIVED_TTL_MS = 60 * 60 * 1000
 
 export type SignInKind = 'agent' | 'cli' | 'mcp' | 'long-lived'
 
@@ -37,7 +39,8 @@ export function takeSignIn(): { code: string; kind: SignInKind } | null {
     const raw = sessionStorage.getItem(SIGNIN_KEY)
     sessionStorage.removeItem(SIGNIN_KEY)
     const v = raw ? JSON.parse(raw) as { code?: string; kind?: string; at?: number } : null
-    if (!v?.code || !v.at || Date.now() - v.at >= SIGNIN_TTL_MS) return null
+    const ttl = v?.kind === 'long-lived' ? LONG_LIVED_TTL_MS : SIGNIN_TTL_MS
+    if (!v?.code || !v.at || Date.now() - v.at >= ttl) return null
     return { code: v.code, kind: v.kind === 'cli' || v.kind === 'mcp' || v.kind === 'long-lived' ? v.kind : 'agent' }
   } catch {
     return null

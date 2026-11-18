@@ -1354,19 +1354,24 @@ deleted in the cloud as soon as its owner is no longer allowed to hold it.
 - `PUT /api/v1/supervisor/accounts/{id}/user-admin {access_key_id, access_key_secret}` stores
   a second key, encrypted like the broker key and never shown again (masked ID only). Its own
   policy, shown in the console, allows only:
-  - AWS: `iam:CreateUser` on `arn:aws:iam::ACCOUNT:user/csg/*` with the condition
-    `iam:PermissionsBoundary = arn:aws:iam::ACCOUNT:policy/cloud-safeguard-boundary`, and
-    `iam:PutUserPolicy`, `iam:DeleteUserPolicy`, `iam:CreateAccessKey`, `iam:DeleteAccessKey`,
-    `iam:DeleteUser` on `user/csg/*`. The boundary policy (created by the supervisor, also
-    shown) is the role's permission policy of §17.13: whatever is put on a `csg` user, it
-    can never do more, and never IAM.
-  - Alibaba Cloud: `ram:CreateUser`, `ram:DeleteUser`, `ram:CreateAccessKey`,
-    `ram:DeleteAccessKey`, `ram:AttachPolicyToUser`, `ram:DetachPolicyFromUser` on
-    `user/csg-*`, and `ram:CreatePolicy`, `ram:DeletePolicy` on `policy/csg-*`. RAM has no
-    permissions boundary, so here the policy Cloud Safeguard writes (a §17.4 template plus
-    the IAM deny) is the only limit: a leak of this key is more serious than of the broker
-    key.
-- The connection test of the second key checks it can sign a harmless call.
+  - AWS: `iam:CreateUser`, `iam:PutUserPermissionsBoundary` and `iam:PutUserPolicy` on
+    `arn:aws:iam::ACCOUNT:user/csg/csg-*`
+    with the condition `iam:PermissionsBoundary =
+    arn:aws:iam::ACCOUNT:policy/cloud-safeguard-boundary`, and `iam:ListAccessKeys`,
+    `iam:CreateAccessKey`, `iam:DeleteAccessKey`, `iam:DeleteUserPolicy`, `iam:DeleteUser` on
+    `user/csg/csg-*`. The boundary is a customer managed policy `cloud-safeguard-boundary`
+    the supervisor creates first; the console shows its content, the role's permission
+    policy of §17.13: whatever is put on a `csg` user, it can never do more, and never IAM.
+  - Alibaba Cloud: `ram:CreateUser`, `ram:DeleteUser`, `ram:ListAccessKeys`,
+    `ram:CreateAccessKey`, `ram:DeleteAccessKey` on `user/csg-*`; `ram:CreatePolicy`,
+    `ram:DeletePolicy` on `policy/csg-*`; and `ram:AttachPolicyToUser`,
+    `ram:DetachPolicyFromUser` on both together (a `csg` policy onto a `csg` user only). RAM
+    has no permissions boundary, and this key may write `csg` policies with any content:
+    whoever holds it can give a `csg` user full access to the account. It is an account
+    administrator's key in effect, and the console says so.
+- The connection test of the second key checks it can sign a harmless call, and refuses a
+  key whose own user is one Cloud Safeguard manages (path `/csg/`, or a name starting with
+  `csg-`): such a key could change its own policies.
 - `DELETE /api/v1/supervisor/accounts/{id}/user-admin` removes it; refused (409) while
   long-lived credentials of that account exist. Both are audited at critical level.
 
@@ -1378,7 +1383,8 @@ permission. Anyone else, and their agents, are refused.
 **Asking.** `POST /api/v1/me/long-lived` (person session) or `POST
 /api/v1/agent/long-lived` (agent token; MCP `request_long_lived_credential`) with
 `cloud_account_id`, `resource`, `permission`, optional `resource_name`, and `reason`
-(required). The checks of §17.4 apply (template, name pattern, role, IAM prohibition), plus
+(required). An unknown account and one the person has no role on get the same 403, before
+the resource is looked at. The checks of §17.4 apply (template, name pattern, role, IAM prohibition), plus
 the person's permission and the account's second key. The answer is `{id, status: pending,
 link, expires_at}`: a console link `/?long-lived=KEY` valid for one hour. The key is stored
 only as a hash and masked in the logs. Nothing is created and no secret goes to the agent.
@@ -1395,20 +1401,32 @@ check runs again. Cloud Safeguard then creates, in the cloud:
 
 and answers with the access key ID and secret, once. Cloud Safeguard stores the user name,
 the policy name and the access key ID, never the secret. If any step fails, what was created
-is deleted again and the request is `failed` with the cloud's error.
+is deleted again and the request is `failed` with the cloud's error; if that deletion fails
+too, the credential is `revoke_failed` (below), named `csg-<id>`. After the cloud calls every
+check runs once more: if the right went meanwhile (an automatic deletion skips a credential
+still being created), the credential is deleted and the secret is not shown.
 
 **No expiry, and deletion.**
 - The key lives until it is revoked: by its owner (`POST /api/v1/me/long-lived/{id}/revoke`)
   or any supervisor (`POST /api/v1/supervisor/long-lived/{id}/revoke`), from the console or
-  the command line. Revoking deletes the access key, the policy and the user, in that order.
+  the command line. Revoking lists the user's access keys and deletes each (so a key whose
+  ID was never recorded goes too), then the policy and the user; parts already gone are
+  skipped. Only `csg-` users are ever deleted.
 - It is revoked automatically, with the same deletion, when its owner is suspended or reset,
   loses the permission (flag removed, or supervisor flag removed without the flag), loses the
   role on the account or keeps a role that no longer permits its permission, or when the
   account is disabled.
 - If a deletion fails in the cloud, the credential is `revoke_failed` with the error; a
   supervisor can retry the revoke. It is never shown as gone while the key may still exist.
+- At startup, a credential left `creating` or `revoking` by a crash becomes `revoke_failed`
+  and is deleted; then every active credential is checked again, like leases, and deleted
+  if its owner lost the right while the server was down. Every sweep checks the active ones
+  again too, so a change made outside the server (`csg supervisor recover`, a database
+  edit) deletes them within a sweep interval.
 - `GET /api/v1/me/long-lived` lists a person's own; `GET /api/v1/supervisor/long-lived`
-  lists all (account, cloud user, scope, owner, who asked, created, status).
+  lists all (account, cloud user, scope, owner, who asked, created, status), at most 500,
+  newest first. `expires_at` is the link's expiry and is present only while a request is
+  pending (or expired): a created credential has none.
 - Every request, create, deny, revoke and failure is audited; create and revoke at critical
   level. The secret and the link key never reach a log or the audit log.
 

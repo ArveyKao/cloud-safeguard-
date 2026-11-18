@@ -53,9 +53,11 @@ type LongLivedCredential struct {
 	FailureReason    string          `json:"failure_reason,omitempty"`
 	RevokeReason     string          `json:"revoke_reason,omitempty"`
 	CreatedAt        time.Time       `json:"created_at"`
-	ExpiresAt        time.Time       `json:"expires_at"`
-	DecidedAt        *time.Time      `json:"decided_at,omitempty"`
-	RevokedAt        *time.Time      `json:"revoked_at,omitempty"`
+	// ExpiresAt is the link's expiry, only while the request is pending
+	// (or expired): a created credential has no expiry.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	DecidedAt *time.Time `json:"decided_at,omitempty"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
 }
 
 // LongLivedRequestInput asks for a long-lived credential.

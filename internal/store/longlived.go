@@ -149,6 +149,15 @@ func (db *DB) SetLongLivedFailed(ctx context.Context, id, reason string, now tim
 		`, failure_reason = ?`, reason)
 }
 
+// SetLongLivedNeedsDeletion moves a credential left creating or revoking (a
+// failed cleanup, a failed write or a crash) to revoke_failed: it may exist in
+// the cloud, so it is named and its deletion can be retried.
+func (db *DB) SetLongLivedNeedsDeletion(ctx context.Context, id, cloudUser, cloudPolicy, reason string, now time.Time) error {
+	return db.moveLongLived(ctx, id, []model.LongLivedStatus{model.LongLivedCreating, model.LongLivedRevoking}, model.LongLivedRevokeFailed, now,
+		`, cloud_user = CASE WHEN cloud_user = '' THEN ? ELSE cloud_user END, cloud_policy = CASE WHEN cloud_policy = '' THEN ? ELSE cloud_policy END, failure_reason = ?`,
+		cloudUser, cloudPolicy, reason)
+}
+
 // DenyLongLived declines a pending request.
 func (db *DB) DenyLongLived(ctx context.Context, id string, now time.Time) error {
 	return db.moveLongLived(ctx, id, []model.LongLivedStatus{model.LongLivedPending}, model.LongLivedDenied, now,
