@@ -281,14 +281,15 @@ func (db *DB) SetLeaseCredential(ctx context.Context, leaseID, encryptedCredenti
 // compare-and-set on the lease being active with the deadline the caller
 // read, so two refreshes cannot both win and a revoke or expiry in between
 // is never undone; ErrConflict otherwise.
-func (db *DB) RefreshLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string, previousExpiry, newExpiry, now time.Time) error {
+func (db *DB) RefreshLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string, previousExpiry, newExpiry, windowEnd, now time.Time) error {
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE leases SET encrypted_credential = ?, credential_fingerprint = ?, credential_available = 1,
-			expires_at = ?, refresh_count = refresh_count + 1, last_refreshed_at = ?
+			expires_at = ?, refresh_count = refresh_count + 1
 		 WHERE id = ? AND status = ? AND expires_at = ? AND expires_at > ?
-		   AND refresh_until IS NOT NULL AND ? <= refresh_until`,
-		encryptedCredential, fingerprint, toMillis(newExpiry), toMillis(now),
-		leaseID, string(model.LeaseActive), toMillis(previousExpiry), toMillis(now), toMillis(newExpiry))
+		   AND refresh_until IS NOT NULL AND ? <= refresh_until AND ? <= ?`,
+		encryptedCredential, fingerprint, toMillis(newExpiry),
+		leaseID, string(model.LeaseActive), toMillis(previousExpiry), toMillis(now), toMillis(newExpiry),
+		toMillis(newExpiry), toMillis(windowEnd))
 	if err != nil {
 		return mapErr(err)
 	}
@@ -299,6 +300,20 @@ func (db *DB) RefreshLeaseCredential(ctx context.Context, leaseID, encryptedCred
 		return ErrConflict
 	}
 	return ErrNotFound
+}
+
+// ReserveRefreshAttempt records a refresh attempt of an active lease at now,
+// unless one was recorded less than interval ago (ErrConflict). It runs
+// before the cloud is asked, so failed attempts count too (CONTRACT §17.12).
+func (db *DB) ReserveRefreshAttempt(ctx context.Context, leaseID string, now time.Time, interval time.Duration) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE leases SET last_refreshed_at = ?
+		 WHERE id = ? AND status = ? AND (last_refreshed_at IS NULL OR last_refreshed_at <= ?)`,
+		toMillis(now), leaseID, string(model.LeaseActive), toMillis(now.Add(-interval)))
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrConflict(res)
 }
 
 // GetLeaseCredential returns the encrypted credential blob.

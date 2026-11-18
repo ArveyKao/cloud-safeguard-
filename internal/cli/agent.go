@@ -170,7 +170,7 @@ func (a *App) runExec(args []string) error {
 	}
 
 	fs := a.newFlagSet("exec", `Usage: csg exec --account ID --resource R --permission P --ttl DUR [--name NAME]
-                [--reason TEXT] [--keep] [--wait DUR] -- CMD [ARGS...]
+                [--reason TEXT] [--max-lifetime DUR] [--keep] [--wait DUR] -- CMD [ARGS...]
 
 Asks for access, injects the Alibaba Cloud credential environment variables and
 runs CMD. The credential is revoked when CMD exits unless --keep is given. The

@@ -454,10 +454,10 @@ logs the console URL + API URL, seeds nothing, starts sweeper, and serves until 
   and uses the session cookie and its CSRF token; it never stores a token in `localStorage`.
   Screens: Inbox (requests waiting for the person, approve/deny/revoke), agent sign-in
   approval (`/?signin=CODE`, the link `csg login` prints), Agents, Cloud accounts (everyone's
-  own roles; for supervisors also every account with people, roles, highest automatic level,
-  connection test, key replacement, disable, and a three-step add wizard), Activity (the
-  person's own requests; the audit log for supervisors), People (supervisors), Settings
-  (approval mode; platform limits for supervisors). The older admin-token console below is
+  own roles and their approval mode on each, §17.11; for supervisors also every account with
+  people, roles, connection test, key replacement, disable, and a three-step add wizard),
+  Activity (the person's own requests; the audit log for supervisors), People (supervisors),
+  Settings (command-line sign-ins; platform limits for supervisors). The older admin-token console below is
   removed; the remaining requirements in this section describe that older console.
 - Every response carries `X-Frame-Options: DENY`, a `Content-Security-Policy` that allows only
   the console's own files and `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff` and
@@ -749,7 +749,7 @@ each part. This section is the running behaviour. Rationale: ADR-015.
   role.
 - **Supervisors are Administrator on every cloud account** (owner's decision, 2026-11-14): no
   role binding is needed, and their agents may ask for up to `full` on every account; their
-  approval mode and each account's highest automatic level still decide what waits for them.
+  approval mode on each account (§17.11) still decides what waits for them.
   Removing the flag revokes what their agents hold beyond their own role bindings.
 - **Supervisor**: a person with the platform flag `supervisor`. `csg init` creates the first one.
   Only supervisors may add, change or disable cloud accounts, create or suspend people, grant
@@ -993,9 +993,10 @@ It is a thin client of the agent API and holds only the agent token saved by `cs
 | Tool | Does |
 | --- | --- |
 | `list_accounts` | Cloud accounts the agent may ask for, with the inherited role, highest permission and `automatic_up_to`. |
-| `request_access` | The §17.4 fields: `cloud_account_id`, `resource`, `permission`, `ttl_seconds`, optional `resource_name` and `reason`. |
-| `check_status` | Status of a request. |
+| `request_access` | The §17.4 fields: `cloud_account_id`, `resource`, `permission`, `ttl_seconds`, optional `resource_name`, `reason` and `max_lifetime_seconds` (§17.12). |
+| `check_status` | Status of a request, with `expires_at` and, once issued, `refresh_until`, `max_lifetime_seconds` and `refresh_count`. |
 | `get_credential` | Writes the credential to `~/.config/cloud-safeguard/credentials/<request id>.env` (directory 0700, file 0600) as `export` lines and returns only the path, expiry and `source <path>`. The secret is never returned to the model, so it stays out of transcripts, logs and model-provider requests. |
+| `refresh_credential` | A new key under the same request (§17.12), then handed over as `get_credential` does. |
 | `revoke` | Ends the request and deletes its credential file. |
 
 Request IDs are validated (`lea_` + 32 hex) before use, so a tool argument can never name another
@@ -1249,9 +1250,10 @@ one rule per cloud account, which only that person sets.
 - `GET /api/v1/me/accounts` shows, per account, the role, the mode (`approval_mode`, with
   `approval_mode_expires_at`) and `automatic_up_to`. Agents still see only `automatic_up_to`.
 - The mode is read when the request is made (a snapshot), as before. Removing a person's role
-  on an account removes their mode there; resetting a person or recovering a supervisor puts
-  every mode back to `read`. Changes are audited (`person.approval_mode_changed`, with the
-  account).
+  on an account removes their mode there (and losing the supervisor flag removes it where no
+  role binding is); resetting or suspending a person, or recovering a supervisor, puts every
+  mode back to `read`. Changes are audited (`person.approval_mode_changed`, with the
+  account); modes removed by such a change are listed as `removed_modes` in its event.
 - **Upgrade.** A person's former single mode becomes their mode on each account where they
   hold a role, lowered to that account's former highest automatic level, with the former
   expiry. Nothing becomes more automatic than it was.
@@ -1272,8 +1274,10 @@ one rule per cloud account, which only that person sets.
   refresh_until − now)`. Below the provider minimum (900 s for real STS) it answers 409: make a
   new request. A refresh repeats every check of a release (agent and owner active, the owner's
   role still permits it, the account active, the IAM prohibition) but not the approval: a
-  request approved above the mode may be refreshed within its window. At most one refresh per
-  request per 60 seconds (429 otherwise). The new key replaces the stored one; the earlier key
+  request approved above the mode may be refreshed within its window. At most one refresh
+  attempt per request per 60 seconds, failed attempts included (429 otherwise). A lowered
+  `max_refresh_lifetime_seconds` applies at once: a window is cut to `issued_at` + the
+  current limit (but never below one key) at approval and at every refresh. The new key replaces the stored one; the earlier key
   stays valid at the cloud until its own deadline (an STS key cannot be withdrawn). Audited as
   `lease.refreshed` with the masked key ID and the new deadline. Revoking the request ends
   refreshes at once.
@@ -1331,7 +1335,7 @@ create a cloud user with an access key for them, under strict control.
 | `csg init` first supervisor, `csg supervisor recover` | implemented |
 | Agent ownership and agent-first sign-in (§17.3 item 2) | implemented, schema version 4 |
 | Five-field request, permission levels, owner approval (§17.4, §17.5) | implemented, schema version 5 |
-| Approval modes and per-account highest automatic level (§17.5) | implemented, schema version 6 |
+| Approval modes and per-account highest automatic level (§17.5) | implemented in schema version 6; replaced by §17.11 |
 | Supervisor API for cloud accounts, settings, audit and the emergency stop | implemented |
 | Supervisors are Administrator on every cloud account (§17.1) | implemented |
 | Removal of the admin token and the §16 agent model (§17.7a) | implemented, schema version 8 |

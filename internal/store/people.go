@@ -224,7 +224,13 @@ func (db *DB) SetPersonAuthority(ctx context.Context, id string, status model.Pe
 		if n, _ := res.RowsAffected(); n == 0 {
 			return db.explainAuthorityRefusal(ctx, tx, id)
 		}
-		if !supervisor {
+		if status != model.PersonActive {
+			// A suspension is an emergency stop: every mode goes back to
+			// read, as at a reset, and the person chooses again.
+			if _, err := tx.ExecContext(ctx, `DELETE FROM account_modes WHERE person_id = ?`, id); err != nil {
+				return mapErr(err)
+			}
+		} else if !supervisor {
 			// Without the flag, modes remain only where a role binding is.
 			if _, err := tx.ExecContext(ctx,
 				`DELETE FROM account_modes WHERE person_id = ?

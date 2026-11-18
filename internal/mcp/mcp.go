@@ -273,6 +273,10 @@ func RequestView(req model.AccessRequest) map[string]any {
 	if req.RefreshUntil != nil {
 		v["refresh_until"] = req.RefreshUntil.UTC().Format(time.RFC3339)
 	}
+	if req.MaxLifetimeSeconds > 0 {
+		v["max_lifetime_seconds"] = req.MaxLifetimeSeconds
+		v["refresh_count"] = req.RefreshCount
+	}
 	switch req.Status {
 	case model.LeasePending:
 		v["next"] = "Waiting for the person who owns you to approve it in the Cloud Safeguard console. Tell the user, then call check_status."

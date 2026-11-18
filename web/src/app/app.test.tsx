@@ -133,6 +133,20 @@ describe('approval mode', () => {
     expect(sent.expires_in_seconds).toBeLessThanOrEqual(3600)
   })
 
+  it('asks before keeping a temporary mode longer', async () => {
+    const end = new Date(Date.now() + 3600_000).toISOString()
+    routes['GET /me/accounts'] = { items: [{ ...account, approval_mode: 'write', approval_mode_expires_at: end }], total: 1 }
+    routes['PUT /me/accounts/prv_1/mode'] = account
+    wrap(<AccountsPage person={{ ...person, supervisor: false }} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Change' }))
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: '86400' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(changes().length).toBe(0)
+    fireEvent.click(await screen.findByRole('button', { name: 'Switch' }))
+    await waitFor(() => expect(changes().length).toBe(1))
+    expect((changes()[0].body as { expires_in_seconds: number }).expires_in_seconds).toBe(86400)
+  })
+
   it('asks before raising the mode, on that account only', async () => {
     routes['GET /me/accounts'] = { items: [account], total: 1 }
     routes['PUT /me/accounts/prv_1/mode'] = account

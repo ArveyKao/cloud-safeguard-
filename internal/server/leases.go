@@ -168,7 +168,7 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 		lease.Status = model.LeaseActive
 		lease.IssuedAt = &issuedAt
 		lease.ExpiresAt = &expiresAt
-		openRefreshWindow(&lease, now)
+		openRefreshWindow(&lease, now, s.refreshLimit(ctx))
 		if err := s.activateLease(ctx, lease); err != nil {
 			return model.Lease{}, err
 		}
@@ -189,12 +189,28 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 }
 
 // openRefreshWindow starts the refresh window of an access request when its
-// first key is issued (CONTRACT §17.12). Other leases have none.
-func openRefreshWindow(lease *model.Lease, issuedAt time.Time) {
-	if lease.MaxLifetimeSeconds > 0 {
-		until := issuedAt.Add(time.Duration(lease.MaxLifetimeSeconds) * time.Second)
-		lease.RefreshUntil = &until
+// first key is issued (CONTRACT §17.12). Other leases have none. The window
+// is cut to the supervisor's current limit, which may have been lowered
+// while the request waited, but never below the key itself.
+func openRefreshWindow(lease *model.Lease, issuedAt time.Time, limitSeconds int) {
+	if lease.MaxLifetimeSeconds <= 0 {
+		return
 	}
+	if limitSeconds > 0 && lease.MaxLifetimeSeconds > limitSeconds {
+		lease.MaxLifetimeSeconds = max(limitSeconds, lease.EffectiveTTLSeconds)
+	}
+	until := issuedAt.Add(time.Duration(lease.MaxLifetimeSeconds) * time.Second)
+	lease.RefreshUntil = &until
+}
+
+// refreshLimit is the supervisor's current refresh limit, or 0 when it
+// cannot be read (the stored window then applies alone).
+func (s *Server) refreshLimit(ctx context.Context) int {
+	settings, err := s.db.GetPolicySettings(ctx)
+	if err != nil {
+		return 0
+	}
+	return settings.MaxRefreshLifetimeSeconds
 }
 
 // policyViolation returns a non-empty, human-readable violation when the
@@ -682,7 +698,7 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 	lease.Status = model.LeaseActive
 	lease.IssuedAt = &issuedAt
 	lease.ExpiresAt = &expiresAt
-	openRefreshWindow(&lease, now)
+	openRefreshWindow(&lease, now, s.refreshLimit(ctx))
 	if err := s.activateLease(ctx, lease); err != nil {
 		return model.Lease{}, err
 	}
@@ -1260,6 +1276,11 @@ func (s *Server) sweepOnce(ctx context.Context) {
 func (s *Server) expireLease(ctx context.Context, lease model.Lease, reason string) {
 	current, err := s.db.GetLease(ctx, lease.ID)
 	if err != nil || current.Status != lease.Status {
+		return
+	}
+	// A refresh may have moved the deadline since the sweep listed the
+	// lease: an active lease whose current deadline is still ahead stays.
+	if current.Status == model.LeaseActive && current.ExpiresAt != nil && current.ExpiresAt.After(s.nowUTC()) {
 		return
 	}
 	// Terminal status first, then scrub (see markLeaseRevoked).

@@ -442,7 +442,8 @@ type Lease struct {
 	MaxLifetimeSeconds int        `json:"max_lifetime_seconds,omitempty"`
 	RefreshUntil       *time.Time `json:"refresh_until,omitempty"`
 	RefreshCount       int        `json:"refresh_count,omitempty"`
-	LastRefreshedAt    *time.Time `json:"last_refreshed_at,omitempty"`
+	// LastRefreshedAt is the last refresh attempt, successful or not.
+	LastRefreshedAt *time.Time `json:"last_refreshed_at,omitempty"`
 }
 
 // CreateLeaseInput is the agent request body for POST /agent/leases.

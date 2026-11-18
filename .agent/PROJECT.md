@@ -70,7 +70,8 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 - **§17 approval modes (2026-11-12, plan confirmed by the owner with the explainer video):**
   each person chooses one mode for all their agents (read default, write, full; optional
   expiry); a supervisor sets each cloud account's highest automatic level (default read);
-  automatic = the lower of the two, after the role check. Schema v6. Built by Lead, verified
+  automatic = the lower of the two, after the role check. Schema v6. (Superseded on
+  2026-11-17 by modes per account, see Piece 4 below.) Built by Lead, verified
   locally (tests, race, demo, live run); not yet committed or cross-family reviewed.
 - **Supervisor API (2026-11-12):** cloud accounts, settings, audit and the emergency stop
   under `/api/v1/supervisor/`, reusing the operator handlers with actions attributed to the

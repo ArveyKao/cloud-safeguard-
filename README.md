@@ -177,9 +177,9 @@ never approve itself:
 ./build/csg supervisor roles set 1234567890123456 mei member --code 123456
 ```
 
-Or run the whole scripted demo (ten scenarios: setup, agent sign-in, automatic read, least
+Or run the whole scripted demo (twelve scenarios: setup, agent sign-in, automatic read, least
 privilege, denial, approval, revocation, emergency stop, a supervisor on the command line,
-audit) in one command:
+remote MCP, approval mode per account with refresh, audit) in one command:
 
 ```bash
 make demo

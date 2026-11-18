@@ -263,10 +263,10 @@ End it with `csg person logout`, or from the console in **Settings → Command-l
 make demo
 ```
 
-It starts its own instance on port 18787 and runs ten scenarios end to end (setup, agent
+It starts its own instance on port 18787 and runs twelve scenarios end to end (setup, agent
 sign-in, automatic read, least privilege, denial, approval, revocation on a role change,
-the supervisor's emergency stop, a supervisor on the command line, audit and a secret-leak
-check), then prints `all S1-S12 scenarios passed`.
+the supervisor's emergency stop, a supervisor on the command line, remote MCP, approval
+mode per account with refresh, audit and a secret-leak check), then prints `all S1-S12 scenarios passed`.
 
 ## 1.15 Clean up
 

@@ -829,10 +829,8 @@ func (db *DB) GetPolicySettings(ctx context.Context) (model.PolicySettings, erro
 	}
 	// Settings stored before the refresh limit existed get its default.
 	if s.MaxRefreshLifetimeSeconds == 0 {
-		s.MaxRefreshLifetimeSeconds = model.DefaultPolicySettings().MaxRefreshLifetimeSeconds
-		if s.MaxRefreshLifetimeSeconds < s.MaxLeaseTTLSeconds {
-			s.MaxRefreshLifetimeSeconds = s.MaxLeaseTTLSeconds
-		}
+		s.MaxRefreshLifetimeSeconds = min(max(model.DefaultPolicySettings().MaxRefreshLifetimeSeconds, s.MaxLeaseTTLSeconds),
+			model.MaxRefreshLifetimeLimit)
 	}
 	return s, nil
 }

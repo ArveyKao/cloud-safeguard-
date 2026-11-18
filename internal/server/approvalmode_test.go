@@ -384,3 +384,46 @@ func TestResetAndRecoveryRecordTheModesTheyClear(t *testing.T) {
 		t.Fatalf("mode after recovery = %s", got)
 	}
 }
+
+// A suspension puts every mode back to read; removed modes are audited.
+func TestSuspensionAndRoleRemovalClearModesAndSaySo(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	requireCode(t, a.setMode(a.mei, model.ModeFull, 0), http.StatusOK)
+	suspended, active := model.PersonSuspended, model.PersonActive
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+a.mei.person.ID, model.UpdatePersonInput{Status: &suspended}), http.StatusOK)
+	requireStatus(t, a.sup.do(http.MethodPatch, "/api/v1/supervisor/people/"+a.mei.person.ID, model.UpdatePersonInput{Status: &active}), http.StatusOK)
+	if got := a.storedMode(a.mei); got != model.ModeRead {
+		t.Fatalf("mode after suspension and reactivation = %s", got)
+	}
+	ev := a.listAudit("person.status_changed")
+	var found bool
+	for _, e := range ev {
+		if removed, _ := e.Metadata["removed_modes"].(map[string]any); removed[demoAccountID] == "full" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("suspension audit does not list the removed mode: %+v", ev)
+	}
+
+	mei := a.loginAgain(a.mei)
+	requireCode(t, a.setMode(mei, model.ModeWrite, 0), http.StatusOK)
+	a.unbind(mei)
+	removed := a.listAudit("binding.removed")
+	if len(removed) == 0 {
+		t.Fatal("no binding.removed event")
+	}
+	if m, _ := removed[0].Metadata["removed_modes"].(map[string]any); m[demoAccountID] != "write" {
+		t.Fatalf("binding.removed audit = %+v", removed[0].Metadata)
+	}
+}
+
+// loginAgain signs p in again (a suspension ended their session).
+func (a *accessEnv) loginAgain(p *personClient) *personClient {
+	a.t.Helper()
+	a.nextStep()
+	rec := a.login(p.person.Username, testPassword, a.totp(p.secret, 0))
+	requireStatus(a.t, rec, http.StatusOK)
+	info := decodeEnvelope[model.SessionInfo](a.t, rec)
+	return &personClient{env: a.testEnv, cookie: sessionCookie(rec), csrf: info.CSRFToken, secret: p.secret, person: p.person}
+}

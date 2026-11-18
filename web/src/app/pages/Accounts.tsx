@@ -86,13 +86,17 @@ function ModeDialog({ account, onClose, onSaved }: { account: PersonAccount; onC
   }
   const raising = rank[mode] > rank[account.approval_mode]
   const endingRemoved = hasEnd && mode !== 'read' && expiry === 0
+  // A later end keeps a standing approval longer: confirm that too.
+  const endingLater = hasEnd && mode !== 'read' && expiry > 0 &&
+    Date.now() + expiry * 1000 > new Date(account.approval_mode_expires_at ?? 0).getTime()
 
   return (
     <Modal title={`Approval mode on ${account.name}`} onClose={onClose}>
       {confirming ? (
         <>
           <div className="confirm-body">
-            <p><b>Switch to {what.title.toLowerCase()}{expiry === 0 ? ' until you change it' : ''}?</b></p>
+            <p><b>{raising ? 'Switch to' : 'Keep'} {what.title.toLowerCase()}{expiry === 0 ? ' until you change it'
+              : expiry === KEEP ? '' : ` ${EXPIRY.find((x) => x.seconds === expiry)?.label.toLowerCase()}`}?</b></p>
             <p>{what.text} This applies to all your agents on {account.name}, up to your role ({roleLabel[account.role] ?? account.role}).</p>
           </div>
           <ErrorNote error={action.error} />
@@ -124,7 +128,7 @@ function ModeDialog({ account, onClose, onSaved }: { account: PersonAccount; onC
           <div className="row-actions">
             <Button onClick={onClose}>Cancel</Button>
             <Button kind="primary" busy={action.busy}
-              onClick={() => (raising || endingRemoved ? setConfirming(true) : action.run(save))}>Save</Button>
+              onClick={() => (raising || endingRemoved || endingLater ? setConfirming(true) : action.run(save))}>Save</Button>
           </div>
         </>
       )}

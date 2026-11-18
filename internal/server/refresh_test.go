@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -223,4 +225,129 @@ func TestRefreshLimitSetting(t *testing.T) {
 	if got, err := a.srv.db.GetPolicySettings(context.Background()); err != nil || got.MaxRefreshLifetimeSeconds != 24*3600 {
 		t.Fatalf("old stored settings = %+v, %v", got, err)
 	}
+}
+
+// ---- regression tests for the independent review of commit 762017d ----
+
+// A sweep that listed the lease before a refresh does not expire it.
+func TestStaleSweepDoesNotExpireARefreshedLease(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	req := a.request(accessInput("ecs", "read"))
+	a.clock.Advance(590 * time.Second)
+	stale, err := a.srv.db.GetLease(context.Background(), req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireStatus(t, a.refresh(a.token, req.ID), http.StatusOK)
+	a.clock.Advance(20 * time.Second) // past the old deadline, before the new one
+	a.srv.expireLease(context.Background(), stale, "deadline reached")
+	if a.status(req.ID) != model.LeaseActive {
+		t.Fatal("a stale sweep expired a refreshed lease")
+	}
+	requireStatus(t, a.credential(req.ID), http.StatusOK)
+	a.clock.Advance(600 * time.Second)
+	a.srv.sweepOnce(context.Background())
+	if a.status(req.ID) != model.LeaseExpired {
+		t.Fatal("the refreshed lease did not expire at its own deadline")
+	}
+}
+
+// Failed attempts count towards the once-a-minute limit.
+func TestFailedRefreshAttemptsAreLimited(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	req := a.request(accessInput("ecs", "read"))
+	a.minter.setFailure(errors.New("Throttling: try later"))
+	mints := a.minter.requestCount()
+	requireStatus(t, a.refresh(a.token, req.ID), http.StatusBadGateway)
+	requireStatus(t, a.refresh(a.token, req.ID), http.StatusTooManyRequests)
+	if a.minter.requestCount() != mints+1 {
+		t.Fatalf("the cloud was asked %d times", a.minter.requestCount()-mints)
+	}
+	a.minter.setFailure(nil)
+	a.clock.Advance(61 * time.Second)
+	requireStatus(t, a.refresh(a.token, req.ID), http.StatusOK)
+}
+
+// Two refreshes at once: exactly one wins.
+func TestConcurrentRefreshesHaveOneWinner(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	req := a.request(accessInput("ecs", "read"))
+	a.clock.Advance(2 * time.Minute)
+	var wg sync.WaitGroup
+	codes := make([]int, 4)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i] = a.refresh(a.token, req.ID).Code
+		}(i)
+	}
+	wg.Wait()
+	ok := 0
+	for _, c := range codes {
+		if c == http.StatusOK {
+			ok++
+		}
+	}
+	lease, _ := a.srv.db.GetLease(context.Background(), req.ID)
+	if ok != 1 || lease.RefreshCount != 1 {
+		t.Fatalf("codes %v, refresh count %d", codes, lease.RefreshCount)
+	}
+}
+
+// A lowered limit applies to waiting requests and to issued windows.
+func TestLoweredRefreshLimitApplies(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	long := accessInput("ecs", "read")
+	long.TTLSeconds = 3600
+	issued := a.request(long) // one-hour key, 8 hour window
+	in := accessInput("dns", "write")
+	in.MaxLifetimeSeconds = 24 * 3600
+	waiting := a.request(in)
+
+	rec := a.sup.do(http.MethodGet, "/api/v1/supervisor/settings", nil)
+	settings := decodeEnvelope[model.PolicySettings](t, rec)
+	settings.MaxRefreshLifetimeSeconds = 3600
+	requireStatus(t, a.sup.do(http.MethodPut, "/api/v1/supervisor/settings", settings), http.StatusOK)
+
+	requireStatus(t, a.approve(a.mei, waiting.ID), http.StatusOK)
+	got := decodeEnvelope[model.AccessRequest](t, a.do(http.MethodGet, "/api/v1/agent/access-requests/"+waiting.ID, a.token, nil))
+	if got.MaxLifetimeSeconds != 3600 || !got.RefreshUntil.Equal(a.clock.Now().Add(time.Hour)) {
+		t.Fatalf("approved under a lowered limit: %+v", got)
+	}
+	// The issued request's 8 hour window is cut to issue + 1 hour.
+	a.clock.Advance(50 * time.Minute)
+	rec = a.refresh(a.token, issued.ID)
+	requireStatus(t, rec, http.StatusOK)
+	if r := decodeEnvelope[model.AccessRequest](t, rec); !r.ExpiresAt.Equal(issued.IssuedAt.Add(time.Hour)) {
+		t.Fatalf("refresh past the lowered limit: expires %v", r.ExpiresAt)
+	}
+	a.clock.Advance(10*time.Minute + time.Second)
+	requireStatus(t, a.refresh(a.token, issued.ID), http.StatusConflict)
+}
+
+// Stored settings from before the limit never exceed 30 days.
+func TestOldSettingsStayWithinThirtyDays(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	if _, err := a.srv.db.SQL().Exec(`UPDATE meta SET value = json_remove(json_set(value, '$.max_lease_ttl_seconds', ?), '$.max_refresh_lifetime_seconds') WHERE key = 'policy_settings'`,
+		40*24*3600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.srv.db.GetPolicySettings(context.Background())
+	if err != nil || got.MaxRefreshLifetimeSeconds != model.MaxRefreshLifetimeLimit {
+		t.Fatalf("limit = %d, %v", got.MaxRefreshLifetimeSeconds, err)
+	}
+	in := accessInput("ecs", "read")
+	in.MaxLifetimeSeconds = 35 * 24 * 3600
+	requireStatus(t, a.requestRaw(a.token, in), http.StatusBadRequest)
+}
+
+// A lease from before refresh existed has no window and is not refreshed.
+func TestLeaseWithoutWindowIsNotRefreshed(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	req := a.request(accessInput("ecs", "read"))
+	if _, err := a.srv.db.SQL().Exec(`UPDATE leases SET refresh_until = NULL, max_lifetime_seconds = 0 WHERE id = ?`, req.ID); err != nil {
+		t.Fatal(err)
+	}
+	requireStatus(t, a.refresh(a.token, req.ID), http.StatusConflict)
 }

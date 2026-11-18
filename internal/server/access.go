@@ -168,12 +168,13 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	}
 	// The refresh window (CONTRACT §17.12): declared, or 8 hours, never above
 	// the supervisor's limit and never shorter than one key.
+	limit := min(settings.MaxRefreshLifetimeSeconds, model.MaxRefreshLifetimeLimit)
 	lifetime := in.MaxLifetimeSeconds
 	if lifetime == 0 {
-		lifetime = min(model.DefaultRefreshLifetimeSeconds, settings.MaxRefreshLifetimeSeconds)
+		lifetime = min(model.DefaultRefreshLifetimeSeconds, limit)
 	}
-	if lifetime > settings.MaxRefreshLifetimeSeconds {
-		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("max_lifetime_seconds %d exceeds the allowed maximum %d", lifetime, settings.MaxRefreshLifetimeSeconds))
+	if lifetime > limit {
+		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("max_lifetime_seconds %d exceeds the allowed maximum %d", lifetime, limit))
 	}
 	if lifetime < in.TTLSeconds {
 		if in.MaxLifetimeSeconds != 0 {
@@ -338,11 +339,14 @@ func (s *Server) handleAgentListAccounts(w http.ResponseWriter, r *http.Request)
 			if prov.Status != model.ProviderActive || prov.CloudAccountID == "" {
 				continue
 			}
-			highest := capcatalog.PermissionRead
+			var highest capcatalog.Permission
 			for _, p := range capcatalog.Permissions() {
 				if b.Role.Permits(p.Access()) {
 					highest = p
 				}
+			}
+			if highest == "" {
+				continue // an unknown role allows nothing
 			}
 			automatic, err := s.accountMode(r.Context(), owner.ID, prov.ID, s.nowUTC())
 			if err != nil {
@@ -804,10 +808,6 @@ func (s *Server) refreshAccessRequest(ctx context.Context, ag model.Agent, id st
 	if lease.RefreshUntil == nil {
 		return model.Lease{}, errConflictAPI("this request cannot be refreshed; make a new request")
 	}
-	if lease.LastRefreshedAt != nil && now.Sub(*lease.LastRefreshedAt) < refreshInterval {
-		return model.Lease{}, &httpError{status: http.StatusTooManyRequests, code: model.ErrCodeRateLimited,
-			message: "this request was refreshed less than a minute ago"}
-	}
 	prov, err := s.db.GetProvider(ctx, lease.ProviderID)
 	if errors.Is(err, store.ErrNotFound) {
 		return model.Lease{}, errConflictAPI("the cloud account no longer exists")
@@ -815,13 +815,30 @@ func (s *Server) refreshAccessRequest(ctx context.Context, ag model.Agent, id st
 	if err != nil {
 		return model.Lease{}, err
 	}
+	// The window as stored, cut to the supervisor's current limit, which
+	// may have been lowered since the request was issued.
+	windowEnd := *lease.RefreshUntil
+	if limit := s.refreshLimit(ctx); limit > 0 && lease.IssuedAt != nil {
+		if capped := lease.IssuedAt.Add(time.Duration(limit) * time.Second); capped.Before(windowEnd) {
+			windowEnd = capped
+		}
+	}
 	ttl := lease.EffectiveTTLSeconds
-	if remaining := int(lease.RefreshUntil.Sub(now) / time.Second); remaining < ttl {
+	if remaining := int(windowEnd.Sub(now) / time.Second); remaining < ttl {
 		ttl = remaining
 	}
 	if ttl < minProviderTTL(prov.Mode) {
 		return model.Lease{}, errConflictAPI(fmt.Sprintf("the refresh window ends at %s, too soon for another key; make a new request",
-			lease.RefreshUntil.UTC().Format(time.RFC3339)))
+			windowEnd.UTC().Format(time.RFC3339)))
+	}
+	// One attempt a minute, failed ones included: the attempt is recorded
+	// before the cloud is asked.
+	if err := s.db.ReserveRefreshAttempt(ctx, lease.ID, now, refreshInterval); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			return model.Lease{}, &httpError{status: http.StatusTooManyRequests, code: model.ErrCodeRateLimited,
+				message: "this request was refreshed, or a refresh was tried, less than a minute ago"}
+		}
+		return model.Lease{}, err
 	}
 	// Every check of a release, but not the approval: a request approved
 	// above the mode may be refreshed within its window.
@@ -843,7 +860,7 @@ func (s *Server) refreshAccessRequest(ctx context.Context, ag model.Agent, id st
 			message: "the cloud did not issue a new key: " + sanitizeMessage(err.Error())}
 	}
 	newExpiry := now.Add(time.Duration(ttl) * time.Second)
-	if err := s.db.RefreshLeaseCredential(ctx, lease.ID, encrypted, fingerprint, *lease.ExpiresAt, newExpiry, now); err != nil {
+	if err := s.db.RefreshLeaseCredential(ctx, lease.ID, encrypted, fingerprint, *lease.ExpiresAt, newExpiry, windowEnd, now); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			return model.Lease{}, errConflictAPI("the request changed while it was refreshed; check its status")
 		}
@@ -868,7 +885,7 @@ func (s *Server) refreshAccessRequest(ctx context.Context, ag model.Agent, id st
 	}
 	s.agentAudit(ctx, ag, "lease.refreshed", "ok", "info", "lease", lease.ID, map[string]any{
 		"fingerprint": fingerprint, "expires_at": newExpiry.Format(time.RFC3339Nano),
-		"refresh_until": lease.RefreshUntil.UTC().Format(time.RFC3339), "refresh_count": updated.RefreshCount,
+		"refresh_until": windowEnd.UTC().Format(time.RFC3339), "refresh_count": updated.RefreshCount,
 	})
 	return updated, nil
 }

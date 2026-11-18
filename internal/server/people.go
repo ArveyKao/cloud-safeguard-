@@ -56,6 +56,22 @@ func raisedModes(ctx context.Context, db *store.DB, personID string, now time.Ti
 	return out, nil
 }
 
+// removedModes compares a person's raised modes now with those before a
+// change and returns the ones that are gone or lower, for the audit.
+func removedModes(ctx context.Context, db *store.DB, personID string, now time.Time, before map[string]string) (map[string]string, error) {
+	after, err := raisedModes(ctx, db, personID, now)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for account, mode := range before {
+		if after[account] != mode {
+			out[account] = mode
+		}
+	}
+	return out, nil
+}
+
 // newPersonWithSetupCode creates a pending person and returns the one-time
 // setup code. It is shared by the supervisor API, bootstrap and recovery.
 func newPersonWithSetupCode(ctx context.Context, db *store.DB, username, displayName string, supervisor bool, now time.Time, issue model.SetupIssue) (model.PersonWithSetupCode, error) {
@@ -171,6 +187,11 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if in.Status != nil || in.Supervisor != nil {
+		modesBefore, err := raisedModes(ctx, s.db, id, now)
+		if err != nil {
+			s.writeHandlerError(w, err)
+			return
+		}
 		status, supervisor := person.Status, person.Supervisor
 		if in.Status != nil {
 			if *in.Status != model.PersonActive && *in.Status != model.PersonSuspended {
@@ -207,17 +228,27 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		removed, err := removedModes(ctx, s.db, id, now, modesBefore)
+		if err != nil {
+			s.logf("person %s: read modes after change: %v", id, err)
+		}
 		if supervisor != person.Supervisor {
-			s.personAudit(ctx, actor.person, "person.supervisor_changed", "ok", "critical", "person", id,
-				map[string]any{"username": person.Username, "supervisor": supervisor})
+			metadata := map[string]any{"username": person.Username, "supervisor": supervisor}
+			if len(removed) > 0 && status == person.Status {
+				metadata["removed_modes"] = removed
+			}
+			s.personAudit(ctx, actor.person, "person.supervisor_changed", "ok", "critical", "person", id, metadata)
 			if !supervisor && status == person.Status {
 				// A former supervisor keeps only their role bindings.
 				s.afterBindingReduced(ctx, actor.person, id, "")
 			}
 		}
 		if status != person.Status {
-			s.personAudit(ctx, actor.person, "person.status_changed", "ok", "warning", "person", id,
-				map[string]any{"username": person.Username, "from": string(person.Status), "to": string(status)})
+			metadata := map[string]any{"username": person.Username, "from": string(person.Status), "to": string(status)}
+			if len(removed) > 0 {
+				metadata["removed_modes"] = removed
+			}
+			s.personAudit(ctx, actor.person, "person.status_changed", "ok", "warning", "person", id, metadata)
 			s.afterPersonAuthorityChange(ctx, actor.person, id)
 		}
 	}
@@ -385,16 +416,24 @@ func (s *Server) handleDeleteBinding(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	now := s.nowUTC()
+	modesBefore, err := raisedModes(ctx, s.db, person.ID, now)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
 	s.bindingsMu.Lock()
-	err := s.db.DeleteBinding(ctx, person.ID, provider.ID)
+	err = s.db.DeleteBinding(ctx, person.ID, provider.ID)
 	s.bindingsMu.Unlock()
 	if err != nil {
 		s.storeErrorResponse(w, err, "this person has no role on this cloud account")
 		return
 	}
-	s.personAudit(ctx, actor.person, "binding.removed", "ok", "warning", "provider", provider.ID, map[string]any{
-		"person_id": person.ID, "username": person.Username,
-	})
+	metadata := map[string]any{"person_id": person.ID, "username": person.Username}
+	if removed, err := removedModes(ctx, s.db, person.ID, now, modesBefore); err == nil && len(removed) > 0 {
+		metadata["removed_modes"] = removed
+	}
+	s.personAudit(ctx, actor.person, "binding.removed", "ok", "warning", "provider", provider.ID, metadata)
 	s.afterBindingReduced(ctx, actor.person, person.ID, provider.ID)
 	s.writeData(w, http.StatusOK, map[string]bool{"ok": true})
 }
