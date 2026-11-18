@@ -118,7 +118,6 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		Region:            in.Region,
 		RoleARN:           in.RoleARN,
 		CloudAccountID:    model.CloudAccountIDFromRoleARN(in.Type, in.RoleARN),
-		MaxAutoLevel:      model.ModeRead,
 		AccessKeyIDMasked: maskAccessKeyID(in.AccessKeyID),
 		Status:            model.ProviderActive,
 		CreatedAt:         now,
@@ -506,10 +505,6 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, "invalid request body: "+err.Error())
 		return
 	}
-	if err := in.Validate(); err != nil {
-		s.badRequest(w, err.Error())
-		return
-	}
 	// Read, decide and write as one step (see settingsMu).
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
@@ -518,9 +513,18 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
+	// A client that does not know the refresh limit leaves it as it is.
+	if in.MaxRefreshLifetimeSeconds == 0 {
+		in.MaxRefreshLifetimeSeconds = before.MaxRefreshLifetimeSeconds
+	}
+	if err := in.Validate(); err != nil {
+		s.badRequest(w, err.Error())
+		return
+	}
 	// Lowering every limit lowers access; anything else may raise it.
 	if !(in.MaxLeaseTTLSeconds <= before.MaxLeaseTTLSeconds && in.PendingTimeoutSeconds <= before.PendingTimeoutSeconds &&
-		in.MaxConcurrentLeasesPerAgent <= before.MaxConcurrentLeasesPerAgent && in.LeasesPerMinutePerAgent <= before.LeasesPerMinutePerAgent) {
+		in.MaxConcurrentLeasesPerAgent <= before.MaxConcurrentLeasesPerAgent && in.LeasesPerMinutePerAgent <= before.LeasesPerMinutePerAgent &&
+		in.MaxRefreshLifetimeSeconds <= before.MaxRefreshLifetimeSeconds) {
 		if !s.stepUp(w, r) {
 			return
 		}

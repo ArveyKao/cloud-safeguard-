@@ -36,11 +36,6 @@ type Person struct {
 	// role bindings and limits, and is Administrator on every cloud account
 	// while active (CONTRACT §17.1).
 	Supervisor bool `json:"supervisor"`
-	// ApprovalMode is the level up to which this person's agents get access
-	// without asking (CONTRACT §17.5). Only the person sets it.
-	ApprovalMode ApprovalMode `json:"approval_mode"`
-	// ApprovalModeExpiresAt, when set, is when the mode falls back to read.
-	ApprovalModeExpiresAt *time.Time `json:"approval_mode_expires_at,omitempty"`
 	// SetupIssued records who issued the setup code the person's current
 	// password and authenticator were set up with. Whoever holds a setup
 	// code can complete the setup, so this is what traces an account a
@@ -242,6 +237,9 @@ type AccessRequestInput struct {
 	// resources of that type in the account.
 	ResourceName string `json:"resource_name,omitempty"`
 	Reason       string `json:"reason,omitempty"`
+	// MaxLifetimeSeconds is how long the agent may keep refreshing the
+	// credential, from first issue (CONTRACT §17.12). 0 means the default.
+	MaxLifetimeSeconds int `json:"max_lifetime_seconds,omitempty"`
 }
 
 // AccessRequest is an access request as shown to the agent and to its owner.
@@ -269,8 +267,13 @@ type AccessRequest struct {
 	CreatedAt           time.Time      `json:"created_at"`
 	ApprovedAt          *time.Time     `json:"approved_at,omitempty"`
 	IssuedAt            *time.Time     `json:"issued_at,omitempty"`
-	// ExpiresAt is the credential's deadline: issue time + TTLSeconds.
+	// ExpiresAt is the current key's deadline.
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// MaxLifetimeSeconds and RefreshUntil bound refreshes (CONTRACT §17.12);
+	// RefreshUntil is set once the first key is issued.
+	MaxLifetimeSeconds int        `json:"max_lifetime_seconds"`
+	RefreshUntil       *time.Time `json:"refresh_until,omitempty"`
+	RefreshCount       int        `json:"refresh_count"`
 }
 
 // AgentAccount is one cloud account an agent may ask for, with the role it
@@ -283,8 +286,8 @@ type AgentAccount struct {
 	// HighestPermission is the highest permission the role allows.
 	HighestPermission string `json:"highest_permission"`
 	// AutomaticUpTo is the highest permission issued here without waiting
-	// for the owner: the lowest of the role, the owner's approval mode and
-	// the account's highest automatic level.
+	// for the owner: the lower of the role and the owner's approval mode on
+	// this account.
 	AutomaticUpTo string   `json:"automatic_up_to"`
 	Resources     []string `json:"resources"`
 }
@@ -294,11 +297,10 @@ type DenyRequestInput struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// ---- approval modes (CONTRACT §17.5) ----
+// ---- approval modes (CONTRACT §17.11) ----
 
 // ApprovalMode is a permission level used as a threshold: requests at or
-// below it are issued automatically. It is also used for a cloud account's
-// highest automatic level.
+// below it on a cloud account are issued automatically.
 type ApprovalMode string
 
 const (
@@ -324,16 +326,22 @@ func (m ApprovalMode) Rank() int {
 // Valid reports whether m is a known mode.
 func (m ApprovalMode) Valid() bool { return m.Rank() > 0 }
 
-// EffectiveApprovalMode is the person's mode at time now: read once a mode
-// has expired, and read for any unknown value.
-func (p Person) EffectiveApprovalMode(now time.Time) ApprovalMode {
-	if !p.ApprovalMode.Valid() {
+// AccountMode is a person's approval mode on one cloud account. Only that
+// person sets it (CONTRACT §17.11).
+type AccountMode struct {
+	ProviderID string       `json:"provider_id"`
+	Mode       ApprovalMode `json:"mode"`
+	// ExpiresAt, when set, is when the mode falls back to read.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// Effective is the mode at time now: read once it has expired, and read for
+// any unknown value, so it can never widen anything.
+func (m AccountMode) Effective(now time.Time) ApprovalMode {
+	if !m.Mode.Valid() || (m.ExpiresAt != nil && !now.Before(*m.ExpiresAt)) {
 		return ModeRead
 	}
-	if p.ApprovalModeExpiresAt != nil && !now.Before(*p.ApprovalModeExpiresAt) {
-		return ModeRead
-	}
-	return p.ApprovalMode
+	return m.Mode
 }
 
 // SetApprovalModeInput is the person's request body for choosing a mode.
@@ -342,24 +350,6 @@ type SetApprovalModeInput struct {
 	// ExpiresInSeconds optionally limits a write or full mode; 0 means until
 	// changed.
 	ExpiresInSeconds int `json:"expires_in_seconds,omitempty"`
-}
-
-// SetAutoLevelInput is the supervisor's request body for a cloud account's
-// highest automatic level.
-type SetAutoLevelInput struct {
-	MaxAutoLevel ApprovalMode `json:"max_auto_level"`
-}
-
-// AsOf returns p as it applies at time now: an expired or unknown mode is
-// shown as read, without its stale expiry. Every API response uses it, so
-// what people see is what decides their agents' requests.
-func (p Person) AsOf(now time.Time) Person {
-	effective := p.EffectiveApprovalMode(now)
-	if effective != p.ApprovalMode {
-		p.ApprovalMode = effective
-		p.ApprovalModeExpiresAt = nil
-	}
-	return p
 }
 
 // PersonAccount is one cloud account a person has a role on, as shown to
@@ -373,11 +363,12 @@ type PersonAccount struct {
 	Role           Role           `json:"role"`
 	// HighestPermission is the highest permission the role allows.
 	HighestPermission string `json:"highest_permission"`
-	// MaxAutoLevel is the account's highest automatic level (set by a
-	// supervisor); AutomaticUpTo is what the person's agents get without
-	// asking here: the lowest of role, mode and level.
-	MaxAutoLevel  ApprovalMode `json:"max_auto_level"`
-	AutomaticUpTo string       `json:"automatic_up_to"`
+	// ApprovalMode is the person's mode here as it applies now (read once
+	// expired); AutomaticUpTo is what their agents get without asking: the
+	// lower of the role and the mode.
+	ApprovalMode          ApprovalMode `json:"approval_mode"`
+	ApprovalModeExpiresAt *time.Time   `json:"approval_mode_expires_at,omitempty"`
+	AutomaticUpTo         string       `json:"automatic_up_to"`
 }
 
 // SetupIssue says who issued a person's setup code, how and when.

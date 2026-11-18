@@ -14,16 +14,22 @@ const pollInterval = time.Second
 
 // runCredential implements `csg credential` (agent side).
 func (a *App) runCredential(args []string) error {
-	fs := a.newFlagSet("credential", `Usage: csg credential --lease ID [--export | --json]
+	fs := a.newFlagSet("credential", `Usage: csg credential --lease ID [--export | --json | --process aws|aliyun]
 
 Fetches the short-lived credential for an active lease. Each fetch is audited.
-  --export   print export NAME='value' lines for the shell
-  (default)  print the JSON CredentialEnvelope
+  --export          print export NAME='value' lines for the shell
+  --process aws     print the JSON of an AWS credential_process
+  --process aliyun  print the JSON of the Alibaba Cloud CLI External mode
+  (default)         print the JSON CredentialEnvelope
+With --process the key is refreshed first when it has less than 5 minutes
+left and the request's refresh window allows it, so an SDK that calls the
+command again before expiry keeps itself supplied.
 `)
 	cf := a.addClientFlags(fs)
 	leaseID := fs.String("lease", "", "lease ID (required)")
 	export := fs.Bool("export", false, "print shell export lines instead of JSON")
 	jsonOut := fs.Bool("json", false, "print JSON")
+	process := fs.String("process", "", "aws or aliyun: print a credential process answer")
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -37,13 +43,26 @@ Fetches the short-lived credential for an active lease. Each fetch is audited.
 	if *export && *jsonOut {
 		return usagef("--export and --json are mutually exclusive")
 	}
+	if *process != "" && (*export || *jsonOut) {
+		return usagef("--process cannot be combined with --export or --json")
+	}
+	if *process != "" && *process != "aws" && *process != "aliyun" {
+		return usagef("--process must be aws or aliyun")
+	}
 	client, err := a.agentClient(cf)
 	if err != nil {
 		return err
 	}
+	ctx := context.Background()
+	if *process != "" {
+		a.refreshIfExpiring(ctx, client, strings.TrimSpace(*leaseID))
+	}
 	var envelope model.CredentialEnvelope
-	if err := client.post(context.Background(), apiPrefix+"/agent/leases/"+pathEscape(*leaseID)+"/credential", nil, &envelope); err != nil {
+	if err := client.post(ctx, apiPrefix+"/agent/leases/"+pathEscape(*leaseID)+"/credential", nil, &envelope); err != nil {
 		return err
+	}
+	if *process != "" {
+		return a.printProcessCredential(*process, envelope.Credential)
 	}
 	if *export {
 		for _, kv := range safeCredentialEnv(&envelope) {
@@ -53,6 +72,42 @@ Fetches the short-lived credential for an active lease. Each fetch is audited.
 	}
 	// The contract's default output is the JSON credential envelope.
 	return a.printJSON(envelope)
+}
+
+// processRefreshMargin is how close to expiry --process refreshes the key.
+const processRefreshMargin = 5 * time.Minute
+
+// refreshIfExpiring asks for a new key when the current one has less than
+// processRefreshMargin left and the refresh window allows another. A refusal
+// is not an error: the current key is still handed out while it lasts.
+func (a *App) refreshIfExpiring(ctx context.Context, client *apiClient, id string) {
+	var req model.AccessRequest
+	if err := client.get(ctx, apiPrefix+"/agent/access-requests/"+pathEscape(id), &req); err != nil {
+		return
+	}
+	now := time.Now()
+	if req.Status != model.LeaseActive || req.ExpiresAt == nil || req.ExpiresAt.Sub(now) >= processRefreshMargin ||
+		req.RefreshUntil == nil || !req.RefreshUntil.After(*req.ExpiresAt) {
+		return
+	}
+	if err := client.post(ctx, apiPrefix+"/agent/access-requests/"+pathEscape(id)+"/refresh", nil, &req); err != nil {
+		fmt.Fprintf(a.Stderr, "csg: could not refresh %s: %s\n", displayString(id), displayString(err.Error()))
+	}
+}
+
+// printProcessCredential prints a credential in the format an SDK's
+// credential process expects.
+func (a *App) printProcessCredential(kind string, c model.Credential) error {
+	if kind == "aws" {
+		return a.printJSON(map[string]any{
+			"Version": 1, "AccessKeyId": c.AccessKeyID, "SecretAccessKey": c.AccessKeySecret,
+			"SessionToken": c.SecurityToken, "Expiration": c.ExpiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return a.printJSON(map[string]any{
+		"mode": "StsToken", "access_key_id": c.AccessKeyID, "access_key_secret": c.AccessKeySecret,
+		"sts_token": c.SecurityToken,
+	})
 }
 
 // shellSingleQuote escapes a value for a single-quoted shell string.

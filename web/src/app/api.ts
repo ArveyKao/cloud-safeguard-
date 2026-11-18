@@ -89,8 +89,8 @@ export const api = {
   cancelCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/cancel`, {}),
   cliSessions: () => call<List<CLISession>>('GET', '/me/cli-sessions'),
   revokeCLISession: (id: string) => call<{ ok: boolean }>('POST', `/me/cli-sessions/${enc(id)}/revoke`, {}),
-  setMode: (mode: ApprovalMode, expires_in_seconds: number) =>
-    call<Person>('PUT', '/me/approval-mode', { mode, expires_in_seconds }),
+  setMode: (providerId: string, mode: ApprovalMode, expires_in_seconds: number) =>
+    call<PersonAccount>('PUT', `/me/accounts/${enc(providerId)}/mode`, { mode, expires_in_seconds }),
 
   // supervisors
   people: () => call<List<Person>>('GET', '/supervisor/people'),
@@ -110,8 +110,6 @@ export const api = {
   testAccount: (id: string) => call<TestResult>('POST', `/supervisor/accounts/${enc(id)}/test`, {}),
   rotateAccount: (id: string, access_key_id: string, access_key_secret: string) =>
     call<Provider>('POST', `/supervisor/accounts/${enc(id)}/rotate`, { access_key_id, access_key_secret }),
-  setAutoLevel: (id: string, max_auto_level: ApprovalMode) =>
-    call<Provider>('PUT', `/supervisor/accounts/${enc(id)}/auto-level`, { max_auto_level }),
   settings: () => call<PolicySettings>('GET', '/supervisor/settings'),
   putSettings: (s: PolicySettings) => call<PolicySettings>('PUT', '/supervisor/settings', s),
   audit: (limit = 100) => call<List<AuditEvent>>('GET', `/supervisor/audit?limit=${limit}`),

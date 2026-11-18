@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
+	"github.com/arveykao/cloud-safeguard/internal/mcp"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/policy"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
@@ -98,6 +99,9 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	if permission != capcatalog.PermissionRead && reason == "" {
 		return model.Lease{}, errBadRequestAPI("reason is required for write and full requests; it is shown to the person who approves")
 	}
+	if in.MaxLifetimeSeconds < 0 {
+		return model.Lease{}, errBadRequestAPI("max_lifetime_seconds must be positive when given")
+	}
 
 	// The cloud account and the owner's role on it. An unknown account and an
 	// account the owner has no role on look the same to the agent.
@@ -162,6 +166,21 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	if in.TTLSeconds > maxTTL {
 		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("ttl_seconds %d exceeds the allowed maximum %d", in.TTLSeconds, maxTTL))
 	}
+	// The refresh window (CONTRACT §17.12): declared, or 8 hours, never above
+	// the supervisor's limit and never shorter than one key.
+	lifetime := in.MaxLifetimeSeconds
+	if lifetime == 0 {
+		lifetime = min(model.DefaultRefreshLifetimeSeconds, settings.MaxRefreshLifetimeSeconds)
+	}
+	if lifetime > settings.MaxRefreshLifetimeSeconds {
+		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("max_lifetime_seconds %d exceeds the allowed maximum %d", lifetime, settings.MaxRefreshLifetimeSeconds))
+	}
+	if lifetime < in.TTLSeconds {
+		if in.MaxLifetimeSeconds != 0 {
+			return model.Lease{}, errBadRequestAPI("max_lifetime_seconds must be at least ttl_seconds")
+		}
+		lifetime = in.TTLSeconds
+	}
 
 	// From the counts below until the request is stored, no other request of
 	// this agent may run: otherwise a burst would pass the limits together.
@@ -212,18 +231,16 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 			fmt.Sprintf("%d requests in the last minute; the limit is %d", lastMinute, settings.LeasesPerMinutePerAgent))
 	}
 	if decision.Outcome != model.OutcomeDeny {
-		// What is automatic: the lower of the owner's approval mode and the
-		// cloud account's highest automatic level (§17.5). The role check
-		// above already held; a mode never widens it.
-		owner, err := s.db.GetPerson(ctx, ag.OwnerID)
+		// What is automatic: the owner's approval mode on this cloud account
+		// (§17.11). The role check above already held; a mode never widens it.
+		mode, err := s.accountMode(ctx, ag.OwnerID, prov.ID, now)
 		if err != nil {
 			return model.Lease{}, err
 		}
-		mode, level, automatic := automaticLevel(owner, prov, now)
-		auditExtra = map[string]any{"approval_mode": string(mode), "max_auto_level": string(level)}
-		if permission.Rank() <= automatic.Rank() {
-			// The detail is shown to the agent, so it names neither the owner's
-			// mode nor the account's level; both are in the audit event.
+		auditExtra = map[string]any{"approval_mode": string(mode)}
+		if permission.Rank() <= mode.Rank() {
+			// The detail is shown to the agent, so it does not name the owner's
+			// mode; that is in the audit event.
 			add(ruleAutomatic, policy.OutcomeAllow, fmt.Sprintf("%s access is issued without approval", permission))
 		} else {
 			decision.Outcome = model.OutcomeRequireApproval
@@ -232,10 +249,11 @@ func (s *Server) createAccessRequest(ctx context.Context, ag model.Agent, in mod
 	}
 
 	return s.submitLease(ctx, ag, capability, &prov, decision, auditExtra, model.CreateLeaseInput{
-		CapabilityID: capability.ID,
-		Params:       params,
-		TTLSeconds:   in.TTLSeconds,
-		Reason:       reason,
+		CapabilityID:       capability.ID,
+		Params:             params,
+		TTLSeconds:         in.TTLSeconds,
+		Reason:             reason,
+		MaxLifetimeSeconds: lifetime,
 	}, now)
 }
 
@@ -254,6 +272,7 @@ func (s *Server) accessRequestView(ctx context.Context, lease model.Lease) (mode
 		DeniedReason: lease.DeniedReason, RevokeReason: lease.RevokeReason, FailureReason: lease.FailureReason,
 		ApprovedBy: lease.ApprovedBy, CredentialAvailable: lease.CredentialAvailable,
 		CreatedAt: lease.CreatedAt, ApprovedAt: lease.ApprovedAt, IssuedAt: lease.IssuedAt, ExpiresAt: lease.ExpiresAt,
+		MaxLifetimeSeconds: lease.MaxLifetimeSeconds, RefreshUntil: lease.RefreshUntil, RefreshCount: lease.RefreshCount,
 	}
 	if name := lease.Params[capcatalog.ResourceNameParam]; name != capcatalog.AllResources {
 		view.ResourceName = name
@@ -325,7 +344,11 @@ func (s *Server) handleAgentListAccounts(w http.ResponseWriter, r *http.Request)
 					highest = p
 				}
 			}
-			_, _, automatic := automaticLevel(owner, prov, s.nowUTC())
+			automatic, err := s.accountMode(r.Context(), owner.ID, prov.ID, s.nowUTC())
+			if err != nil {
+				s.writeHandlerError(w, err)
+				return
+			}
 			if automatic.Rank() > highest.Rank() {
 				automatic = model.ApprovalMode(highest)
 			}
@@ -523,14 +546,25 @@ func (s *Server) ownedAccessLease(ctx context.Context, leaseID, personID string)
 	return lease, ag, true
 }
 
-// ---- approval modes (CONTRACT §17.5) ----
+// ---- approval modes per cloud account (CONTRACT §17.11) ----
 
 // maxModeExpiry bounds a temporary approval mode.
 const maxModeExpiry = 30 * 24 * time.Hour
 
-// handleSetMyApprovalMode implements PUT /api/v1/me/approval-mode. A person
-// sets only their own mode; it applies to all their agents.
-func (s *Server) handleSetMyApprovalMode(w http.ResponseWriter, r *http.Request) {
+// accountMode is a person's approval mode on a cloud account as it applies
+// at now: read when none was chosen, it expired, or it is unknown.
+func (s *Server) accountMode(ctx context.Context, personID, providerID string, now time.Time) (model.ApprovalMode, error) {
+	m, err := s.db.GetAccountMode(ctx, personID, providerID)
+	if err != nil {
+		return "", err
+	}
+	return m.Effective(now), nil
+}
+
+// handleSetMyAccountMode implements PUT /api/v1/me/accounts/{provider}/mode.
+// A person sets only their own mode, on an account where they have a role;
+// it applies to all their agents there.
+func (s *Server) handleSetMyAccountMode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
 	var in model.SetApprovalModeInput
@@ -546,8 +580,16 @@ func (s *Server) handleSetMyApprovalMode(w http.ResponseWriter, r *http.Request)
 		s.badRequest(w, "expires_in_seconds must be between 0 and 30 days")
 		return
 	}
+	prov, err := s.db.GetProvider(ctx, r.PathValue("provider"))
+	if err == nil {
+		_, err = s.personRole(ctx, actor.person.ID, prov.ID)
+	}
+	if err != nil {
+		s.storeErrorResponse(w, err, "cloud account not found")
+		return
+	}
 	// A mode above read lets agents get more without asking: it is a
-	// standing approval, so it needs the code.
+	// standing approval, so a command-line session needs the code.
 	if in.Mode != model.ModeRead && !s.stepUp(w, r) {
 		return
 	}
@@ -557,10 +599,14 @@ func (s *Server) handleSetMyApprovalMode(w http.ResponseWriter, r *http.Request)
 		t := now.Add(time.Duration(in.ExpiresInSeconds) * time.Second)
 		expiresAt = &t
 	}
-	previous := actor.person.EffectiveApprovalMode(now)
-	if err := s.db.SetApprovalMode(ctx, actor.person.ID, in.Mode, expiresAt, now); err != nil {
+	previous, err := s.accountMode(ctx, actor.person.ID, prov.ID, now)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	if err := s.db.SetAccountMode(ctx, actor.person.ID, prov.ID, in.Mode, expiresAt, now); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "your account is not active")
+			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "your account is not active, or you no longer have a role on this cloud account")
 			return
 		}
 		s.writeHandlerError(w, err)
@@ -570,85 +616,37 @@ func (s *Server) handleSetMyApprovalMode(w http.ResponseWriter, r *http.Request)
 	if in.Mode.Rank() > previous.Rank() {
 		severity = "warning"
 	}
-	metadata := map[string]any{"mode": string(in.Mode), "previous_mode": string(previous)}
+	metadata := map[string]any{"mode": string(in.Mode), "previous_mode": string(previous),
+		"provider_id": prov.ID, "cloud_account_id": prov.CloudAccountID}
 	if expiresAt != nil {
 		metadata["expires_at"] = expiresAt.Format(time.RFC3339)
 	}
-	s.personAudit(ctx, actor.person, "person.approval_mode_changed", "ok", severity, "person", actor.person.ID, metadata)
-	updated, err := s.db.GetPerson(ctx, actor.person.ID)
+	s.personAudit(ctx, actor.person, "person.approval_mode_changed", "ok", severity, "provider", prov.ID, metadata)
+	account, ok, err := s.personAccount(ctx, actor.person, prov.ID, now)
 	if err != nil {
 		s.writeHandlerError(w, err)
 		return
 	}
-	s.writeData(w, http.StatusOK, updated.AsOf(now))
-}
-
-// handleSetAccountAutoLevel implements
-// PUT /api/v1/supervisor/accounts/{provider}/auto-level.
-func (s *Server) handleSetAccountAutoLevel(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	actor, _ := sessionFromContext(ctx)
-	var in model.SetAutoLevelInput
-	if err := s.decodeJSON(w, r, &in); err != nil {
-		s.badRequest(w, "invalid request body: "+err.Error())
+	if !ok {
+		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "cloud account not found")
 		return
 	}
-	if !in.MaxAutoLevel.Valid() {
-		s.badRequest(w, "max_auto_level must be read, write or full")
-		return
-	}
-	if in.MaxAutoLevel != model.ModeRead && !s.stepUp(w, r) {
-		return
-	}
-	prov, err := s.db.GetProvider(ctx, r.PathValue("provider"))
-	if err != nil {
-		s.storeErrorResponse(w, err, "cloud account not found")
-		return
-	}
-	if err := s.db.SetProviderMaxAutoLevel(ctx, prov.ID, in.MaxAutoLevel, s.nowUTC()); err != nil {
-		s.storeErrorResponse(w, err, "cloud account not found")
-		return
-	}
-	severity := "info"
-	if in.MaxAutoLevel.Rank() > prov.MaxAutoLevel.Rank() {
-		severity = "warning"
-	}
-	s.personAudit(ctx, actor.person, "provider.auto_level_changed", "ok", severity, "provider", prov.ID, map[string]any{
-		"max_auto_level": string(in.MaxAutoLevel), "previous": string(prov.MaxAutoLevel), "cloud_account_id": prov.CloudAccountID,
-	})
-	updated, err := s.db.GetProvider(ctx, prov.ID)
-	if err != nil {
-		s.storeErrorResponse(w, err, "cloud account not found")
-		return
-	}
-	s.writeData(w, http.StatusOK, updated)
-}
-
-// automaticLevel returns the owner's effective approval mode, the cloud
-// account's highest automatic level, and the lower of the two: requests at
-// or below it are issued without asking (CONTRACT §17.5). Unknown or
-// missing values count as read, so they can never widen anything.
-func automaticLevel(owner model.Person, prov model.Provider, now time.Time) (mode, level, automatic model.ApprovalMode) {
-	mode = owner.EffectiveApprovalMode(now)
-	level = prov.MaxAutoLevel
-	if !level.Valid() {
-		level = model.ModeRead
-	}
-	automatic = mode
-	if level.Rank() < automatic.Rank() {
-		automatic = level
-	}
-	return mode, level, automatic
+	s.writeData(w, http.StatusOK, account)
 }
 
 // handleListMyAccounts implements GET /api/v1/me/accounts: the cloud accounts
-// the signed-in person has a role on, with what their agents get there.
-// Everyone sees only their own accounts; supervisors manage all of them under
-// /supervisor/accounts.
+// the signed-in person has a role on, with their mode and what their agents
+// get there. Everyone sees only their own accounts; supervisors manage all of
+// them under /supervisor/accounts.
 func (s *Server) handleListMyAccounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actor, _ := sessionFromContext(ctx)
 	bindings, err := s.personBindings(ctx, actor.person)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	modes, err := s.db.ListAccountModes(ctx, actor.person.ID)
 	if err != nil {
 		s.writeHandlerError(w, err)
 		return
@@ -664,30 +662,64 @@ func (s *Server) handleListMyAccounts(w http.ResponseWriter, r *http.Request) {
 			s.writeHandlerError(w, err)
 			return
 		}
-		// An unknown role allows nothing, and a disabled account (or one
-		// without a cloud account ID) issues nothing: show no level rather
-		// than one requests would not get.
-		var highest capcatalog.Permission
-		for _, p := range capcatalog.Permissions() {
-			if b.Role.Permits(p.Access()) {
-				highest = p
-			}
-		}
-		_, level, automatic := automaticLevel(actor.person, prov, now)
-		if automatic.Rank() > model.ApprovalMode(highest).Rank() {
-			automatic = model.ApprovalMode(highest)
-		}
-		if prov.Status != model.ProviderActive || prov.CloudAccountID == "" {
-			automatic = ""
-		}
-		accounts = append(accounts, model.PersonAccount{
-			ProviderID: prov.ID, CloudAccountID: prov.CloudAccountID, Name: prov.Name,
-			ProviderType: prov.Type, Status: prov.Status, Role: b.Role,
-			HighestPermission: string(highest), MaxAutoLevel: level, AutomaticUpTo: string(automatic),
-		})
+		accounts = append(accounts, personAccountView(prov, b.Role, modes[prov.ID], now))
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].Name < accounts[j].Name })
 	writeList(s, w, http.StatusOK, accounts, len(accounts))
+}
+
+// personAccount is one of the person's cloud accounts as GET /me/accounts
+// shows it; ok is false when they have no role there.
+func (s *Server) personAccount(ctx context.Context, person model.Person, providerID string, now time.Time) (model.PersonAccount, bool, error) {
+	prov, err := s.db.GetProvider(ctx, providerID)
+	if errors.Is(err, store.ErrNotFound) {
+		return model.PersonAccount{}, false, nil
+	}
+	if err != nil {
+		return model.PersonAccount{}, false, err
+	}
+	role, err := s.personRole(ctx, person.ID, providerID)
+	if errors.Is(err, store.ErrNotFound) {
+		return model.PersonAccount{}, false, nil
+	}
+	if err != nil {
+		return model.PersonAccount{}, false, err
+	}
+	mode, err := s.db.GetAccountMode(ctx, person.ID, providerID)
+	if err != nil {
+		return model.PersonAccount{}, false, err
+	}
+	return personAccountView(prov, role, mode, now), true, nil
+}
+
+// personAccountView combines an account, the person's role there and their
+// mode. An unknown role allows nothing, and a disabled account (or one
+// without a cloud account ID) issues nothing: it shows no automatic level
+// rather than one requests would not get.
+func personAccountView(prov model.Provider, role model.Role, mode model.AccountMode, now time.Time) model.PersonAccount {
+	var highest capcatalog.Permission
+	for _, p := range capcatalog.Permissions() {
+		if role.Permits(p.Access()) {
+			highest = p
+		}
+	}
+	effective := mode.Effective(now)
+	automatic := effective
+	if automatic.Rank() > model.ApprovalMode(highest).Rank() {
+		automatic = model.ApprovalMode(highest)
+	}
+	if prov.Status != model.ProviderActive || prov.CloudAccountID == "" {
+		automatic = ""
+	}
+	view := model.PersonAccount{
+		ProviderID: prov.ID, CloudAccountID: prov.CloudAccountID, Name: prov.Name,
+		ProviderType: prov.Type, Status: prov.Status, Role: role,
+		HighestPermission: string(highest), ApprovalMode: effective, AutomaticUpTo: string(automatic),
+	}
+	if effective == mode.Mode {
+		view.ApprovalModeExpiresAt = mode.ExpiresAt
+	}
+	return view
 }
 
 // personRole is a person's role on one cloud account: an active supervisor is
@@ -723,4 +755,120 @@ func (s *Server) personBindings(ctx context.Context, person model.Person) ([]mod
 		out = append(out, model.RoleBinding{PersonID: person.ID, ProviderID: p.ID, Role: model.RoleAdministrator})
 	}
 	return out, nil
+}
+
+// ---- refresh (CONTRACT §17.12) ----
+
+// refreshInterval is the shortest time between two refreshes of one request.
+const refreshInterval = 60 * time.Second
+
+// handleAgentRefreshAccessRequest implements
+// POST /api/v1/agent/access-requests/{id}/refresh: a new key under the same
+// request, with the same policy, within the request's refresh window.
+func (s *Server) handleAgentRefreshAccessRequest(w http.ResponseWriter, r *http.Request) {
+	ag, _ := agentFromContext(r.Context())
+	lease, err := s.refreshAccessRequest(r.Context(), ag, r.PathValue("id"))
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	view, err := s.accessRequestView(r.Context(), lease)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
+	s.writeData(w, http.StatusOK, view)
+}
+
+func (s *Server) refreshAccessRequest(ctx context.Context, ag model.Agent, id string) (model.Lease, error) {
+	notFound := errNotFoundAPI("request not found")
+	if !mcp.LeaseIDRE.MatchString(id) {
+		return model.Lease{}, notFound
+	}
+	unlock := s.lockLease(id)
+	defer unlock()
+	lease, err := s.db.GetLease(ctx, id)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && (lease.AgentID != ag.ID || !capcatalog.IsAccessTemplateID(lease.CapabilityID))) {
+		return model.Lease{}, notFound
+	}
+	if err != nil {
+		return model.Lease{}, err
+	}
+	now := s.nowUTC()
+	if lease.Status != model.LeaseActive {
+		return model.Lease{}, errConflictAPI("request is " + string(lease.Status) + "; only an active request can be refreshed")
+	}
+	if lease.ExpiresAt == nil || !lease.ExpiresAt.After(now) {
+		return model.Lease{}, errConflictAPI("the credential has expired; make a new request")
+	}
+	if lease.RefreshUntil == nil {
+		return model.Lease{}, errConflictAPI("this request cannot be refreshed; make a new request")
+	}
+	if lease.LastRefreshedAt != nil && now.Sub(*lease.LastRefreshedAt) < refreshInterval {
+		return model.Lease{}, &httpError{status: http.StatusTooManyRequests, code: model.ErrCodeRateLimited,
+			message: "this request was refreshed less than a minute ago"}
+	}
+	prov, err := s.db.GetProvider(ctx, lease.ProviderID)
+	if errors.Is(err, store.ErrNotFound) {
+		return model.Lease{}, errConflictAPI("the cloud account no longer exists")
+	}
+	if err != nil {
+		return model.Lease{}, err
+	}
+	ttl := lease.EffectiveTTLSeconds
+	if remaining := int(lease.RefreshUntil.Sub(now) / time.Second); remaining < ttl {
+		ttl = remaining
+	}
+	if ttl < minProviderTTL(prov.Mode) {
+		return model.Lease{}, errConflictAPI(fmt.Sprintf("the refresh window ends at %s, too soon for another key; make a new request",
+			lease.RefreshUntil.UTC().Format(time.RFC3339)))
+	}
+	// Every check of a release, but not the approval: a request approved
+	// above the mode may be refreshed within its window.
+	if problem, err := s.credentialReleaseProblem(ctx, ag.ID, lease.ID); err != nil {
+		return model.Lease{}, err
+	} else if problem != "" {
+		return model.Lease{}, errConflictAPI(problem)
+	}
+	capability, err := s.capabilityByID(ctx, lease.CapabilityID)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	encrypted, fingerprint, _, err := s.mintCredential(ctx, lease, capability, &prov, ttl)
+	if err != nil {
+		s.agentAudit(ctx, ag, "lease.refresh_failed", "failed", "warning", "lease", lease.ID, map[string]any{
+			"reason": sanitizeMessage(err.Error()),
+		})
+		return model.Lease{}, &httpError{status: http.StatusBadGateway, code: model.ErrCodeProviderError,
+			message: "the cloud did not issue a new key: " + sanitizeMessage(err.Error())}
+	}
+	newExpiry := now.Add(time.Duration(ttl) * time.Second)
+	if err := s.db.RefreshLeaseCredential(ctx, lease.ID, encrypted, fingerprint, *lease.ExpiresAt, newExpiry, now); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			return model.Lease{}, errConflictAPI("the request changed while it was refreshed; check its status")
+		}
+		return model.Lease{}, err
+	}
+	// The new key is stored: check again, as at activation, so a revoke or a
+	// role change that raced the mint cannot leave it behind.
+	if problem, err := s.credentialReleaseProblem(ctx, ag.ID, lease.ID); err != nil || problem != "" {
+		if current, gerr := s.db.GetLease(ctx, lease.ID); gerr == nil && current.Status == model.LeaseActive {
+			if _, rerr := s.revokeLeaseAsSystem(ctx, current, "no longer authorized at refresh: "+problem); rerr != nil {
+				s.logf("lease %s: revoke after refresh: %v", lease.ID, rerr)
+			}
+		}
+		if err != nil {
+			return model.Lease{}, err
+		}
+		return model.Lease{}, errConflictAPI(problem)
+	}
+	updated, err := s.db.GetLease(ctx, lease.ID)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	s.agentAudit(ctx, ag, "lease.refreshed", "ok", "info", "lease", lease.ID, map[string]any{
+		"fingerprint": fingerprint, "expires_at": newExpiry.Format(time.RFC3339Nano),
+		"refresh_until": lease.RefreshUntil.UTC().Format(time.RFC3339), "refresh_count": updated.RefreshCount,
+	})
+	return updated, nil
 }

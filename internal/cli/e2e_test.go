@@ -168,6 +168,33 @@ func TestE2EAgentSignInAccessAndExec(t *testing.T) {
 	if code := ta.run("credential", "--lease", read.ID, "--export"); code != ExitOK || !strings.Contains(ta.out(), "export ALIBABA_CLOUD_ACCESS_KEY_ID=") {
 		t.Fatalf("credential exit %d: %s", code, ta.out())
 	}
+	// --process: the key has under 5 minutes left, so it is refreshed first,
+	// and printed as an SDK's credential process expects.
+	ta.stdout.Reset()
+	if code := ta.run("credential", "--lease", read.ID, "--process", "aws"); code != ExitOK {
+		t.Fatalf("credential --process exit %d: %s", code, ta.errOut())
+	}
+	var proc map[string]any
+	if err := json.Unmarshal(ta.stdout.Bytes(), &proc); err != nil || proc["Version"] != float64(1) ||
+		proc["AccessKeyId"] == "" || proc["SecretAccessKey"] == "" || proc["SessionToken"] == "" || proc["Expiration"] == "" {
+		t.Fatalf("process output: %s %v", ta.out(), err)
+	}
+	ta.stdout.Reset()
+	if code := ta.run("access", "status", read.ID, "--json"); code != ExitOK || !strings.Contains(ta.out(), `"refresh_count": 1`) {
+		t.Fatalf("--process did not refresh: %s", ta.out())
+	}
+	// A refresh within a minute is refused; --process still hands out the
+	// current key.
+	if code := ta.run("access", "refresh", read.ID); code == ExitOK {
+		t.Fatal("a second refresh within a minute was accepted")
+	}
+	ta.stdout.Reset()
+	if code := ta.run("credential", "--lease", read.ID, "--process", "aliyun"); code != ExitOK || !strings.Contains(ta.out(), `"mode": "StsToken"`) {
+		t.Fatalf("--process aliyun exit %d: %s", code, ta.out())
+	}
+	if code := ta.run("credential", "--lease", read.ID, "--process", "gcp"); code != ExitUsage {
+		t.Fatalf("--process gcp exit %d", code)
+	}
 	ta.run("revoke", "--lease", read.ID)
 
 	// write: waits for the owner, who approves in the console.
@@ -261,7 +288,7 @@ func TestE2EMCPServer(t *testing.T) {
 	if v := result("1")["protocolVersion"]; v != "2025-06-18" {
 		t.Fatalf("protocol version = %v", v)
 	}
-	if tools, _ := result("2")["tools"].([]any); len(tools) != 5 {
+	if tools, _ := result("2")["tools"].([]any); len(tools) != 6 {
 		t.Fatalf("tools = %v", result("2"))
 	}
 	if s, isErr := text("3"); isErr || !strings.Contains(s, e2eAccount) {

@@ -220,10 +220,6 @@ type Provider struct {
 	// name the account by it (CONTRACT §17.2). Empty when unknown: such a
 	// provider cannot serve access requests.
 	CloudAccountID string `json:"cloud_account_id,omitempty"`
-	// MaxAutoLevel is the highest permission that may be issued on this
-	// cloud account without the owner's approval, whatever a person's
-	// approval mode is (CONTRACT §17.5). A supervisor sets it; default read.
-	MaxAutoLevel ApprovalMode `json:"max_auto_level"`
 	// AccessKeyIDMasked is a display-only form such as "LTAI****9f2c". The raw
 	// broker AccessKey ID is never returned by the API.
 	AccessKeyIDMasked string         `json:"access_key_id_masked"`
@@ -441,6 +437,12 @@ type Lease struct {
 	IssuedAt              *time.Time `json:"issued_at,omitempty"`
 	ExpiresAt             *time.Time `json:"expires_at,omitempty"`
 	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
+	// MaxLifetimeSeconds bounds refreshes from first issue; RefreshUntil is
+	// issue time + MaxLifetimeSeconds (CONTRACT §17.12).
+	MaxLifetimeSeconds int        `json:"max_lifetime_seconds,omitempty"`
+	RefreshUntil       *time.Time `json:"refresh_until,omitempty"`
+	RefreshCount       int        `json:"refresh_count,omitempty"`
+	LastRefreshedAt    *time.Time `json:"last_refreshed_at,omitempty"`
 }
 
 // CreateLeaseInput is the agent request body for POST /agent/leases.
@@ -450,6 +452,8 @@ type CreateLeaseInput struct {
 	// TTLSeconds 0 means "use the capability default".
 	TTLSeconds int    `json:"ttl_seconds,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+	// MaxLifetimeSeconds bounds refreshes (access requests only).
+	MaxLifetimeSeconds int `json:"-"`
 	// BreakGlass must be true to request a critical capability; it forces human
 	// approval and critical-severity audit.
 	BreakGlass bool `json:"break_glass,omitempty"`
@@ -529,8 +533,8 @@ type AuditVerifyResult struct {
 }
 
 // PolicySettings are the platform-wide limits a supervisor can change. What
-// needs approval is not here: that is each person's approval mode and each
-// cloud account's highest automatic level (CONTRACT §17.5).
+// needs approval is not here: that is each person's approval mode on each
+// cloud account (CONTRACT §17.11).
 type PolicySettings struct {
 	// MaxLeaseTTLSeconds is the longest validity period of any credential.
 	MaxLeaseTTLSeconds int `json:"max_lease_ttl_seconds"`
@@ -541,7 +545,17 @@ type PolicySettings struct {
 	MaxConcurrentLeasesPerAgent int `json:"max_concurrent_leases_per_agent"`
 	// LeasesPerMinutePerAgent rate-limits requests per agent.
 	LeasesPerMinutePerAgent int `json:"leases_per_minute_per_agent"`
+	// MaxRefreshLifetimeSeconds is the longest an agent may keep refreshing
+	// one request's credential, from first issue (CONTRACT §17.12).
+	MaxRefreshLifetimeSeconds int `json:"max_refresh_lifetime_seconds"`
 }
+
+// DefaultRefreshLifetimeSeconds is the refresh window of a request that
+// declares none (CONTRACT §17.12).
+const DefaultRefreshLifetimeSeconds = 8 * 3600
+
+// MaxRefreshLifetimeLimit is the highest MaxRefreshLifetimeSeconds allowed.
+const MaxRefreshLifetimeLimit = 30 * 24 * 3600
 
 // DefaultPolicySettings returns the shipped limits.
 func DefaultPolicySettings() PolicySettings {
@@ -550,6 +564,7 @@ func DefaultPolicySettings() PolicySettings {
 		PendingTimeoutSeconds:       600,
 		MaxConcurrentLeasesPerAgent: 3,
 		LeasesPerMinutePerAgent:     6,
+		MaxRefreshLifetimeSeconds:   24 * 3600,
 	}
 }
 
@@ -566,6 +581,9 @@ func (p PolicySettings) Validate() error {
 	}
 	if p.LeasesPerMinutePerAgent <= 0 {
 		return fmt.Errorf("leases_per_minute_per_agent must be positive")
+	}
+	if p.MaxRefreshLifetimeSeconds < p.MaxLeaseTTLSeconds || p.MaxRefreshLifetimeSeconds > MaxRefreshLifetimeLimit {
+		return fmt.Errorf("max_refresh_lifetime_seconds must be at least max_lease_ttl_seconds and at most 30 days")
 	}
 	return nil
 }

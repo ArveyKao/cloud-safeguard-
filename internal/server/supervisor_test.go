@@ -85,7 +85,7 @@ func TestSupervisorManagesCloudAccounts(t *testing.T) {
 	rec = a.sup.do(http.MethodPost, supAccounts, newMockAccount("staging", "6543210987654321"))
 	requireStatus(t, rec, http.StatusCreated)
 	created := decodeEnvelope[model.Provider](t, rec)
-	if created.CloudAccountID != "6543210987654321" || created.MaxAutoLevel != model.ModeRead || strings.Contains(rec.Body.String(), "placeholder-secret-value") {
+	if created.CloudAccountID != "6543210987654321" || strings.Contains(rec.Body.String(), "placeholder-secret-value") {
 		t.Fatalf("created = %s", rec.Body.String())
 	}
 	a.requireActor(a.lastEvent("provider.created"), a.sup)
@@ -202,15 +202,14 @@ func TestMyAccounts(t *testing.T) {
 	}
 	acct := list.Items[0]
 	if acct.CloudAccountID != demoAccountID || acct.Role != model.RoleMember || acct.HighestPermission != "write" ||
-		acct.MaxAutoLevel != model.ModeRead || acct.AutomaticUpTo != "read" || acct.ProviderID != a.providerID {
+		acct.ApprovalMode != model.ModeRead || acct.AutomaticUpTo != "read" || acct.ProviderID != a.providerID {
 		t.Fatalf("account = %+v", acct)
 	}
 
-	// Mode and level raise what is automatic, up to the role.
-	requireCode(t, a.setLevel(model.ModeFull), http.StatusOK)
+	// The mode raises what is automatic, up to the role.
 	requireCode(t, a.setMode(a.mei, model.ModeFull, 0), http.StatusOK)
 	rec = a.mei.do(http.MethodGet, "/api/v1/me/accounts", nil)
-	if acct := decodeEnvelope[listData[model.PersonAccount]](t, rec).Items[0]; acct.AutomaticUpTo != "write" || acct.MaxAutoLevel != model.ModeFull {
+	if acct := decodeEnvelope[listData[model.PersonAccount]](t, rec).Items[0]; acct.AutomaticUpTo != "write" || acct.ApprovalMode != model.ModeFull {
 		t.Fatalf("after raising = %+v", acct)
 	}
 

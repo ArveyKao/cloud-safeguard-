@@ -89,6 +89,7 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 		Risk:                capability.Risk,
 		Params:              in.Params,
 		Reason:              in.Reason,
+		MaxLifetimeSeconds:  in.MaxLifetimeSeconds,
 		RequestedTTLSeconds: in.TTLSeconds,
 		EffectiveTTLSeconds: decision.EffectiveTTLSeconds,
 		Status:              model.LeasePending,
@@ -167,6 +168,7 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 		lease.Status = model.LeaseActive
 		lease.IssuedAt = &issuedAt
 		lease.ExpiresAt = &expiresAt
+		openRefreshWindow(&lease, now)
 		if err := s.activateLease(ctx, lease); err != nil {
 			return model.Lease{}, err
 		}
@@ -184,6 +186,15 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 		})
 	}
 	return lease, nil
+}
+
+// openRefreshWindow starts the refresh window of an access request when its
+// first key is issued (CONTRACT §17.12). Other leases have none.
+func openRefreshWindow(lease *model.Lease, issuedAt time.Time) {
+	if lease.MaxLifetimeSeconds > 0 {
+		until := issuedAt.Add(time.Duration(lease.MaxLifetimeSeconds) * time.Second)
+		lease.RefreshUntil = &until
+	}
 }
 
 // policyViolation returns a non-empty, human-readable violation when the
@@ -205,30 +216,47 @@ func policyViolation(capability model.Capability, params map[string]string) stri
 // stores it encrypted with the lease-bound AAD. It mutates lease's credential
 // availability fields but leaves lifecycle fields to the caller.
 func (s *Server) mintCredentialForLease(ctx context.Context, lease *model.Lease, capability model.Capability, prov *model.Provider, durationSeconds int) error {
-	if prov == nil {
-		return errors.New("no provider available for capability")
+	encrypted, fingerprint, _, err := s.mintCredential(ctx, *lease, capability, prov, durationSeconds)
+	if err != nil {
+		return err
 	}
+	if err := s.db.SetLeaseCredential(ctx, lease.ID, encrypted, fingerprint); err != nil {
+		return err
+	}
+	lease.CredentialAvailable = true
+	lease.CredentialFingerprint = fingerprint
+	return nil
+}
+
+// mintCredential renders the lease's policy, mints a provider credential and
+// returns it encrypted with the lease-bound AAD, with its masked key ID. It
+// stores nothing.
+func (s *Server) mintCredential(ctx context.Context, lease model.Lease, capability model.Capability, prov *model.Provider, durationSeconds int) (encrypted, fingerprint string, credential model.Credential, err error) {
+	if prov == nil {
+		return "", "", model.Credential{}, errors.New("no provider available for capability")
+	}
+	fail := func(e error) (string, string, model.Credential, error) { return "", "", model.Credential{}, e }
 	policyJSON, err := capcatalog.RenderPolicy(capability, lease.Params)
 	if err != nil {
-		return fmt.Errorf("render policy: %w", err)
+		return fail(fmt.Errorf("render policy: %w", err))
 	}
 	encCred, err := s.db.GetProviderCredential(ctx, prov.ID)
 	if err != nil {
-		return fmt.Errorf("read provider credential: %w", err)
+		return fail(fmt.Errorf("read provider credential: %w", err))
 	}
 	plain, err := s.vault.Decrypt(encCred, providerAAD(prov.ID))
 	if err != nil {
-		return errors.New("provider credential cannot be decrypted")
+		return fail(errors.New("provider credential cannot be decrypted"))
 	}
 	var broker brokerCredential
 	if err := json.Unmarshal(plain, &broker); err != nil {
-		return errors.New("provider credential is malformed")
+		return fail(errors.New("provider credential is malformed"))
 	}
 	minter, err := s.minterFactory(*prov)
 	if err != nil {
-		return fmt.Errorf("provider %s: %w", prov.Mode, err)
+		return fail(fmt.Errorf("provider %s: %w", prov.Mode, err))
 	}
-	credential, err := minter.Mint(ctx, provider.MintRequest{
+	credential, err = minter.Mint(ctx, provider.MintRequest{
 		LeaseID:               lease.ID,
 		Provider:              *prov,
 		BrokerAccessKeyID:     broker.AccessKeyID,
@@ -239,23 +267,17 @@ func (s *Server) mintCredentialForLease(ctx context.Context, lease *model.Lease,
 		SigningKey:            s.signingKey,
 	})
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	credentialJSON, err := json.Marshal(credential)
 	if err != nil {
-		return errors.New("encode lease credential")
+		return fail(errors.New("encode lease credential"))
 	}
-	encrypted, err := s.vault.Encrypt(credentialJSON, leaseAAD(lease.ID))
+	encrypted, err = s.vault.Encrypt(credentialJSON, leaseAAD(lease.ID))
 	if err != nil {
-		return errors.New("encrypt lease credential")
+		return fail(errors.New("encrypt lease credential"))
 	}
-	fingerprint := maskAccessKeyID(credential.AccessKeyID)
-	if err := s.db.SetLeaseCredential(ctx, lease.ID, encrypted, fingerprint); err != nil {
-		return err
-	}
-	lease.CredentialAvailable = true
-	lease.CredentialFingerprint = fingerprint
-	return nil
+	return encrypted, maskAccessKeyID(credential.AccessKeyID), credential, nil
 }
 
 // handleAgentListLeases implements GET /api/v1/agent/leases.
@@ -660,6 +682,7 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 	lease.Status = model.LeaseActive
 	lease.IssuedAt = &issuedAt
 	lease.ExpiresAt = &expiresAt
+	openRefreshWindow(&lease, now)
 	if err := s.activateLease(ctx, lease); err != nil {
 		return model.Lease{}, err
 	}

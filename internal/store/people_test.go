@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -383,86 +384,134 @@ func TestCloudAccountIDMigration(t *testing.T) {
 	}
 }
 
-// A provider stored without a level starts at read.
-func TestNewProviderStartsAtReadLevel(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-	p := model.Provider{ID: "p1", Name: "x", Type: model.ProviderAliyun, Mode: model.ModeMock, Status: model.ProviderActive,
+func addTestProvider(t *testing.T, db *DB, id string) {
+	t.Helper()
+	p := model.Provider{ID: id, Name: id, Type: model.ProviderAliyun, Mode: model.ModeMock, Status: model.ProviderActive,
 		CreatedAt: peopleNow, UpdatedAt: peopleNow}
-	if err := db.CreateProvider(ctx, p, ""); err != nil {
+	if err := db.CreateProvider(context.Background(), p, ""); err != nil {
 		t.Fatal(err)
-	}
-	got, err := db.GetProvider(ctx, "p1")
-	if err != nil || got.MaxAutoLevel != model.ModeRead {
-		t.Fatalf("level = %q, %v", got.MaxAutoLevel, err)
-	}
-	// Whatever the caller passes, a new account starts at read.
-	p.ID, p.MaxAutoLevel = "p2", model.ModeFull
-	if err := db.CreateProvider(ctx, p, ""); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := db.GetProvider(ctx, "p2"); got.MaxAutoLevel != model.ModeRead {
-		t.Fatalf("created at level %q", got.MaxAutoLevel)
-	}
-	if err := db.SetProviderMaxAutoLevel(ctx, "p1", "everything", peopleNow); err == nil {
-		t.Fatal("an unknown level was stored")
-	}
-	if err := db.SetProviderMaxAutoLevel(ctx, "missing", model.ModeFull, peopleNow); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("unknown provider: %v", err)
 	}
 }
 
-func TestSetApprovalModeGuards(t *testing.T) {
+func bindTest(t *testing.T, db *DB, person, provider string) {
+	t.Helper()
+	if err := db.PutBinding(context.Background(), model.RoleBinding{PersonID: person, ProviderID: provider, Role: model.RoleMember,
+		CreatedAt: peopleNow, UpdatedAt: peopleNow}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccountModeGuards(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	newPerson(t, db, "root", true)
 	activate(t, db, "root")
 	newPerson(t, db, "mei", false)
-	if err := db.SetApprovalMode(ctx, "mei", model.ModeFull, nil, peopleNow); !errors.Is(err, ErrConflict) {
+	addTestProvider(t, db, "p1")
+	addTestProvider(t, db, "p2")
+	mode := func(person, provider string) model.ApprovalMode {
+		t.Helper()
+		m, err := db.GetAccountMode(ctx, person, provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.Effective(peopleNow)
+	}
+	// Only an active person with a role on the account.
+	bindTest(t, db, "mei", "p1")
+	if err := db.SetAccountMode(ctx, "mei", "p1", model.ModeFull, nil, peopleNow); !errors.Is(err, ErrConflict) {
 		t.Fatalf("pending person: %v", err)
 	}
 	activate(t, db, "mei")
-	if err := db.SetApprovalMode(ctx, "mei", "everything", nil, peopleNow); err == nil {
+	if err := db.SetAccountMode(ctx, "mei", "p2", model.ModeFull, nil, peopleNow); !errors.Is(err, ErrConflict) {
+		t.Fatalf("no role on the account: %v", err)
+	}
+	if err := db.SetAccountMode(ctx, "mei", "p1", "everything", nil, peopleNow); err == nil {
 		t.Fatal("unknown mode stored")
 	}
 	until := peopleNow.Add(time.Hour)
-	if err := db.SetApprovalMode(ctx, "mei", model.ModeFull, &until, peopleNow); err != nil {
+	if err := db.SetAccountMode(ctx, "mei", "p1", model.ModeFull, &until, peopleNow); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetPersonAuthority(ctx, "mei", model.PersonSuspended, false, peopleNow); err != nil {
+	if mode("mei", "p1") != model.ModeFull || mode("mei", "p2") != model.ModeRead {
+		t.Fatal("modes are per account")
+	}
+	if m, _ := db.GetAccountMode(ctx, "mei", "p1"); m.Effective(until) != model.ModeRead {
+		t.Fatal("an expired mode is still in effect")
+	}
+	// A supervisor has a role everywhere.
+	if err := db.SetAccountMode(ctx, "root", "p2", model.ModeWrite, nil, peopleNow); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetApprovalMode(ctx, "mei", model.ModeWrite, nil, peopleNow); !errors.Is(err, ErrConflict) {
-		t.Fatalf("suspended person: %v", err)
+	if all, err := db.ListAccountModes(ctx, "root"); err != nil || len(all) != 1 || all["p2"].Mode != model.ModeWrite {
+		t.Fatalf("list %v %v", all, err)
 	}
-	if err := db.ResetPersonSetup(ctx, "mei", "again", peopleNow.Add(time.Hour), peopleNow, false, testIssue); err != nil {
+	// Setting read removes the row.
+	if err := db.SetAccountMode(ctx, "root", "p2", model.ModeRead, nil, peopleNow); err != nil {
 		t.Fatal(err)
 	}
-	if p, _ := db.GetPerson(ctx, "mei"); p.ApprovalMode != model.ModeRead || p.ApprovalModeExpiresAt != nil {
-		t.Fatalf("after reset: %s, %v", p.ApprovalMode, p.ApprovalModeExpiresAt)
+	if all, _ := db.ListAccountModes(ctx, "root"); len(all) != 0 {
+		t.Fatalf("read kept a row: %v", all)
+	}
+	// Losing the role ends the mode there.
+	if err := db.DeleteBinding(ctx, "mei", "p1"); err != nil {
+		t.Fatal(err)
+	}
+	if mode("mei", "p1") != model.ModeRead {
+		t.Fatal("mode survived the removal of the binding")
+	}
+	// Losing the supervisor flag ends modes on accounts without a binding.
+	newPerson(t, db, "sup2", true)
+	activate(t, db, "sup2")
+	bindTest(t, db, "sup2", "p1")
+	for _, prov := range []string{"p1", "p2"} {
+		if err := db.SetAccountMode(ctx, "sup2", prov, model.ModeWrite, nil, peopleNow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.SetPersonAuthority(ctx, "sup2", model.PersonActive, false, peopleNow); err != nil {
+		t.Fatal(err)
+	}
+	if mode("sup2", "p1") != model.ModeWrite || mode("sup2", "p2") != model.ModeRead {
+		t.Fatal("supervisor flag removal kept or dropped the wrong modes")
+	}
+	// A reset puts every mode back to read.
+	if err := db.ResetPersonSetup(ctx, "sup2", "again", peopleNow.Add(time.Hour), peopleNow, false, testIssue); err != nil {
+		t.Fatal(err)
+	}
+	if mode("sup2", "p1") != model.ModeRead {
+		t.Fatal("mode survived a reset")
 	}
 }
 
-// The schema-6 migration gives every existing person and account read.
-func TestApprovalModeMigrationDefaults(t *testing.T) {
+// Schema 11 turns the single mode into a mode per account, lowered to each
+// account's former level; nothing becomes more automatic.
+func TestAccountModeMigration(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	db, err := Open(ctx, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	future, past := peopleNow.Add(240*time.Hour).UnixMilli(), int64(1)
 	for _, stmt := range []string{
-		`ALTER TABLE persons DROP COLUMN setup_issued_by`,
-		`ALTER TABLE persons DROP COLUMN setup_issued_by_name`,
-		`ALTER TABLE persons DROP COLUMN setup_issued_kind`,
-		`ALTER TABLE persons DROP COLUMN setup_issued_at`,
-		`ALTER TABLE persons DROP COLUMN approval_mode`,
-		`ALTER TABLE persons DROP COLUMN approval_mode_expires_at`,
-		`ALTER TABLE providers DROP COLUMN max_auto_level`,
-		`INSERT INTO persons(id, username, status, created_at, updated_at) VALUES ('mei', 'mei', 'active', 1, 1)`,
-		`INSERT INTO providers(id, name, type, mode, region, role_arn, status, created_at, updated_at, cloud_account_id)
-			VALUES ('p1', 'x', 'aliyun', 'mock', 'r', '', 'active', 1, 1, '')`,
-		`UPDATE meta SET value = '5' WHERE key = 'schema_version'`,
+		`DROP TABLE account_modes`,
+		`ALTER TABLE leases DROP COLUMN refresh_until`,
+		`ALTER TABLE leases DROP COLUMN refresh_count`,
+		`INSERT INTO persons(id, username, status, supervisor, created_at, updated_at, approval_mode) VALUES
+			('mei', 'mei', 'active', 0, 1, 1, 'full'), ('old', 'old', 'active', 0, 1, 1, 'full'),
+			('sus', 'sus', 'suspended', 0, 1, 1, 'full'), ('sup', 'sup', 'active', 1, 1, 1, 'write')`,
+		`UPDATE persons SET approval_mode_expires_at = ` + strconv.FormatInt(past, 10) + ` WHERE id = 'old'`,
+		`UPDATE persons SET approval_mode_expires_at = ` + strconv.FormatInt(future, 10) + ` WHERE id = 'sup'`,
+		`INSERT INTO providers(id, name, type, mode, region, role_arn, status, created_at, updated_at, cloud_account_id, max_auto_level) VALUES
+			('pw', 'w', 'aliyun', 'mock', 'r', '', 'active', 1, 1, '', 'write'),
+			('pf', 'f', 'aliyun', 'mock', 'r', '', 'active', 1, 1, '', 'full'),
+			('pr', 'r', 'aliyun', 'mock', 'r', '', 'active', 1, 1, '', 'read'),
+			('pn', 'n', 'aliyun', 'mock', 'r', '', 'active', 1, 1, '', 'full')`,
+		`INSERT INTO role_bindings(person_id, provider_id, role, created_by, created_at, updated_at) VALUES
+			('mei', 'pw', 'member', 'x', 1, 1), ('mei', 'pf', 'member', 'x', 1, 1), ('mei', 'pr', 'member', 'x', 1, 1),
+			('old', 'pf', 'member', 'x', 1, 1), ('sus', 'pf', 'member', 'x', 1, 1)`,
+		`UPDATE meta SET value = '10' WHERE key = 'schema_version'`,
 	} {
 		if _, err := db.SQL().Exec(stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -474,13 +523,19 @@ func TestApprovalModeMigrationDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	p, err := db.GetPerson(ctx, "mei")
-	if err != nil || p.ApprovalMode != model.ModeRead || p.ApprovalModeExpiresAt != nil {
-		t.Fatalf("person after migration = %+v, %v", p, err)
+	want := map[[2]string]model.ApprovalMode{
+		{"mei", "pw"}: model.ModeWrite, {"mei", "pf"}: model.ModeFull, {"mei", "pr"}: model.ModeRead, {"mei", "pn"}: model.ModeRead,
+		{"old", "pf"}: model.ModeRead, {"sus", "pf"}: model.ModeRead,
+		{"sup", "pw"}: model.ModeWrite, {"sup", "pf"}: model.ModeWrite, {"sup", "pr"}: model.ModeRead,
 	}
-	prov, err := db.GetProvider(ctx, "p1")
-	if err != nil || prov.MaxAutoLevel != model.ModeRead {
-		t.Fatalf("provider after migration = %q, %v", prov.MaxAutoLevel, err)
+	for k, w := range want {
+		m, err := db.GetAccountMode(ctx, k[0], k[1])
+		if err != nil || m.Effective(peopleNow) != w {
+			t.Errorf("%v: got %q, want %q (%v)", k, m.Effective(peopleNow), w, err)
+		}
+	}
+	if m, _ := db.GetAccountMode(ctx, "sup", "pf"); m.ExpiresAt == nil || m.ExpiresAt.UnixMilli() != future {
+		t.Errorf("expiry not carried over: %+v", m)
 	}
 }
 

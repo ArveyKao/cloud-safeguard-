@@ -17,8 +17,6 @@ export interface Person {
   display_name: string
   status: 'pending' | 'active' | 'suspended'
   supervisor: boolean
-  approval_mode: ApprovalMode
-  approval_mode_expires_at?: string
   setup_issued?: SetupIssue
   last_login_at?: string
   created_at: string
@@ -58,7 +56,9 @@ export interface PersonAccount {
   status: 'active' | 'disabled'
   role: Role
   highest_permission: string
-  max_auto_level: ApprovalMode
+  /** The person's mode here as it applies now (read once expired). */
+  approval_mode: ApprovalMode
+  approval_mode_expires_at?: string
   automatic_up_to: string
 }
 
@@ -70,7 +70,6 @@ export interface Provider {
   region: string
   role_arn?: string
   cloud_account_id?: string
-  max_auto_level: ApprovalMode
   access_key_id_masked: string
   status: 'active' | 'disabled'
   last_tested_at?: string
@@ -107,6 +106,10 @@ export interface AccessRequest {
   created_at: string
   issued_at?: string
   expires_at?: string
+  /** How long the agent may keep refreshing the key (CONTRACT §17.12). */
+  max_lifetime_seconds: number
+  refresh_until?: string
+  refresh_count: number
 }
 
 export interface CLISignIn {
@@ -169,6 +172,7 @@ export interface PolicySettings {
   pending_timeout_seconds: number
   max_concurrent_leases_per_agent: number
   leases_per_minute_per_agent: number
+  max_refresh_lifetime_seconds: number
 }
 
 export interface List<T> {

@@ -46,6 +46,7 @@ func (s *Server) buildHandler() http.Handler {
 	agentMux.HandleFunc("GET /api/v1/agent/accounts", s.handleAgentListAccounts)
 	agentMux.HandleFunc("POST /api/v1/agent/access-requests", s.handleAgentCreateAccessRequest)
 	agentMux.HandleFunc("GET /api/v1/agent/access-requests/{id}", s.handleAgentGetAccessRequest)
+	agentMux.HandleFunc("POST /api/v1/agent/access-requests/{id}/refresh", s.handleAgentRefreshAccessRequest)
 	agentMux.HandleFunc("/", s.handleUnknownAPI)
 	s.agentAPI = agentMux
 
@@ -71,7 +72,7 @@ func (s *Server) buildHandler() http.Handler {
 	meMux.HandleFunc("POST /api/v1/me/signins/{code}/deny", s.handleDenySignIn)
 	meMux.HandleFunc("GET /api/v1/me/agents", s.handleListMyAgents)
 	meMux.HandleFunc("POST /api/v1/me/agents/{id}/revoke", s.handleRevokeMyAgent)
-	meMux.HandleFunc("PUT /api/v1/me/approval-mode", s.handleSetMyApprovalMode)
+	meMux.HandleFunc("PUT /api/v1/me/accounts/{provider}/mode", s.handleSetMyAccountMode)
 	meMux.HandleFunc("GET /api/v1/me/accounts", s.handleListMyAccounts)
 	meMux.HandleFunc("GET /api/v1/me/requests", s.handleListMyRequests)
 	meMux.HandleFunc("POST /api/v1/me/requests/{id}/approve", s.consoleOnly(s.handleApproveMyRequest))
@@ -97,7 +98,6 @@ func (s *Server) buildHandler() http.Handler {
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/bindings", s.handleListBindings)
 	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/people/{person}", s.handlePutBinding)
 	supervisorMux.HandleFunc("DELETE /api/v1/supervisor/accounts/{provider}/people/{person}", s.handleDeleteBinding)
-	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/auto-level", s.handleSetAccountAutoLevel)
 	// Cloud accounts, settings, audit and the emergency stop (CONTRACT §17.8).
 	// Actions are attributed to the signed-in supervisor. There is
 	// deliberately no approve route: a supervisor can stop any request or

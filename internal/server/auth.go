@@ -349,7 +349,7 @@ func (s *Server) sessionInfo(ctx context.Context, person model.Person, sess stor
 	if sess.IsCLI() {
 		kind = store.SessionCLI
 	}
-	return model.SessionInfo{Person: person.AsOf(s.nowUTC()), Bindings: bindings, CSRFToken: sess.CSRFToken, ExpiresAt: sess.ExpiresAt, Kind: kind}, nil
+	return model.SessionInfo{Person: person, Bindings: bindings, CSRFToken: sess.CSRFToken, ExpiresAt: sess.ExpiresAt, Kind: kind}, nil
 }
 
 // ================= handlers =================

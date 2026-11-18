@@ -1,11 +1,11 @@
-// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S11)
+// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S12)
 // against a running control plane in mock mode. scripts/demo.sh builds csg,
 // bootstraps a throwaway data directory, starts the server and runs this.
 //
 // People act through the same HTTP API the console uses (setup, sign-in with
 // an authenticator code, approvals); the agent acts through the real csg
 // binary. No secret is printed: setup codes, passwords, tokens and
-// credentials stay in memory, and S11 checks that none of them reached the
+// credentials stay in memory, and S12 checks that none of them reached the
 // server log or this program's own output.
 package main
 
@@ -89,7 +89,8 @@ func main() {
 		{"S8 a supervisor can stop anything; the admin token is gone", d.s8},
 		{"S9 a supervisor on the command line: raising access needs a code, approving stays in the console", d.s9person},
 		{"S10 an MCP client connects by URL: the owner approves in the console, the credential reaches a shell through a one-time link", d.s10remote},
-		{"S11 audit chain verifies and no secret leaked", d.s9},
+		{"S11 approval mode per account, and a credential refreshed under the same request", d.s11modeRefresh},
+		{"S12 audit chain verifies and no secret leaked", d.s9},
 	}
 	failed := 0
 	for _, s := range scenarios {
@@ -106,7 +107,7 @@ func main() {
 	}
 }
 
-// say prints and remembers what was printed, for the leak check in S11.
+// say prints and remembers what was printed, for the leak check in S12.
 func (d *demo) say(format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
 	d.printed.WriteString(text)
@@ -735,6 +736,88 @@ func (d *demo) s9person() error {
 // s10remote is a remote MCP client that knows only the server's URL: it
 // discovers the sign-in, registers, mei approves in the console, and the
 // credential reaches a shell through a one-time link.
+func (d *demo) s11modeRefresh() error {
+	// The earlier scenarios used up this minute's requests: the supervisor
+	// raises the limit for the scenario and puts it back after.
+	var settings model.PolicySettings
+	if err := d.must(d.sup, http.MethodGet, "/api/v1/supervisor/settings", nil, &settings, http.StatusOK); err != nil {
+		return err
+	}
+	raised := settings
+	raised.LeasesPerMinutePerAgent = 60
+	if err := d.must(d.sup, http.MethodPut, "/api/v1/supervisor/settings", raised, nil, http.StatusOK); err != nil {
+		return err
+	}
+	defer func() { _ = d.must(d.sup, http.MethodPut, "/api/v1/supervisor/settings", settings, nil, http.StatusOK) }()
+	if err := d.bind(model.RoleMember); err != nil {
+		return err
+	}
+	var mine struct {
+		Items []model.PersonAccount `json:"items"`
+	}
+	if err := d.must(d.mei, http.MethodGet, "/api/v1/me/accounts", nil, &mine, http.StatusOK); err != nil {
+		return err
+	}
+	var providerID string
+	for _, a := range mine.Items {
+		if a.CloudAccountID == demoAccount {
+			providerID = a.ProviderID
+		}
+	}
+	if providerID == "" {
+		return errors.New("the demo account is not among mei's accounts")
+	}
+	// Write mode on this account: write is issued at once, no approval.
+	if err := d.must(d.mei, http.MethodPut, "/api/v1/me/accounts/"+providerID+"/mode",
+		model.SetApprovalModeInput{Mode: model.ModeWrite}, nil, http.StatusOK); err != nil {
+		return err
+	}
+	write, _, err := d.request("write", "--reason", "restart after a config change", "--max-lifetime", "1h")
+	if err != nil {
+		return err
+	}
+	if write.Status != model.LeaseActive || write.RefreshUntil == nil {
+		return fmt.Errorf("write in write mode is %s (%s), want active at once", write.Status, write.DeniedReason)
+	}
+	first, err := d.credentialToken(write.ID)
+	if err != nil {
+		return err
+	}
+	// A new key under the same request; it works, and so does the old one
+	// until its own expiry.
+	stdout, stderr, code := d.agent(nil, "access", "refresh", write.ID, "--json")
+	var refreshed model.AccessRequest
+	if code != 0 || json.Unmarshal([]byte(stdout), &refreshed) != nil || refreshed.RefreshCount != 1 {
+		return fmt.Errorf("csg access refresh exit %d: %s", code, firstLine(stderr))
+	}
+	second, err := d.credentialToken(write.ID)
+	if err != nil {
+		return err
+	}
+	if second == first {
+		return errors.New("the refresh handed out the same key")
+	}
+	if out, code := d.mock(second, "POST", "/v1/ecs/instances/i-2ze0demo001/restart"); code != 0 {
+		return fmt.Errorf("the refreshed key cannot restart: %s", firstLine(out))
+	}
+	// At most once a minute.
+	if _, _, code := d.agent(nil, "access", "refresh", write.ID); code == 0 {
+		return errors.New("a second refresh within a minute was accepted")
+	}
+	if _, errOut, code := d.agent(nil, "revoke", "--lease", write.ID); code != 0 {
+		return fmt.Errorf("csg revoke exit %d: %s", code, firstLine(errOut))
+	}
+	if _, _, code := d.agent(nil, "access", "refresh", write.ID); code == 0 {
+		return errors.New("a revoked request was refreshed")
+	}
+	// Back to read, and the role back to guest, as before this scenario.
+	if err := d.must(d.mei, http.MethodPut, "/api/v1/me/accounts/"+providerID+"/mode",
+		model.SetApprovalModeInput{Mode: model.ModeRead}, nil, http.StatusOK); err != nil {
+		return err
+	}
+	return d.bind(model.RoleGuest)
+}
+
 func (d *demo) s10remote() error {
 	plain := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	send := func(method, target, contentType, token string, body []byte) (*http.Response, []byte, error) {

@@ -159,7 +159,18 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   `eval "$(curl -fsS -X POST LINK)"`; the link works once within 60 s. Schema 10:
   `oauth_clients`, `oauth_requests`, `credential_links`. The MCP tool layer moved to
   `internal/mcp`, shared with `csg mcp`. Demo S10 covers it; checked live with a scripted
-  OAuth client and the console in a browser. Not yet tried with Claude Code or Cursor.
+  OAuth client and the console in a browser. Review: no blocker or major; 12 minor items
+  fixed in 9e17b44. Tried with Claude Code 2.1.221: sign-in, tools, credential link work.
+- **Piece 4, approval mode per account and refresh (2026-11-17):** owner asked that signing
+  in once be enough and that each person control access per cloud account with
+  read/write/full. The mode is now per (person, account); the supervisor's per-account
+  automatic level is removed (upgrade lowers each mode to the old level, so nothing gets
+  more automatic). Refresh: a new key under the same request within a window the agent may
+  declare (default 8 h, supervisor max default 24 h); `csg access refresh`,
+  `csg credential --process aws|aliyun`, MCP `refresh_credential`. Schema 11. Demo S11.
+  Next pieces decided (CONTRACT §17.13, §17.14): AWS via STS + session policy, then
+  long-lived cloud users and keys for supervisors and people they allow (no expiry, shown
+  once in the console, never given to the agent).
 - **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
   README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
   Alibaba Cloud is untested.
@@ -179,7 +190,7 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console (target surface = api; browser E2E covers the console).
   No production deployment requested.
 - **Address / artifact:** `build/csg` (single binary), demo on `http://127.0.0.1:18787`.
-- **Final demo:** `make demo` → S1–S11 pass; console screenshots captured by verifier.
+- **Final demo:** `make demo` → S1–S12 pass; console screenshots captured by verifier.
 - **Evidence / review:** `scripts/demo.sh` transcript, `go test ./...`, `npm run build`,
   verifier report `changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md`, canonical
   `arvey-develop delivery check --phase complete` PASS.

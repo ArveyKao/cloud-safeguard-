@@ -915,7 +915,9 @@ agent or the request.
 
 ### 17.5 Approval
 
-- **Approval mode.** Each person chooses one mode for all their agents: `read` (default),
+- **Approval mode.** *Replaced by §17.11: the mode is now per cloud account and the account's
+  highest automatic level is removed; the rest of this item describes the earlier design.*
+  Each person chooses one mode for all their agents: `read` (default),
   `write` or `full`. A request at or below the mode is issued automatically; a request above
   it waits for approval.
 
@@ -970,7 +972,8 @@ agent or the request.
   rejects it after the deadline even if Cloud Safeguard is down (the cloud's own deadline is
   later than the server's by the time minting took, normally under a second). At the deadline the server
   marks the lease `expired`, erases its stored credential and writes an audit event (§10
-  sweep). A credential cannot be extended; the agent sends a new request.
+  sweep). A key cannot be extended; within its refresh window the agent can have a new key
+  issued under the same request (§17.12), and after it the agent sends a new request.
 - Suspending a person suspends their agents and revokes their pending and active leases.
 - Removing or lowering a binding revokes that person's agents' leases on that account that the
   new role does not permit. Real STS credentials stay valid until expiry.
@@ -1225,6 +1228,100 @@ returns a **one-time link** instead of the secret:
   the link is audited too; the link token is stored only as a hash and masked in the logs,
   like the connection key.
 
+### 17.11 Approval mode per cloud account (decided 2026-11-17; replaces the mode and level of §17.5)
+
+A person signs in an agent once; after that, what the agent gets without asking is decided by
+one rule per cloud account, which only that person sets.
+
+- **Mode per account.** For each cloud account where a person has a role, the person chooses a
+  mode: `read` (default), `write` or `full`. A request at or below the mode on that account is
+  issued at once, with no approval and no code; a request above it waits for the person's
+  approval in the console (§17.5 approval, unchanged). The role still comes first: what is
+  automatic is the lower of the mode and the highest permission the role there allows.
+- **The account's highest automatic level is removed.** Supervisors control access through
+  roles; there is no second, per-account automatic ceiling. `PUT
+  /api/v1/supervisor/accounts/{id}/auto-level` and `max_auto_level` are gone.
+- `PUT /api/v1/me/accounts/{provider_id}/mode {mode, expires_in_seconds?}` sets it (person
+  session, the person's own accounts only; 404 for an account they have no role on). A mode
+  above `read` may carry an expiry (at most 30 days), after which it is `read`. As before, a
+  command-line session needs a fresh authenticator code to raise a mode (§17.9); the console
+  does not. `PUT /api/v1/me/approval-mode` is gone.
+- `GET /api/v1/me/accounts` shows, per account, the role, the mode (`approval_mode`, with
+  `approval_mode_expires_at`) and `automatic_up_to`. Agents still see only `automatic_up_to`.
+- The mode is read when the request is made (a snapshot), as before. Removing a person's role
+  on an account removes their mode there; resetting a person or recovering a supervisor puts
+  every mode back to `read`. Changes are audited (`person.approval_mode_changed`, with the
+  account).
+- **Upgrade.** A person's former single mode becomes their mode on each account where they
+  hold a role, lowered to that account's former highest automatic level, with the former
+  expiry. Nothing becomes more automatic than it was.
+
+### 17.12 Credential lifetime and refresh (decided 2026-11-17; replaces "cannot be extended" in §17.6)
+
+- **Lifetime of one key.** `ttl_seconds`, declared by the agent, within the limits of §17.4.
+  The cloud rejects the key at its deadline even when Cloud Safeguard is down; Cloud Safeguard
+  erases its copy then.
+- **Refresh window.** A request may also declare `max_lifetime_seconds`: how long the agent
+  wants to keep refreshing. Left out, it is 8 hours. It must be at least `ttl_seconds` and at
+  most the supervisor setting `max_refresh_lifetime_seconds` (default 24 hours, at most 30
+  days); a default above the setting is lowered to it. The window starts when the first key is
+  issued: `refresh_until = issued_at + max_lifetime_seconds`. The approval shows it.
+- `POST /api/v1/agent/access-requests/{id}/refresh` (agent token, own requests only): while the
+  request is active, its current key has not expired and the window is open, Cloud Safeguard
+  mints a new key under the same request, with the same policy, for `min(ttl_seconds,
+  refresh_until − now)`. Below the provider minimum (900 s for real STS) it answers 409: make a
+  new request. A refresh repeats every check of a release (agent and owner active, the owner's
+  role still permits it, the account active, the IAM prohibition) but not the approval: a
+  request approved above the mode may be refreshed within its window. At most one refresh per
+  request per 60 seconds (429 otherwise). The new key replaces the stored one; the earlier key
+  stays valid at the cloud until its own deadline (an STS key cannot be withdrawn). Audited as
+  `lease.refreshed` with the masked key ID and the new deadline. Revoking the request ends
+  refreshes at once.
+- The request view shows `max_lifetime_seconds`, `refresh_until` and `refresh_count`.
+- **MCP.** `refresh_credential {request_id}` refreshes and then hands the new key over as
+  `get_credential` does (a credential file for `csg mcp`, a one-time link for remote MCP).
+- **CLI.** `csg access refresh ID`; `csg credential --lease ID --process aws|aliyun` prints the
+  JSON an SDK credential process expects (AWS `credential_process`, Alibaba Cloud CLI
+  `External` mode), refreshing first when the key has less than 5 minutes left, so a
+  long-running SDK keeps itself supplied within the window.
+
+### 17.13 AWS (decided 2026-11-17, not built yet)
+
+- A cloud account of type `aws` is reached the same way as Alibaba Cloud: one broker identity
+  that can only call `sts:AssumeRole` on one role (for example `csg-access`), and every key is
+  `AssumeRole` with a session policy rendered from a fixed read/write/full template, so the
+  key can do only what both the role and the session policy allow. No users, policies or keys
+  are created per request.
+- The role should allow everything agents may ever need there and no IAM; the console
+  recommends AWS `PowerUserAccess` (and for Alibaba Cloud `AdministratorAccess` with an
+  explicit deny of `ram:*` and `sts:*`). The connection test warns when the role allows IAM.
+- First resource type: `s3` (bucket; objects are items). `resource_name` is the bucket name.
+- The broker identity may later come from the platform instead of a stored key (instance
+  role, OIDC federation); the agent side does not change.
+
+### 17.14 Long-lived credentials (decided 2026-11-17, not built yet)
+
+Some uses need a key that does not expire (a CDN origin, a bucket sync). Cloud Safeguard can
+create a cloud user with an access key for them, under strict control.
+
+- **Who.** Supervisors, and people a supervisor has allowed (a person flag). Anyone else, and
+  their agents, are refused.
+- **Asking.** The person in the console, or one of their agents (API and MCP
+  `request_long_lived_credential`) with the §17.4 fields except `ttl_seconds`. The answer is
+  only a console link. Nothing is created and no secret goes to the agent.
+- **Creating.** The person opens the link signed in to the console (only that person can open
+  it), checks what will be created and confirms. Cloud Safeguard then creates the user, the
+  policy rendered from the same read/write/full template (with the IAM deny), attaches it,
+  creates the access key, and shows the secret once in the console. The secret is never
+  stored by Cloud Safeguard.
+- **No expiry.** The key lives until it is revoked. The console lists every long-lived
+  credential (account, user, scope, creator, created); its creator or any supervisor can
+  revoke it, which deletes the key, the policy and the user.
+- **Cloud side.** This needs a second, separate broker identity per account, enabled by a
+  supervisor, that may only manage users and policies named `csg-*` (on AWS also only with a
+  fixed permissions boundary that denies IAM). Agents' keys never come from it. Every create
+  and revoke is audited at critical level.
+
 ### 17.8 Implementation status
 
 | Part | Status |
@@ -1239,7 +1336,9 @@ returns a **one-time link** instead of the secret:
 | Supervisors are Administrator on every cloud account (§17.1) | implemented |
 | Removal of the admin token and the §16 agent model (§17.7a) | implemented, schema version 8 |
 | Person sign-in for `csg` with guarded sessions (§17.9) | implemented, schema version 9 |
-| Remote MCP over HTTPS with OAuth sign-in (§17.10) | done; tested with a scripted OAuth client, not yet with Claude or Cursor |
+| Remote MCP over HTTPS with OAuth sign-in (§17.10) | done; tried with Claude Code 2.1.221 (sign-in, tools, credential link) |
+| Approval mode per cloud account (§17.11), refresh (§17.12) | implemented, schema version 11 |
+| AWS (§17.13), long-lived credentials (§17.14) | decided, not built |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
 | Console redesign (sign-in, Inbox, Agents, Cloud accounts, Activity, People, Settings) | implemented; the admin-token console is removed |
@@ -1261,10 +1360,10 @@ The HTTP API:
   `GET /api/v1/agent/leases[/{id}]` and `POST /api/v1/agent/heartbeat` complete the agent API.
 - `GET /api/v1/me/requests[?status=pending]`,
   `POST /api/v1/me/requests/{id}/approve|deny|revoke` (person session)
-- `PUT /api/v1/me/approval-mode` (person session; the current mode is in `GET /auth/me`),
-  `PUT /api/v1/supervisor/accounts/{provider_id}/auto-level` (supervisor)
+- `PUT /api/v1/me/accounts/{provider_id}/mode` (person session; §17.11)
 - `GET /api/v1/me/accounts` (person session): the person's own cloud accounts with their
-  role, the account's highest automatic level and what their agents get there automatically
+  role, their approval mode there and what their agents get there automatically
+- `POST /api/v1/agent/access-requests/{id}/refresh` (agent token; §17.12)
 - Supervisor session:
   - cloud accounts: `GET|POST /api/v1/supervisor/accounts`,
     `GET|PATCH /api/v1/supervisor/accounts/{id}`,

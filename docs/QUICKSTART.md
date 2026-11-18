@@ -154,10 +154,19 @@ credential can restart that one instance and nothing else.
 
 ## 1.9 Approval modes
 
-In **Settings**, each person picks how much their agents get without asking: **Read** (the
-default), **Write** or **Full**, optionally for a limited time. A supervisor sets the highest
-automatic level per cloud account (default read). What is issued without approval is the
-lowest of the person's role, their mode and the account's level.
+On the **Cloud accounts** page, each person picks, per account, how much their agents get
+without asking: **Read** (the default), **Write** or **Full**, optionally for a limited
+time (**Change** in the *Your approval mode* column). What is issued without approval is
+the lower of their role on that account and their mode there; anything above waits for
+them in the Inbox. From the command line: `csg me mode ACCOUNT write --for 2h` (raising
+asks for an authenticator code).
+
+A credential lasts what the agent asked for (`--ttl`), and the agent can have a new key
+issued under the same request before it expires, for up to 8 hours (or what it declares
+with `--max-lifetime`, at most the supervisor's limit): `csg access refresh ID`. For
+long-running SDKs, `csg credential --lease ID --process aws|aliyun` prints the JSON of an
+AWS `credential_process` or the Alibaba Cloud CLI `External` mode, refreshing first when
+less than 5 minutes are left.
 
 ## 1.10 Revocation
 
@@ -257,7 +266,7 @@ make demo
 It starts its own instance on port 18787 and runs ten scenarios end to end (setup, agent
 sign-in, automatic read, least privilege, denial, approval, revocation on a role change,
 the supervisor's emergency stop, a supervisor on the command line, audit and a secret-leak
-check), then prints `all S1-S11 scenarios passed`.
+check), then prints `all S1-S12 scenarios passed`.
 
 ## 1.15 Clean up
 
@@ -379,7 +388,8 @@ and never by an agent.
    (`sts:GetCallerIdentity`) and that it can assume the role (one `AssumeRole` for 15
    minutes with a policy that allows nothing useful; the result is thrown away).
 
-Then give people their roles on the account, and decide its highest automatic level.
+Then give people their roles on the account. Each person then chooses their own approval
+mode on it.
 
 ## 2.5 Sign agents in and ask for access
 

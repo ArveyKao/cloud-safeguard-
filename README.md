@@ -50,7 +50,7 @@ Agent   → csg login: shows a short code; its owner approves it in the console
 Agent   → asks: cloud account + resource (ecs/dns/oss) + permission (read/write/full)
                 + validity period [+ one resource name] [+ reason]
         → the owner's role on that account decides whether it is allowed at all
-        → the owner's approval mode and the account's limit decide: issue now, or wait
+        → the owner's approval mode on that account decides: issue now, or wait
           for the owner
         → the vault decrypts the broker AccessKey (in-process only)
         → AssumeRole with a policy written for exactly this request
@@ -110,7 +110,8 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | Roles per cloud account (Guest, Member, Administrator); supervisors manage the platform | ✅ |
 | Agents sign in with a short code a person approves; no token is copied by hand | ✅ |
 | Access requests: cloud account, resource type (ECS, DNS, OSS), read / write / full, validity, optional resource name | ✅ |
-| Approval modes per person (Read, Write, Full) and a highest automatic level per cloud account | ✅ |
+| Approval modes per person and cloud account (Read, Write, Full) | ✅ |
+| Refresh: a new key under the same request within its refresh window (default 8 hours); SDK credential process output | ✅ |
 | Only the agent's owner approves; supervisors can deny or revoke anything, never approve for someone else | ✅ |
 | STS credentials with a policy scoped to the request; RAM management always denied | ✅ |
 | Deadlines, a background sweeper, and revocation when a role is lowered, a person is suspended or an account is disabled | ✅ |
@@ -120,8 +121,10 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | Mock cloud and a scripted demo (no cloud account needed) | ✅ |
 | Real Alibaba Cloud `sts` mode | ✅ implemented, unit-tested against a fake STS endpoint; not yet run against a live account |
 | `csg` sign-in for people, with supervisor commands (raising access needs an authenticator code) | ✅ |
-| Remote MCP over HTTPS: an agent connects with just a URL, signs in through the console (OAuth), and gets credentials through one-time links | ✅ tested with a scripted OAuth client; not yet with Claude or Cursor |
-| More clouds (AWS, GCP), SSO, chat approvals, credential-free proxy mode | 🔜 later |
+| Remote MCP over HTTPS: an agent connects with just a URL, signs in through the console (OAuth), and gets credentials through one-time links | ✅ tried with Claude Code |
+| AWS (STS with a session policy; S3 first) | 🔜 next (CONTRACT §17.13) |
+| Long-lived credentials (a cloud user and key) for supervisors and people they allow | 🔜 next (CONTRACT §17.14) |
+| GCP, SSO, chat approvals, credential-free proxy mode | 🔜 later |
 
 The rules are in [docs/CONTRACT.md](docs/CONTRACT.md) §17.
 
@@ -191,12 +194,12 @@ The step-by-step path, the MCP setup and the real-cloud setup are in
 | --- | --- |
 | Server host | `csg init [--demo] [--data-dir DIR] [--supervisor NAME]` · `csg serve [--data-dir DIR] [--addr 127.0.0.1:8787] [--public-url URL]` · `csg supervisor recover --username NAME` |
 | Agent sign-in | `csg login --server URL [--name NAME]` · `csg whoami` · `csg version` |
-| Agent | `csg accounts` · `csg access request --account ID --resource R --permission P --ttl 15m [--name N] [--reason ...] [--wait 5m]` · `csg access status ID` |
+| Agent | `csg accounts` · `csg access request --account ID --resource R --permission P --ttl 15m [--max-lifetime 8h] [--name N] [--reason ...] [--wait 5m]` · `csg access status ID` · `csg access refresh ID` · `csg credential --lease ID --export\|--process aws\|aliyun` |
 | Agent | `csg exec --account ID --resource R --permission P --ttl 15m -- CMD` · `csg credential --lease ID [--export\|--json]` · `csg revoke --lease ID` · `csg leases mine` |
-| MCP | `https://SERVER/mcp` (remote, OAuth sign-in in the console) or `csg mcp` (stdio); tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `revoke` |
+| MCP | `https://SERVER/mcp` (remote, OAuth sign-in in the console) or `csg mcp` (stdio); tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `refresh_credential`, `revoke` |
 | Person sign-in | `csg person login --server URL [--name NAME]` · `csg person whoami` · `csg person logout` |
-| Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode read\|write\|full [--for DUR]` · `csg me sessions` · `csg me end-session ID` |
-| Supervisor | `csg supervisor people [add\|suspend\|activate\|reset\|make-supervisor\|remove-supervisor] …` · `csg supervisor roles [set\|remove] …` · `csg supervisor accounts [show\|test\|enable\|disable\|rename\|set-region\|set-role-arn\|auto-level\|rotate] …` · `csg supervisor settings [set …]` · `csg supervisor audit [verify]` · `csg supervisor requests [deny\|revoke] …` |
+| Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode ACCOUNT read\|write\|full [--for DUR]` · `csg me sessions` · `csg me end-session ID` |
+| Supervisor | `csg supervisor people [add\|suspend\|activate\|reset\|make-supervisor\|remove-supervisor] …` · `csg supervisor roles [set\|remove] …` · `csg supervisor accounts [show\|test\|enable\|disable\|rename\|set-region\|set-role-arn\|rotate] …` · `csg supervisor settings [set …]` · `csg supervisor audit [verify]` · `csg supervisor requests [deny\|revoke] …` |
 | Demo | `csg mock request METHOD /v1/PATH [JSON_BODY]` |
 
 Changes that raise access take `--code` (a code from your authenticator app), or ask for it
@@ -256,7 +259,7 @@ cloud-safeguard/
 │   ├── token/          # bearer token generation and hashing
 │   └── cli/            # csg commands and the MCP server
 ├── web/                # React + Vite console, embedded into the binary
-├── scripts/demo.sh     # end-to-end demo (S1–S11), driven by scripts/demo/
+├── scripts/demo.sh     # end-to-end demo (S1–S12), driven by scripts/demo/
 ├── docs/               # SPEC, CONTRACT, PRODUCT, SECURITY, ARCHITECTURE, QUICKSTART, API, DECISIONS
 └── Makefile            # build / test / demo entry points
 ```

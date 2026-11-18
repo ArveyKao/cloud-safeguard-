@@ -57,7 +57,8 @@ export function InboxPage({ person, onChange }: { person: Person; onChange: () =
             <dl className="facts">
               <div><dt>Cloud account</dt><dd>{r.cloud_account_name} <span className="mono muted">{r.cloud_account_id}</span></dd></div>
               <div><dt>Resource</dt><dd>{r.resource.toUpperCase()} · {r.resource_name ? <span className="mono">{r.resource_name}</span> : 'all'}</dd></div>
-              <div><dt>For</dt><dd>{duration(r.ttl_seconds)}</dd></div>
+              <div><dt>For</dt><dd>{duration(r.ttl_seconds)} per key{r.max_lifetime_seconds > r.ttl_seconds &&
+                <span className="muted"> · the agent may get new keys for up to {duration(r.max_lifetime_seconds)}</span>}</dd></div>
             </dl>
             <div className="row-actions">
               <Button onClick={() => setDenying(r)}>Deny</Button>

@@ -263,7 +263,6 @@ func (a *App) runSupAccounts(args []string) error {
        csg supervisor accounts enable ACCOUNT [--code CODE]
        csg supervisor accounts set-region ACCOUNT REGION [--code CODE]
        csg supervisor accounts set-role-arn ACCOUNT ARN [--code CODE]
-       csg supervisor accounts auto-level ACCOUNT read|write|full [--code CODE]
        csg supervisor accounts rotate ACCOUNT --key-id ID --code CODE < secret   (secret piped in)
 
 Adding a cloud account is done in the console only. rotate reads the new
@@ -290,9 +289,9 @@ terminal), so its --code must be given as a flag.
 		}
 		rows := [][]string{}
 		for _, p := range list.Items {
-			rows = append(rows, []string{orDash(p.CloudAccountID), p.Name, string(p.Mode), p.Region, string(p.Status), string(p.MaxAutoLevel), p.AccessKeyIDMasked})
+			rows = append(rows, []string{orDash(p.CloudAccountID), p.Name, string(p.Mode), p.Region, string(p.Status), p.AccessKeyIDMasked})
 		}
-		writeTable(a.Stdout, []string{"CLOUD ACCOUNT", "NAME", "MODE", "REGION", "STATUS", "AUTOMATIC UP TO", "ACCESS KEY"}, rows)
+		writeTable(a.Stdout, []string{"CLOUD ACCOUNT", "NAME", "MODE", "REGION", "STATUS", "ACCESS KEY"}, rows)
 		return nil
 	}
 	if sub == "add" {
@@ -357,21 +356,6 @@ terminal), so its --code must be given as a flag.
 			return err
 		}
 		update.RoleARN = &v
-	case "auto-level":
-		v, err := arg()
-		if err != nil {
-			return err
-		}
-		level := model.ApprovalMode(strings.ToLower(v))
-		if !level.Valid() {
-			return usagef("level must be read, write or full")
-		}
-		var out model.Provider
-		if err := a.raising(c, *f.code, http.MethodPut, path+"/auto-level", model.SetAutoLevelInput{MaxAutoLevel: level}, &out); err != nil {
-			return err
-		}
-		fmt.Fprintf(a.Stdout, "%s: issued without approval up to %s\n", out.Name, out.MaxAutoLevel)
-		return nil
 	case "rotate":
 		if strings.TrimSpace(*keyID) == "" || strings.TrimSpace(*f.code) == "" {
 			return usagef("rotate needs --key-id and --code; the new secret is read from standard input")
@@ -419,7 +403,8 @@ func (a *App) runSupSettings(args []string) error {
 	}
 	fs, f := a.supFlagSet("supervisor settings "+sub, `Usage: csg supervisor settings [show]
        csg supervisor settings set [--max-validity DUR] [--approval-timeout DUR]
-                                   [--max-credentials N] [--requests-per-minute N] [--code CODE]
+                                   [--max-credentials N] [--requests-per-minute N]
+                                   [--max-refresh DUR] [--code CODE]
 
 Values not given are left as they are. Raising any value needs a code from
 your authenticator app; lowering does not.
@@ -428,6 +413,7 @@ your authenticator app; lowering does not.
 	timeout := fs.String("approval-timeout", "", "how long a request waits for approval")
 	maxCreds := fs.String("max-credentials", "", "credentials and waiting requests per agent")
 	perMinute := fs.String("requests-per-minute", "", "requests per agent per minute")
+	maxRefresh := fs.String("max-refresh", "", "longest an agent may keep refreshing one request's credential")
 	if _, err := parseFlags(fs, rest); err != nil {
 		return err
 	}
@@ -449,6 +435,11 @@ your authenticator app; lowering does not.
 		if *timeout != "" {
 			if s.PendingTimeoutSeconds, err = parseDurationSeconds(*timeout); err != nil {
 				return usagef("--approval-timeout: %v", err)
+			}
+		}
+		if *maxRefresh != "" {
+			if s.MaxRefreshLifetimeSeconds, err = parseDurationSeconds(*maxRefresh); err != nil {
+				return usagef("--max-refresh: %v", err)
 			}
 		}
 		for _, v := range []struct {
@@ -480,6 +471,7 @@ your authenticator app; lowering does not.
 	fmt.Fprintf(a.Stdout, "approval timeout:           %s\n", formatSeconds(s.PendingTimeoutSeconds))
 	fmt.Fprintf(a.Stdout, "credentials per agent:      %d\n", s.MaxConcurrentLeasesPerAgent)
 	fmt.Fprintf(a.Stdout, "requests per agent/minute:  %d\n", s.LeasesPerMinutePerAgent)
+	fmt.Fprintf(a.Stdout, "longest refresh window:     %s\n", formatSeconds(s.MaxRefreshLifetimeSeconds))
 	return nil
 }
 

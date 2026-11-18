@@ -28,7 +28,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 10
+const CurrentSchemaVersion = 11
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -308,6 +308,80 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_credential_links_expires ON credential_links(expires_at)`,
 		},
 	},
+	{ // version 10 -> 11: approval mode per cloud account, refresh (CONTRACT §17.11, §17.12)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS account_modes (
+				person_id   TEXT NOT NULL,
+				provider_id TEXT NOT NULL,
+				mode        TEXT NOT NULL,
+				expires_at  INTEGER,
+				updated_at  INTEGER NOT NULL,
+				PRIMARY KEY (person_id, provider_id)
+			)`,
+		},
+		transform: migrateAccountModes,
+	},
+}
+
+// tableColumns returns the names of a table's columns.
+func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		have[name] = true
+	}
+	return have, rows.Err()
+}
+
+// migrateAccountModes adds the refresh columns of leases and turns each
+// person's single approval mode into a mode on each cloud account where they
+// hold a role, lowered to that account's former highest automatic level, so
+// nothing becomes more automatic than it was (CONTRACT §17.11). An expired
+// mode, or one that was read on either side, is not carried over.
+func migrateAccountModes(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	have, err := tableColumns(ctx, tx, "leases")
+	if err != nil {
+		return err
+	}
+	for _, c := range []struct{ name, ddl string }{
+		{"max_lifetime_seconds", `ALTER TABLE leases ADD COLUMN max_lifetime_seconds INTEGER NOT NULL DEFAULT 0`},
+		{"refresh_until", `ALTER TABLE leases ADD COLUMN refresh_until INTEGER`},
+		{"refresh_count", `ALTER TABLE leases ADD COLUMN refresh_count INTEGER NOT NULL DEFAULT 0`},
+		{"last_refreshed_at", `ALTER TABLE leases ADD COLUMN last_refreshed_at INTEGER`},
+	} {
+		if have[c.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, c.ddl); err != nil {
+			return fmt.Errorf("store: add leases.%s: %w", c.name, err)
+		}
+	}
+	now := time.Now().UTC().UnixMilli()
+	rank := func(col string) string {
+		return `(CASE ` + col + ` WHEN 'full' THEN 3 WHEN 'write' THEN 2 ELSE 1 END)`
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO account_modes(person_id, provider_id, mode, expires_at, updated_at)
+		 SELECT p.id, pr.id,
+		        CASE WHEN `+rank("p.approval_mode")+` <= `+rank("pr.max_auto_level")+` THEN p.approval_mode ELSE pr.max_auto_level END,
+		        p.approval_mode_expires_at, ?
+		 FROM persons p JOIN providers pr
+		 WHERE p.status = 'active' AND `+rank("p.approval_mode")+` > 1 AND `+rank("pr.max_auto_level")+` > 1
+		   AND (p.approval_mode_expires_at IS NULL OR p.approval_mode_expires_at > ?)
+		   AND (p.supervisor = 1 OR EXISTS (SELECT 1 FROM role_bindings b WHERE b.person_id = p.id AND b.provider_id = pr.id))`,
+		now, now)
+	if err != nil {
+		return fmt.Errorf("store: migrate approval modes: %w", err)
+	}
+	return nil
 }
 
 // addSessionKindColumns adds the session columns of schema 9 that are not
@@ -752,6 +826,13 @@ func (db *DB) GetPolicySettings(ctx context.Context) (model.PolicySettings, erro
 	var s model.PolicySettings
 	if err := json.Unmarshal([]byte(raw), &s); err != nil {
 		return model.PolicySettings{}, fmt.Errorf("store: corrupt policy settings: %w", err)
+	}
+	// Settings stored before the refresh limit existed get its default.
+	if s.MaxRefreshLifetimeSeconds == 0 {
+		s.MaxRefreshLifetimeSeconds = model.DefaultPolicySettings().MaxRefreshLifetimeSeconds
+		if s.MaxRefreshLifetimeSeconds < s.MaxLeaseTTLSeconds {
+			s.MaxRefreshLifetimeSeconds = s.MaxLeaseTTLSeconds
+		}
 	}
 	return s, nil
 }

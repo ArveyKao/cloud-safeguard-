@@ -6,7 +6,7 @@ import { api, setCsrf } from './api'
 import { ToastProvider } from './ui'
 import { InboxPage } from './pages/Inbox'
 import { PeoplePage } from './pages/People'
-import { SettingsPage } from './pages/Settings'
+import { AccountsPage } from './pages/Accounts'
 import { SignInApprovalPage } from './pages/SignInApproval'
 import { rememberSignIn, takeSignIn } from './App'
 import { CLISignInApprovalPage } from './pages/CLISignInApproval'
@@ -52,7 +52,7 @@ const changes = () => calls.filter((c) => c.method !== 'GET')
 
 const person: Person = {
   id: 'per_1', username: 'mei', display_name: 'Mei', status: 'active', supervisor: true,
-  approval_mode: 'read', created_at: '2026-11-01T00:00:00Z',
+  created_at: '2026-11-01T00:00:00Z',
 }
 
 describe('server text is shown as text', () => {
@@ -113,26 +113,38 @@ describe('authority changes ask first', () => {
 })
 
 describe('approval mode', () => {
+  const account = {
+    provider_id: 'prv_1', cloud_account_id: '1234567890123456', name: 'demo', provider_type: 'aliyun', status: 'active',
+    role: 'administrator', highest_permission: 'full', approval_mode: 'read', automatic_up_to: 'read',
+  }
+
   it('keeps the end of a temporary mode when saved unchanged', async () => {
     const end = new Date(Date.now() + 3600_000).toISOString()
-    routes['PUT /me/approval-mode'] = (b: unknown) => ({ status: 200, body: { data: { ...person, ...(b as object) } } })
-    wrap(<SettingsPage person={{ ...person, supervisor: false, approval_mode: 'write', approval_mode_expires_at: end }} onPersonChange={() => {}} />)
+    routes['GET /me/accounts'] = { items: [{ ...account, approval_mode: 'write', approval_mode_expires_at: end }], total: 1 }
+    routes['PUT /me/accounts/prv_1/mode'] = (b: unknown) => ({ status: 200, body: { data: { ...account, ...(b as object) } } })
+    wrap(<AccountsPage person={{ ...person, supervisor: false }} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Change' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(changes().length).toBe(1))
+    expect(changes()[0].path).toBe('/me/accounts/prv_1/mode')
     const sent = changes()[0].body as { mode: string; expires_in_seconds: number }
     expect(sent.mode).toBe('write')
     expect(sent.expires_in_seconds).toBeGreaterThan(3500)
     expect(sent.expires_in_seconds).toBeLessThanOrEqual(3600)
   })
 
-  it('asks before raising the mode', async () => {
-    routes['PUT /me/approval-mode'] = person
-    wrap(<SettingsPage person={{ ...person, supervisor: false }} onPersonChange={() => {}} />)
+  it('asks before raising the mode, on that account only', async () => {
+    routes['GET /me/accounts'] = { items: [account], total: 1 }
+    routes['PUT /me/accounts/prv_1/mode'] = account
+    wrap(<AccountsPage person={{ ...person, supervisor: false }} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Change' }))
     fireEvent.click(screen.getByRole('radio', { name: 'Full mode' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     expect(changes().length).toBe(0)
+    await screen.findByText(/all your agents on demo/)
     fireEvent.click(screen.getByRole('button', { name: 'Switch' }))
-    await waitFor(() => expect(changes().length).toBe(1))
+    await waitFor(() => expect(changes().map((c) => c.method + ' ' + c.path)).toEqual(['PUT /me/accounts/prv_1/mode']))
+    expect((changes()[0].body as { mode: string }).mode).toBe('full')
   })
 })
 

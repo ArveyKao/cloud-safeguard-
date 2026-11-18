@@ -330,7 +330,7 @@ func TestInitBootstrapArtifacts(t *testing.T) {
 		t.Fatalf("seeded providers = %d, %v", len(providers), err)
 	}
 	if providers[0].Name != "demo-aliyun" || providers[0].Mode != model.ModeMock || providers[0].Status != model.ProviderActive ||
-		providers[0].CloudAccountID != demoAccountID || providers[0].MaxAutoLevel != model.ModeRead {
+		providers[0].CloudAccountID != demoAccountID {
 		t.Fatalf("demo provider = %+v", providers[0])
 	}
 	people, err := db.ListPersons(ctx)

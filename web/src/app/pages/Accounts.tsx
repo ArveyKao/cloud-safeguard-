@@ -1,17 +1,29 @@
 import { useState } from 'react'
 import { api } from '../api'
-import type { ApprovalMode, Person, Provider, Role } from '../types'
+import type { ApprovalMode, Person, PersonAccount, Provider, Role } from '../types'
 import { navigate } from '../router'
 import {
-  Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, ago, roleHint, roleLabel, useAction, useConfirm, useLoad, useToast,
+  Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, ago, roleHint, roleLabel, useAction, useConfirm, useLoad, useToast, when,
 } from '../ui'
 
-const LEVELS: { value: ApprovalMode; label: string }[] = [
-  { value: 'read', label: 'Read only' }, { value: 'write', label: 'Up to write' }, { value: 'full', label: 'Up to full' },
+const MODES: { value: ApprovalMode; title: string; text: string }[] = [
+  { value: 'read', title: 'Read mode', text: 'Reading is automatic. Every change asks you.' },
+  { value: 'write', title: 'Write mode', text: 'Reading and changing existing resources are automatic. Creating and deleting ask you.' },
+  { value: 'full', title: 'Full mode', text: 'Everything your role allows is automatic. Nothing asks you.' },
 ]
+
+const KEEP = -1
+
+const EXPIRY = [
+  { seconds: 0, label: 'Until I change it' }, { seconds: 3600, label: 'For 1 hour' },
+  { seconds: 8 * 3600, label: 'For 8 hours' }, { seconds: 86400, label: 'For 1 day' },
+]
+
+const rank: Record<ApprovalMode, number> = { read: 1, write: 2, full: 3 }
 
 export function AccountsPage({ person }: { person: Person }) {
   const mine = useLoad(() => api.myAccounts(), [])
+  const [editing, setEditing] = useState<PersonAccount | null>(null)
   return (
     <>
       <PageHead title="Cloud accounts"
@@ -23,12 +35,17 @@ export function AccountsPage({ person }: { person: Person }) {
       <Card title="Your roles">
         {(mine.data?.items ?? []).length === 0 ? <Empty>You have no role on any cloud account yet. A supervisor gives you one.</Empty> : (
           <table className="table">
-            <thead><tr><th>Account</th><th>Your role</th><th>Your agents get without asking</th><th>Status</th></tr></thead>
+            <thead><tr><th>Account</th><th>Your role</th><th>Your approval mode</th><th>Your agents get without asking</th><th>Status</th></tr></thead>
             <tbody>
               {mine.data!.items.map((a) => (
                 <tr key={a.provider_id}>
                   <td><b>{a.name}</b><div className="mono muted small">{a.cloud_account_id}</div></td>
                   <td>{roleLabel[a.role] ?? a.role} <span className="muted small">· {roleHint[a.role]}</span></td>
+                  <td>
+                    {MODES.find((m) => m.value === a.approval_mode)?.title ?? a.approval_mode}
+                    {a.approval_mode_expires_at && <div className="muted small">until {when(a.approval_mode_expires_at)}</div>}
+                    <div><Button kind="link" onClick={() => setEditing(a)}>Change</Button></div>
+                  </td>
                   <td>{a.automatic_up_to ? <Badge tone="blue">{a.automatic_up_to}</Badge> : <span className="muted">nothing</span>}</td>
                   <td>{a.status === 'active' ? <Badge tone="green">active</Badge> : <Badge>disabled</Badge>}</td>
                 </tr>
@@ -36,9 +53,82 @@ export function AccountsPage({ person }: { person: Person }) {
             </tbody>
           </table>
         )}
+        <p className="muted small">Your approval mode decides, per account, what your agents get without asking you. It never goes beyond your role there.</p>
       </Card>
+      {editing && <ModeDialog account={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); mine.reload() }} />}
       {person.supervisor && <ManageAccounts onChange={mine.reload} />}
     </>
+  )
+}
+
+/** Sets the person's approval mode on one cloud account. */
+function ModeDialog({ account, onClose, onSaved }: { account: PersonAccount; onClose: () => void; onSaved: () => void }) {
+  const [mode, setMode] = useState<ApprovalMode>(account.approval_mode)
+  // KEEP keeps the current end of a temporary mode; saving must never turn
+  // a temporary mode into a permanent one by accident.
+  const hasEnd = Boolean(account.approval_mode_expires_at)
+  const [expiry, setExpiry] = useState(hasEnd ? KEEP : 0)
+  const [confirming, setConfirming] = useState(false)
+  const action = useAction()
+  const toast = useToast()
+  const what = MODES.find((m) => m.value === mode)!
+
+  function expirySeconds(): number {
+    if (mode === 'read') return 0
+    if (expiry !== KEEP) return expiry
+    const left = Math.ceil((new Date(account.approval_mode_expires_at ?? 0).getTime() - Date.now()) / 1000)
+    return Math.max(1, left)
+  }
+  async function save() {
+    await api.setMode(account.provider_id, mode, expirySeconds())
+    toast(`${account.name}: ${what.title.toLowerCase()} saved`)
+    onSaved()
+  }
+  const raising = rank[mode] > rank[account.approval_mode]
+  const endingRemoved = hasEnd && mode !== 'read' && expiry === 0
+
+  return (
+    <Modal title={`Approval mode on ${account.name}`} onClose={onClose}>
+      {confirming ? (
+        <>
+          <div className="confirm-body">
+            <p><b>Switch to {what.title.toLowerCase()}{expiry === 0 ? ' until you change it' : ''}?</b></p>
+            <p>{what.text} This applies to all your agents on {account.name}, up to your role ({roleLabel[account.role] ?? account.role}).</p>
+          </div>
+          <ErrorNote error={action.error} />
+          <div className="row-actions">
+            <Button onClick={() => setConfirming(false)}>Back</Button>
+            <Button kind="primary" busy={action.busy} onClick={() => action.run(save)}>Switch</Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="mode-grid" role="radiogroup">
+            {MODES.map((m) => (
+              <label key={m.value} className="mode" data-selected={mode === m.value}>
+                <input type="radio" name="mode" aria-label={m.title} checked={mode === m.value} onChange={() => setMode(m.value)} />
+                <b>{m.title}</b><span>{m.text}</span>
+              </label>
+            ))}
+          </div>
+          {mode !== 'read' && (
+            <label className="field inline">
+              <span>Keep it</span>
+              <select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>
+                {hasEnd && <option value={KEEP}>Until {when(account.approval_mode_expires_at)}, as now</option>}
+                {EXPIRY.map((x) => <option key={x.seconds} value={x.seconds}>{x.label}</option>)}
+              </select>
+            </label>
+          )}
+          <ErrorNote error={action.error} />
+          <div className="row-actions">
+            <Button onClick={onClose}>Cancel</Button>
+            <Button kind="primary" busy={action.busy}
+              onClick={() => (raising || endingRemoved ? setConfirming(true) : action.run(save))}>Save</Button>
+          </div>
+        </>
+      )}
+    </Modal>
   )
 }
 
@@ -136,19 +226,6 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
               <Button disabled={!adding} busy={action.busy} onClick={() => run(async () => { await api.putBinding(account.id, adding, 'guest'); setAdding('') }, 'Added as guest')}>Add as guest</Button>
             </div>
           )}
-
-          <h3>What agents get without asking</h3>
-          <p className="muted small">The most any person's approval mode can issue automatically on this account. Above it, the agent's owner must approve.</p>
-          <div className="segmented" role="radiogroup">
-            {LEVELS.map((l) => (
-              <button key={l.value} role="radio" aria-checked={account.max_auto_level === l.value}
-                onClick={() => l.value !== account.max_auto_level && ask(`Set ${account.name} to "${l.label.toLowerCase()}"?`,
-                  l.value === 'read'
-                    ? 'Every change on this account will need the agent owner\'s approval.'
-                    : `People whose approval mode allows it will get ${l.value} access here without approving each request.`,
-                  'Change level', () => api.setAutoLevel(account.id, l.value), 'Level changed')}>{l.label}</button>
-            ))}
-          </div>
 
           <h3>Connection</h3>
           <p className="muted small">

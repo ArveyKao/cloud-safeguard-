@@ -273,22 +273,18 @@ func TestCLIRaisingChangesNeedACode(t *testing.T) {
 			p, _ := a.srv.db.GetProvider(context.Background(), a.providerID)
 			return strings.HasSuffix(p.AccessKeyIDMasked, "Cli1")
 		}},
-		"raise the automatic level": {sup, http.MethodPut, account + "/auto-level", model.SetAutoLevelInput{MaxAutoLevel: model.ModeWrite}, func() bool {
-			p, _ := a.srv.db.GetProvider(context.Background(), a.providerID)
-			return p.MaxAutoLevel == model.ModeWrite
-		}},
 		"raise a limit": {sup, http.MethodPut, "/api/v1/supervisor/settings", raised, func() bool {
 			s, _ := a.srv.db.GetPolicySettings(context.Background())
 			return s.LeasesPerMinutePerAgent == 60
 		}},
-		"set an approval mode above read": {mei, http.MethodPut, "/api/v1/me/approval-mode", model.SetApprovalModeInput{Mode: model.ModeWrite}, func() bool {
-			p, _ := a.srv.db.GetPerson(context.Background(), a.mei.person.ID)
-			return p.ApprovalMode == model.ModeWrite
+		"set an approval mode above read": {mei, http.MethodPut, modePath(a.providerID), model.SetApprovalModeInput{Mode: model.ModeWrite}, func() bool {
+			m, _ := a.srv.db.GetAccountMode(context.Background(), a.mei.person.ID, a.providerID)
+			return m.Mode == model.ModeWrite
 		}},
 	}
 	// "enable a disabled account" needs the account disabled first.
 	order := []string{"add a person", "activate a person", "give a role above guest", "set an approval mode above read",
-		"make a supervisor", "change an account's region", "replace the AccessKey", "raise the automatic level", "raise a limit", "reset a person"}
+		"make a supervisor", "change an account's region", "replace the AccessKey", "raise a limit", "reset a person"}
 	for _, name := range order {
 		c := calls[name]
 		rec := c.c.do(c.method, c.path, c.body)
@@ -343,7 +339,7 @@ func TestCLILoweringChangesNeedNoCode(t *testing.T) {
 			return mei.do(http.MethodPost, "/api/v1/me/requests/"+read.ID+"/revoke", nil)
 		}},
 		{"set the mode to read", func() *httptest.ResponseRecorder {
-			return mei.do(http.MethodPut, "/api/v1/me/approval-mode", model.SetApprovalModeInput{Mode: model.ModeRead})
+			return mei.do(http.MethodPut, modePath(a.providerID), model.SetApprovalModeInput{Mode: model.ModeRead})
 		}},
 		{"lower a role to guest", func() *httptest.ResponseRecorder {
 			return sup.do(http.MethodPut, account+"/people/"+a.mei.person.ID, model.PutBindingInput{Role: model.RoleGuest})
@@ -356,9 +352,6 @@ func TestCLILoweringChangesNeedNoCode(t *testing.T) {
 		}},
 		{"rename an account", func() *httptest.ResponseRecorder {
 			return sup.do(http.MethodPatch, account, model.UpdateProviderInput{Name: &name})
-		}},
-		{"lower the auto level", func() *httptest.ResponseRecorder {
-			return sup.do(http.MethodPut, account+"/auto-level", model.SetAutoLevelInput{MaxAutoLevel: model.ModeRead})
 		}},
 		{"lower a limit", func() *httptest.ResponseRecorder {
 			return sup.do(http.MethodPut, "/api/v1/supervisor/settings", lowered)

@@ -17,7 +17,8 @@ const leaseColumns = `id, agent_id, agent_name, capability_id, capability_name,
 	requested_ttl_seconds, effective_ttl_seconds, status, decision_json, break_glass,
 	approved_by, approval_note, denied_reason, revoke_reason, failure_reason,
 	session_name, credential_available, credential_fingerprint, created_at,
-	approved_at, issued_at, expires_at, revoked_at`
+	approved_at, issued_at, expires_at, revoked_at,
+	max_lifetime_seconds, refresh_until, refresh_count, last_refreshed_at`
 
 // scanLease scans one lease row (credential blob excluded).
 func scanLease(row rowScanner) (model.Lease, error) {
@@ -32,6 +33,8 @@ func scanLease(row rowScanner) (model.Lease, error) {
 		issuedAt      *int64
 		expiresAt     *int64
 		revokedAt     *int64
+		refreshUntil  *int64
+		lastRefreshed *int64
 	)
 	err := row.Scan(
 		&l.ID, &l.AgentID, &l.AgentName, &l.CapabilityID, &l.CapabilityName,
@@ -40,6 +43,7 @@ func scanLease(row rowScanner) (model.Lease, error) {
 		&l.ApprovedBy, &l.ApprovalNote, &l.DeniedReason, &l.RevokeReason, &l.FailureReason,
 		&l.SessionName, &credAvailable, &l.CredentialFingerprint, &createdAt,
 		&approvedAt, &issuedAt, &expiresAt, &revokedAt,
+		&l.MaxLifetimeSeconds, &refreshUntil, &l.RefreshCount, &lastRefreshed,
 	)
 	if err != nil {
 		return model.Lease{}, mapErr(err)
@@ -51,6 +55,8 @@ func scanLease(row rowScanner) (model.Lease, error) {
 	l.IssuedAt = timePtr(issuedAt)
 	l.ExpiresAt = timePtr(expiresAt)
 	l.RevokedAt = timePtr(revokedAt)
+	l.RefreshUntil = timePtr(refreshUntil)
+	l.LastRefreshedAt = timePtr(lastRefreshed)
 	if paramsJSON != "" && paramsJSON != "null" {
 		if err := json.Unmarshal([]byte(paramsJSON), &l.Params); err != nil {
 			return model.Lease{}, fmt.Errorf("store: corrupt lease params for %s: %w", l.ID, err)
@@ -79,13 +85,14 @@ func (db *DB) CreateLease(ctx context.Context, l model.Lease) error {
 	}
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO leases(`+leaseColumns+`, encrypted_credential)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
 		l.ID, l.AgentID, l.AgentName, l.CapabilityID, l.CapabilityName,
 		l.ProviderID, l.ProviderName, string(l.ProviderMode), string(l.Risk), paramsJSON, l.Reason,
 		l.RequestedTTLSeconds, l.EffectiveTTLSeconds, string(l.Status), decisionJSON, boolInt(l.BreakGlass),
 		l.ApprovedBy, l.ApprovalNote, l.DeniedReason, l.RevokeReason, l.FailureReason,
 		l.SessionName, boolInt(l.CredentialAvailable), l.CredentialFingerprint, toMillis(l.CreatedAt),
 		millisPtr(l.ApprovedAt), millisPtr(l.IssuedAt), millisPtr(l.ExpiresAt), millisPtr(l.RevokedAt),
+		l.MaxLifetimeSeconds, millisPtr(l.RefreshUntil), l.RefreshCount, millisPtr(l.LastRefreshedAt),
 	)
 	return mapErr(err)
 }
@@ -226,7 +233,7 @@ func (db *DB) updateLease(ctx context.Context, l model.Lease, expected model.Lea
 			decision_json = ?, break_glass = ?, approved_by = ?, approval_note = ?,
 			denied_reason = ?, revoke_reason = ?, failure_reason = ?, session_name = ?,
 			credential_available = ?, credential_fingerprint = ?, approved_at = ?, issued_at = ?,
-			expires_at = ?, revoked_at = ?
+			expires_at = ?, revoked_at = ?, max_lifetime_seconds = ?, refresh_until = ?
 		 WHERE id = ? AND (? = '' OR status = ?)`,
 		l.AgentID, l.AgentName, l.CapabilityID, l.CapabilityName,
 		l.ProviderID, l.ProviderName, string(l.ProviderMode), string(l.Risk), paramsJSON,
@@ -235,6 +242,7 @@ func (db *DB) updateLease(ctx context.Context, l model.Lease, expected model.Lea
 		l.DeniedReason, l.RevokeReason, l.FailureReason, l.SessionName,
 		boolInt(l.CredentialAvailable), l.CredentialFingerprint,
 		millisPtr(l.ApprovedAt), millisPtr(l.IssuedAt), millisPtr(l.ExpiresAt), millisPtr(l.RevokedAt),
+		l.MaxLifetimeSeconds, millisPtr(l.RefreshUntil),
 		l.ID, string(expected), string(expected),
 	)
 	if err != nil {
@@ -256,6 +264,31 @@ func (db *DB) SetLeaseCredential(ctx context.Context, leaseID, encryptedCredenti
 			credential_available = 1
 		 WHERE id = ? AND status = ?`,
 		encryptedCredential, fingerprint, leaseID, string(model.LeasePending))
+	if err != nil {
+		return mapErr(err)
+	}
+	if err := affectedOrNotFound(res); !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if _, gerr := db.GetLease(ctx, leaseID); gerr == nil {
+		return ErrConflict
+	}
+	return ErrNotFound
+}
+
+// RefreshLeaseCredential stores a refreshed credential (CONTRACT §17.12): the
+// new blob, fingerprint and deadline, counting the refresh. It is a
+// compare-and-set on the lease being active with the deadline the caller
+// read, so two refreshes cannot both win and a revoke or expiry in between
+// is never undone; ErrConflict otherwise.
+func (db *DB) RefreshLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string, previousExpiry, newExpiry, now time.Time) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE leases SET encrypted_credential = ?, credential_fingerprint = ?, credential_available = 1,
+			expires_at = ?, refresh_count = refresh_count + 1, last_refreshed_at = ?
+		 WHERE id = ? AND status = ? AND expires_at = ? AND expires_at > ?
+		   AND refresh_until IS NOT NULL AND ? <= refresh_until`,
+		encryptedCredential, fingerprint, toMillis(newExpiry), toMillis(now),
+		leaseID, string(model.LeaseActive), toMillis(previousExpiry), toMillis(now), toMillis(newExpiry))
 	if err != nil {
 		return mapErr(err)
 	}

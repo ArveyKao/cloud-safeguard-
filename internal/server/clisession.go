@@ -148,7 +148,7 @@ func (s *Server) handlePersonSignInToken(w http.ResponseWriter, r *http.Request)
 	s.personAudit(ctx, person, "cli_signin.completed", "ok", "warning", "session", sessionID, map[string]any{
 		"signin_id": signIn.ID, "client_name": signIn.ClientName, "remote_addr": sess.RemoteAddr,
 	})
-	view := person.AsOf(now)
+	view := person
 	s.writeData(w, http.StatusOK, model.PersonSignInResult{
 		Status: model.SignInApproved, Token: plain, Person: &view, ExpiresAt: &sess.ExpiresAt,
 	})

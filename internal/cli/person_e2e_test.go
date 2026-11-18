@@ -142,7 +142,7 @@ func TestE2EPersonSignInAndGuards(t *testing.T) {
 		{"supervisor", "people", "suspend", "jun"},
 		{"supervisor", "accounts", "rename", "demo-aliyun", "demo"},
 		{"supervisor", "accounts", "test", "demo"},
-		{"me", "mode", "read"},
+		{"me", "mode", "demo", "read"},
 	} {
 		ta.stderr.Reset()
 		if code := ta.run(args...); code != ExitOK {
@@ -153,9 +153,8 @@ func TestE2EPersonSignInAndGuards(t *testing.T) {
 	for _, args := range [][]string{
 		{"supervisor", "roles", "set", "1234567890123456", "jun", "member"},
 		{"supervisor", "people", "activate", "jun"},
-		{"supervisor", "accounts", "auto-level", "demo", "write"},
 		{"supervisor", "settings", "set", "--requests-per-minute", "60"},
-		{"me", "mode", "write"},
+		{"me", "mode", "1234567890123456", "write"},
 	} {
 		ta.stderr.Reset()
 		if code := ta.run(args...); code != ExitAuth {

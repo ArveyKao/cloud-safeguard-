@@ -26,7 +26,7 @@ every problem as a GitHub issue.
 
 ```bash
 go build -o build/csg ./cmd/csg
-./scripts/demo.sh            # must end with "all S1-S11 scenarios passed"
+./scripts/demo.sh            # must end with "all S1-S12 scenarios passed"
 go test ./...                # must pass
 ./build/csg init --demo --data-dir ./build/qa-data
 ./build/csg serve --data-dir ./build/qa-data
@@ -47,8 +47,13 @@ is listed in CONTRACT §17.8; `docs/QUICKSTART.md` walks through the whole flow.
   administrator's (and a supervisor's) agent can get full after approval.
 - Only the owner approves. A supervisor or another person cannot; a supervisor can deny and
   revoke through the API.
-- Approval modes (Read, Write, Full, with an optional expiry) and the account's highest
-  automatic level decide what is issued without approval; neither exceeds the role.
+- Approval modes per cloud account (Read, Write, Full, with an optional expiry), set by the
+  person on the Cloud accounts page, decide what is issued without approval; a mode never
+  exceeds the role there, and a mode on one account changes nothing on another.
+- A credential can be refreshed (`csg access refresh ID`, MCP `refresh_credential`): a new
+  key under the same request, at most once a minute, within its refresh window (8 hours
+  unless the agent declares another, at most the supervisor's limit). A revoked or expired
+  request, or one whose owner lost the role, is not refreshed.
 - A credential allows only what was asked for (one resource type, one permission level,
   optionally one resource), and is refused on RAM endpoints of the mock cloud at every level.
 - Lowering or removing a role, suspending or resetting a person, revoking an agent and

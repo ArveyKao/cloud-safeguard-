@@ -260,7 +260,6 @@ func seedDemoProvider(ctx context.Context, db *store.DB, v *vault.Vault, now tim
 		Region:            demoProviderRegion,
 		RoleARN:           demoProviderRoleARN,
 		CloudAccountID:    model.CloudAccountIDFromRoleARN(model.ProviderAliyun, demoProviderRoleARN),
-		MaxAutoLevel:      model.ModeRead,
 		AccessKeyIDMasked: maskAccessKeyID(demoBrokerAccessKeyID),
 		Status:            model.ProviderActive,
 		CreatedAt:         now,
@@ -429,11 +428,13 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 	var out model.PersonWithSetupCode
 	revokedLeases := []string{}
 	recoveryIssue := model.SetupIssue{ByID: "system", ByName: "csg supervisor recover", Kind: model.SetupRecovered}
-	previousStatus, previousMode := "(new)", model.ModeRead
+	previousStatus, previousModes := "(new)", map[string]string{}
 	person, err := db.GetPersonByUsername(ctx, username)
 	if err == nil {
 		previousStatus = string(person.Status)
-		previousMode = person.EffectiveApprovalMode(now)
+		if previousModes, err = raisedModes(ctx, db, person.ID, now); err != nil {
+			return zero, err
+		}
 	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -485,7 +486,7 @@ func RecoverSupervisor(ctx context.Context, opts RecoverOptions) (model.PersonWi
 		TargetType: "person", TargetID: out.Person.ID,
 		// A suspended person is reactivated by recovery; record what they were.
 		Metadata: map[string]any{"username": username, "previous_status": previousStatus, "revoked_lease_ids": revokedLeases,
-			"previous_mode": string(previousMode), "mode": string(model.ModeRead)},
+			"previous_modes": previousModes, "mode": string(model.ModeRead)},
 	}
 	if err := db.AppendAudit(ctx, &ev); err != nil {
 		return zero, err

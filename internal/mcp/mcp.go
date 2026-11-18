@@ -118,9 +118,11 @@ func (s *Server) Tools() []Tool {
 				"cloud_account_id": str("Cloud account ID, from list_accounts."),
 				"resource":         str("Resource type, from list_accounts (for example ecs, dns, oss)."),
 				"permission":       map[string]any{"type": "string", "enum": []string{"read", "write", "full"}},
-				"ttl_seconds":      map[string]any{"type": "integer", "minimum": 1, "description": "How long the credential stays valid. Ask for no more than the task needs."},
-				"resource_name":    str("Optional: one resource (instance ID, domain, bucket). Omit for all resources of that type."),
-				"reason":           str("Why you need it. Required for write and full; your owner sees it."),
+				"ttl_seconds":      map[string]any{"type": "integer", "minimum": 1, "description": "How long one key stays valid. Ask for no more than the task needs; refresh_credential gives a new key later."},
+				"max_lifetime_seconds": map[string]any{"type": "integer", "minimum": 1,
+					"description": "Optional: how long you may keep refreshing the key with refresh_credential, from first issue. Default 8 hours."},
+				"resource_name": str("Optional: one resource (instance ID, domain, bucket). Omit for all resources of that type."),
+				"reason":        str("Why you need it. Required for write and full; your owner sees it."),
 			}),
 		},
 		{
@@ -131,6 +133,13 @@ func (s *Server) Tools() []Tool {
 		{
 			Name:        "get_credential",
 			Description: s.CredentialDescription,
+			InputSchema: schema([]string{"request_id"}, map[string]any{"request_id": str("The id returned by request_access.")}),
+		},
+		{
+			Name: "refresh_credential",
+			Description: "Get a new key for an active request before the current one expires, within the request's refresh window " +
+				"(refresh_until in check_status), then hand it over as get_credential does. The earlier key keeps working until its own expiry. " +
+				"At most once a minute per request.",
 			InputSchema: schema([]string{"request_id"}, map[string]any{"request_id": str("The id returned by request_access.")}),
 		},
 		{
@@ -222,7 +231,7 @@ func (s *Server) Handle(ctx context.Context, req Request) (Response, bool) {
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "cloud-safeguard", "version": model.Version},
 			"instructions": "Use list_accounts to see where you may ask for access, request_access to get short-lived scoped credentials, " +
-				"get_credential to prepare them for a shell, and revoke when done. Ask for the lowest permission and shortest validity that does the job.",
+				"get_credential to prepare them for a shell, refresh_credential for a new key before one expires, and revoke when done. Ask for the lowest permission and shortest validity that does the job.",
 		}
 	case "ping":
 		resp.Result = map[string]any{}
@@ -261,11 +270,14 @@ func RequestView(req model.AccessRequest) map[string]any {
 	if req.ExpiresAt != nil {
 		v["expires_at"] = req.ExpiresAt.UTC().Format(time.RFC3339)
 	}
+	if req.RefreshUntil != nil {
+		v["refresh_until"] = req.RefreshUntil.UTC().Format(time.RFC3339)
+	}
 	switch req.Status {
 	case model.LeasePending:
 		v["next"] = "Waiting for the person who owns you to approve it in the Cloud Safeguard console. Tell the user, then call check_status."
 	case model.LeaseActive:
-		v["next"] = "Call get_credential to prepare it for a shell."
+		v["next"] = "Call get_credential to prepare it for a shell; call refresh_credential for a new key before expires_at, until refresh_until."
 	case model.LeaseDenied:
 		v["denied_reason"] = req.DeniedReason
 	case model.LeaseRevoked:
@@ -320,6 +332,13 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			CloudAccountID: getStr("cloud_account_id"), Resource: getStr("resource"), Permission: getStr("permission"),
 			TTLSeconds: int(ttl), ResourceName: getStr("resource_name"), Reason: getStr("reason"),
 		}
+		if v, present := args["max_lifetime_seconds"]; present {
+			lifetime, ok := v.(float64)
+			if !ok || lifetime != float64(int(lifetime)) || lifetime < 1 {
+				return "", errors.New("max_lifetime_seconds must be a positive whole number")
+			}
+			in.MaxLifetimeSeconds = int(lifetime)
+		}
 		var req model.AccessRequest
 		if err := s.Backend.Call(ctx, "POST", apiPrefix+"/agent/access-requests", in, &req); err != nil {
 			return "", err
@@ -340,6 +359,21 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 	case "get_credential":
 		id, err := requestID()
 		if err != nil {
+			return "", err
+		}
+		out, err := s.PrepareCredential(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		return ToJSON(out), nil
+
+	case "refresh_credential":
+		id, err := requestID()
+		if err != nil {
+			return "", err
+		}
+		var req model.AccessRequest
+		if err := s.Backend.Call(ctx, "POST", apiPrefix+"/agent/access-requests/"+url.PathEscape(id)+"/refresh", nil, &req); err != nil {
 			return "", err
 		}
 		out, err := s.PrepareCredential(ctx, id)

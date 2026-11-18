@@ -258,6 +258,34 @@ func TestRemoteMCPFlow(t *testing.T) {
 	env.clock.Advance(61 * time.Second)
 	requireStatus(t, env.raw(http.MethodPost, link, nil, ""), http.StatusNotFound)
 
+	// refresh_credential: a new key, handed over through a new link.
+	text, isErr = toolText(t, env.mcpCall(tok.AccessToken, callTool("refresh_credential", map[string]any{"request_id": req.ID})))
+	if isErr || !strings.Contains(text, credentialLinkPrefix) {
+		t.Fatalf("refresh_credential %s", text)
+	}
+	_ = json.Unmarshal([]byte(text), &cred)
+	link = strings.TrimSuffix(cred.Run[strings.Index(cred.Run, credentialLinkPrefix):], `')"`)
+	rec = env.raw(http.MethodPost, link, nil, "")
+	requireStatus(t, rec, http.StatusOK)
+	keyLine := func(b string) string {
+		for _, l := range strings.Split(b, "\n") {
+			if strings.HasPrefix(l, "export ALIBABA_CLOUD_ACCESS_KEY_ID=") {
+				return l
+			}
+		}
+		return ""
+	}
+	if k := keyLine(rec.Body.String()); k == "" || k == keyLine(body) {
+		t.Fatal("refresh_credential did not hand over a new key")
+	}
+	text, _ = toolText(t, env.mcpCall(tok.AccessToken, callTool("check_status", map[string]any{"request_id": req.ID})))
+	if !strings.Contains(text, "refresh_until") {
+		t.Fatalf("check_status does not show the refresh window: %s", text)
+	}
+	if text, isErr = toolText(t, env.mcpCall(tok.AccessToken, callTool("refresh_credential", map[string]any{"request_id": req.ID}))); !isErr {
+		t.Fatalf("a second refresh within a minute: %s", text)
+	}
+
 	// A link dies with the request: revoke, then fetch.
 	text, _ = toolText(t, env.mcpCall(tok.AccessToken, callTool("get_credential", map[string]any{"request_id": req.ID})))
 	_ = json.Unmarshal([]byte(text), &cred)

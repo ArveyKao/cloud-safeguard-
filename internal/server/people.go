@@ -33,6 +33,29 @@ func cleanDisplayName(raw string) (string, bool) {
 	return name, true
 }
 
+// raisedModes is a person's approval modes above read that are in effect at
+// now, by cloud account ID (or provider ID when the account has none), for
+// the audit of a reset.
+func raisedModes(ctx context.Context, db *store.DB, personID string, now time.Time) (map[string]string, error) {
+	modes, err := db.ListAccountModes(ctx, personID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for providerID, m := range modes {
+		mode := m.Effective(now)
+		if mode == model.ModeRead {
+			continue
+		}
+		key := providerID
+		if prov, err := db.GetProvider(ctx, providerID); err == nil && prov.CloudAccountID != "" {
+			key = prov.CloudAccountID
+		}
+		out[key] = string(mode)
+	}
+	return out, nil
+}
+
 // newPersonWithSetupCode creates a pending person and returns the one-time
 // setup code. It is shared by the supervisor API, bootstrap and recovery.
 func newPersonWithSetupCode(ctx context.Context, db *store.DB, username, displayName string, supervisor bool, now time.Time, issue model.SetupIssue) (model.PersonWithSetupCode, error) {
@@ -46,7 +69,7 @@ func newPersonWithSetupCode(ctx context.Context, db *store.DB, username, display
 	}
 	person := model.Person{
 		ID: id, Username: username, DisplayName: displayName, Status: model.PersonPending,
-		Supervisor: supervisor, ApprovalMode: model.ModeRead, CreatedAt: now, UpdatedAt: now,
+		Supervisor: supervisor, CreatedAt: now, UpdatedAt: now,
 	}
 	issue.At = now
 	person.SetupIssued = &issue
@@ -62,10 +85,6 @@ func (s *Server) handleListPeople(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.internalError(w, "list people", err)
 		return
-	}
-	now := s.nowUTC()
-	for i := range people {
-		people[i] = people[i].AsOf(now)
 	}
 	writeList(s, w, http.StatusOK, people, len(people))
 }
@@ -207,7 +226,7 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		s.storeErrorResponse(w, err, "person not found")
 		return
 	}
-	s.writeData(w, http.StatusOK, updated.AsOf(now))
+	s.writeData(w, http.StatusOK, updated)
 }
 
 // handleResetPerson issues a new setup code, erasing the person's password,
@@ -240,6 +259,11 @@ func (s *Server) handleResetPerson(w http.ResponseWriter, r *http.Request) {
 	}
 	now := s.nowUTC()
 	expires := now.Add(setupCodeTTL)
+	previousModes, err := raisedModes(ctx, s.db, id, now)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
 	if err := s.db.ResetPersonSetup(ctx, id, hash, expires, now, true,
 		model.SetupIssue{ByID: actor.person.ID, ByName: actor.person.Username, Kind: model.SetupReset}); err != nil {
 		if errors.Is(err, store.ErrLastSupervisor) {
@@ -251,8 +275,8 @@ func (s *Server) handleResetPerson(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.personAudit(ctx, actor.person, "person.setup_reset", "ok", "warning", "person", id, map[string]any{
-		"username":      person.Username,
-		"previous_mode": string(person.EffectiveApprovalMode(now)), "mode": string(model.ModeRead),
+		"username":       person.Username,
+		"previous_modes": previousModes, "mode": string(model.ModeRead),
 	})
 	s.afterPersonAuthorityChange(ctx, actor.person, id)
 	person, err = s.db.GetPerson(ctx, id)

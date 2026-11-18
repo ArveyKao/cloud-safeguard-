@@ -168,7 +168,7 @@ without waiting for the owner.
 
 // accessFlags are the five fields of an access request plus a reason.
 type accessFlags struct {
-	account, resource, permission, ttl, name, reason *string
+	account, resource, permission, ttl, name, reason, lifetime *string
 }
 
 func addAccessFlags(fs *flagSet) accessFlags {
@@ -179,6 +179,7 @@ func addAccessFlags(fs *flagSet) accessFlags {
 		ttl:        fs.String("ttl", "", "validity period, e.g. 15m (required)"),
 		name:       fs.String("name", "", "one resource (instance ID, domain, bucket); default all"),
 		reason:     fs.String("reason", "", "shown to your owner; required for write and full"),
+		lifetime:   fs.String("max-lifetime", "", "how long the credential may be refreshed, e.g. 24h (default 8h)"),
 	}
 }
 
@@ -198,21 +199,53 @@ func (f accessFlags) input() (model.AccessRequestInput, error) {
 		return in, usagef("--ttl: %v", err)
 	}
 	in.TTLSeconds = ttl
+	if in.MaxLifetimeSeconds, err = parseOptionalDurationSeconds(*f.lifetime); err != nil {
+		return in, usagef("--max-lifetime: %v", err)
+	}
 	return in, nil
 }
 
 // runAccess implements `csg access request|status`.
 func (a *App) runAccess(args []string) error {
 	if len(args) == 0 {
-		return usagef("usage: csg access request|status ...")
+		return usagef("usage: csg access request|status|refresh ...")
 	}
 	switch args[0] {
 	case "request":
 		return a.runAccessRequest(args[1:])
 	case "status":
 		return a.runAccessStatus(args[1:])
+	case "refresh":
+		return a.runAccessRefresh(args[1:])
 	}
-	return usagef("unknown access subcommand %q (request, status)", args[0])
+	return usagef("unknown access subcommand %q (request, status, refresh)", args[0])
+}
+
+func (a *App) runAccessRefresh(args []string) error {
+	fs := a.newFlagSet("access refresh", `Usage: csg access refresh ID [--json]
+
+Has a new key issued under an active request, within its refresh window. The
+earlier key keeps working until its own expiry. Fetch the new one with
+csg credential --lease ID --export.
+`)
+	cf := a.addClientFlags(fs)
+	jsonOut := fs.Bool("json", false, "print JSON")
+	positionals, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return usagef("access refresh takes one request ID")
+	}
+	client, err := a.agentClient(cf)
+	if err != nil {
+		return err
+	}
+	var req model.AccessRequest
+	if err := client.post(context.Background(), apiPrefix+"/agent/access-requests/"+pathEscape(positionals[0])+"/refresh", nil, &req); err != nil {
+		return err
+	}
+	return a.emitAccess(req, *jsonOut)
 }
 
 func (a *App) runAccessRequest(args []string) error {
@@ -315,6 +348,9 @@ func (a *App) printAccess(req model.AccessRequest, jsonOut bool) {
 	fmt.Fprintf(a.Stdout, "valid for:  %s\n", formatSeconds(req.TTLSeconds))
 	if req.ExpiresAt != nil {
 		fmt.Fprintf(a.Stdout, "expires:    %s\n", req.ExpiresAt.Local().Format(time.RFC3339))
+	}
+	if req.RefreshUntil != nil {
+		fmt.Fprintf(a.Stdout, "refreshable until: %s (csg access refresh %s)\n", req.RefreshUntil.Local().Format(time.RFC3339), displayString(req.ID))
 	}
 	switch req.Status {
 	case model.LeasePending:

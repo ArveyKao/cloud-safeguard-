@@ -71,7 +71,7 @@ func scanSession(row rowScanner) (Session, error) {
 }
 
 const personColumns = `id, username, display_name, status, supervisor, last_login_at, created_at, updated_at,
-	approval_mode, approval_mode_expires_at, setup_issued_by, setup_issued_by_name, setup_issued_kind, setup_issued_at`
+	setup_issued_by, setup_issued_by_name, setup_issued_kind, setup_issued_at`
 
 func scanPerson(row rowScanner) (model.Person, error) {
 	var (
@@ -79,19 +79,17 @@ func scanPerson(row rowScanner) (model.Person, error) {
 		supervisor           int
 		lastLogin            *int64
 		createdAt, updatedAt int64
-		modeExpires          *int64
 		issue                model.SetupIssue
 		issuedAt             *int64
 	)
 	if err := row.Scan(&p.ID, &p.Username, &p.DisplayName, &p.Status, &supervisor, &lastLogin, &createdAt, &updatedAt,
-		&p.ApprovalMode, &modeExpires, &issue.ByID, &issue.ByName, &issue.Kind, &issuedAt); err != nil {
+		&issue.ByID, &issue.ByName, &issue.Kind, &issuedAt); err != nil {
 		return model.Person{}, mapErr(err)
 	}
 	if issue.Kind != "" && issuedAt != nil {
 		issue.At = fromMillis(*issuedAt)
 		p.SetupIssued = &issue
 	}
-	p.ApprovalModeExpiresAt = timePtr(modeExpires)
 	p.Supervisor = intBool(supervisor)
 	p.LastLoginAt = timePtr(lastLogin)
 	p.CreatedAt = fromMillis(createdAt)
@@ -226,6 +224,16 @@ func (db *DB) SetPersonAuthority(ctx context.Context, id string, status model.Pe
 		if n, _ := res.RowsAffected(); n == 0 {
 			return db.explainAuthorityRefusal(ctx, tx, id)
 		}
+		if !supervisor {
+			// Without the flag, modes remain only where a role binding is.
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM account_modes WHERE person_id = ?
+				   AND NOT EXISTS (SELECT 1 FROM role_bindings b
+				                   WHERE b.person_id = account_modes.person_id AND b.provider_id = account_modes.provider_id)`,
+				id); err != nil {
+				return mapErr(err)
+			}
+		}
 		if status != model.PersonActive {
 			return endSessionsAndSignIns(ctx, tx, id)
 		}
@@ -289,6 +297,10 @@ func (db *DB) ResetPersonSetup(ctx context.Context, id, setupCodeHash string, se
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			return db.explainAuthorityRefusal(ctx, tx, id)
+		}
+		// A reset puts every approval mode back to read.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM account_modes WHERE person_id = ?`, id); err != nil {
+			return mapErr(err)
 		}
 		return endSessionsAndSignIns(ctx, tx, id)
 	})
@@ -526,14 +538,25 @@ func (db *DB) GetBinding(ctx context.Context, personID, providerID string) (mode
 		`SELECT `+bindingColumns+` FROM role_bindings WHERE person_id = ? AND provider_id = ?`, personID, providerID))
 }
 
-// DeleteBinding removes a binding; ErrNotFound when it does not exist.
+// DeleteBinding removes a binding, and the person's approval mode on that
+// account unless they are a supervisor (who keeps a role there); ErrNotFound
+// when the binding does not exist.
 func (db *DB) DeleteBinding(ctx context.Context, personID, providerID string) error {
-	res, err := db.sql.ExecContext(ctx,
-		`DELETE FROM role_bindings WHERE person_id = ? AND provider_id = ?`, personID, providerID)
-	if err != nil {
+	return db.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM role_bindings WHERE person_id = ? AND provider_id = ?`, personID, providerID)
+		if err != nil {
+			return mapErr(err)
+		}
+		if err := affectedOrNotFound(res); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx,
+			`DELETE FROM account_modes WHERE person_id = ? AND provider_id = ?
+			   AND NOT EXISTS (SELECT 1 FROM persons WHERE id = ? AND supervisor = 1)`,
+			personID, providerID, personID)
 		return mapErr(err)
-	}
-	return affectedOrNotFound(res)
+	})
 }
 
 // ListBindings returns bindings filtered by person and/or cloud account;
@@ -559,31 +582,78 @@ func (db *DB) ListBindings(ctx context.Context, personID, providerID string) ([]
 	return out, mapErr(rows.Err())
 }
 
-// SetApprovalMode stores a person's approval mode. It only writes while the
-// person is active (ErrConflict otherwise).
-func (db *DB) SetApprovalMode(ctx context.Context, personID string, mode model.ApprovalMode, expiresAt *time.Time, now time.Time) error {
+// ---- approval modes per cloud account (CONTRACT §17.11) ----
+
+// GetAccountMode returns a person's mode on a cloud account; a person who
+// never chose one there gets read.
+func (db *DB) GetAccountMode(ctx context.Context, personID, providerID string) (model.AccountMode, error) {
+	m := model.AccountMode{ProviderID: providerID, Mode: model.ModeRead}
+	var expires *int64
+	err := db.sql.QueryRowContext(ctx,
+		`SELECT mode, expires_at FROM account_modes WHERE person_id = ? AND provider_id = ?`,
+		personID, providerID).Scan(&m.Mode, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return m, nil
+	}
+	if err != nil {
+		return model.AccountMode{}, mapErr(err)
+	}
+	m.ExpiresAt = timePtr(expires)
+	return m, nil
+}
+
+// ListAccountModes returns the modes a person has chosen, by provider ID.
+func (db *DB) ListAccountModes(ctx context.Context, personID string) (map[string]model.AccountMode, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT provider_id, mode, expires_at FROM account_modes WHERE person_id = ?`, personID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := map[string]model.AccountMode{}
+	for rows.Next() {
+		var (
+			m       model.AccountMode
+			expires *int64
+		)
+		if err := rows.Scan(&m.ProviderID, &m.Mode, &expires); err != nil {
+			return nil, mapErr(err)
+		}
+		m.ExpiresAt = timePtr(expires)
+		out[m.ProviderID] = m
+	}
+	return out, mapErr(rows.Err())
+}
+
+// SetAccountMode stores a person's mode on a cloud account. It writes only
+// while the person is active and has a role there (a binding, or the
+// supervisor flag); ErrConflict otherwise. Read is stored as no row.
+func (db *DB) SetAccountMode(ctx context.Context, personID, providerID string, mode model.ApprovalMode, expiresAt *time.Time, now time.Time) error {
 	if !mode.Valid() {
 		return errors.New("store: invalid approval mode")
 	}
-	res, err := db.sql.ExecContext(ctx,
-		`UPDATE persons SET approval_mode = ?, approval_mode_expires_at = ?, updated_at = ?
-		 WHERE id = ? AND status = 'active'`,
-		string(mode), millisPtr(expiresAt), toMillis(now), personID)
-	if err != nil {
+	return db.withTx(ctx, func(tx *sql.Tx) error {
+		var ok int
+		err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM persons p
+			 WHERE p.id = ? AND p.status = 'active'
+			   AND (p.supervisor = 1 OR EXISTS (SELECT 1 FROM role_bindings b WHERE b.person_id = p.id AND b.provider_id = ?))
+			   AND EXISTS (SELECT 1 FROM providers WHERE id = ?)`,
+			personID, providerID, providerID).Scan(&ok)
+		if err != nil {
+			return mapErr(err)
+		}
+		if ok == 0 {
+			return ErrConflict
+		}
+		if mode == model.ModeRead {
+			_, err = tx.ExecContext(ctx, `DELETE FROM account_modes WHERE person_id = ? AND provider_id = ?`, personID, providerID)
+			return mapErr(err)
+		}
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO account_modes(person_id, provider_id, mode, expires_at, updated_at) VALUES(?, ?, ?, ?, ?)
+			 ON CONFLICT(person_id, provider_id) DO UPDATE SET mode = excluded.mode, expires_at = excluded.expires_at, updated_at = excluded.updated_at`,
+			personID, providerID, string(mode), millisPtr(expiresAt), toMillis(now))
 		return mapErr(err)
-	}
-	return affectedOrConflict(res)
-}
-
-// SetProviderMaxAutoLevel stores a cloud account's highest automatic level.
-func (db *DB) SetProviderMaxAutoLevel(ctx context.Context, providerID string, level model.ApprovalMode, now time.Time) error {
-	if !level.Valid() {
-		return errors.New("store: invalid automatic level")
-	}
-	res, err := db.sql.ExecContext(ctx,
-		`UPDATE providers SET max_auto_level = ?, updated_at = ? WHERE id = ?`, string(level), toMillis(now), providerID)
-	if err != nil {
-		return mapErr(err)
-	}
-	return affectedOrNotFound(res)
+	})
 }

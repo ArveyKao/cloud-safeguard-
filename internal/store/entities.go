@@ -19,7 +19,7 @@ type rowScanner interface {
 // ================= Providers =================
 
 const providerColumns = `id, name, type, mode, region, role_arn, access_key_id_masked,
-	status, last_tested_at, last_test_ok, created_at, updated_at, cloud_account_id, max_auto_level`
+	status, last_tested_at, last_test_ok, created_at, updated_at, cloud_account_id`
 
 // scanProvider scans one provider row (credential blob excluded).
 func scanProvider(row rowScanner) (model.Provider, error) {
@@ -33,7 +33,7 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 	err := row.Scan(
 		&p.ID, &p.Name, &p.Type, &p.Mode, &p.Region, &p.RoleARN,
 		&p.AccessKeyIDMasked, &p.Status, &lastTestedAt, &lastTestOK,
-		&createdAt, &updatedAt, &p.CloudAccountID, &p.MaxAutoLevel,
+		&createdAt, &updatedAt, &p.CloudAccountID,
 	)
 	if err != nil {
 		return model.Provider{}, mapErr(err)
@@ -47,17 +47,13 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 
 // CreateProvider persists a provider and its encrypted broker credential.
 func (db *DB) CreateProvider(ctx context.Context, p model.Provider, encryptedCredential string) error {
-	// A new cloud account always starts at the safest level, whatever the
-	// caller passes; only a supervisor raises it, through the audited
-	// SetProviderMaxAutoLevel (CONTRACT §17.5).
-	level := model.ModeRead
 	_, err := db.sql.ExecContext(ctx,
 		`INSERT INTO providers(`+providerColumns+`, encrypted_credential)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Name, string(p.Type), string(p.Mode), p.Region, p.RoleARN,
 		p.AccessKeyIDMasked, string(p.Status),
 		millisPtr(p.LastTestedAt), boolPtrInt(p.LastTestOK),
-		toMillis(p.CreatedAt), toMillis(p.UpdatedAt), p.CloudAccountID, string(level),
+		toMillis(p.CreatedAt), toMillis(p.UpdatedAt), p.CloudAccountID,
 		encryptedCredential,
 	)
 	return mapErr(err)

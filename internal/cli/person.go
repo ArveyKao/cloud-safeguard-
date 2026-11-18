@@ -317,7 +317,6 @@ func (a *App) runPersonWhoami(args []string) error {
 	fmt.Fprintf(a.Stdout, "person:     %s%s\n", displayString(info.Person.Username), supervisorSuffix(info.Person.Supervisor))
 	fmt.Fprintf(a.Stdout, "server:     %s\n", cfg.Server)
 	fmt.Fprintf(a.Stdout, "expires:    %s at the latest (30 minutes without use)\n", info.ExpiresAt.Local().Format("2006-01-02 15:04"))
-	fmt.Fprintf(a.Stdout, "mode:       %s\n", info.Person.ApprovalMode)
 	return nil
 }
 
@@ -505,18 +504,22 @@ func (a *App) runMeAccounts(args []string) error {
 		if auto == "" {
 			auto = "-"
 		}
-		rows = append(rows, []string{acct.CloudAccountID, acct.Name, string(acct.Role), acct.HighestPermission, auto, string(acct.Status)})
+		mode := string(acct.ApprovalMode)
+		if acct.ApprovalModeExpiresAt != nil {
+			mode += " until " + acct.ApprovalModeExpiresAt.Local().Format("2006-01-02 15:04")
+		}
+		rows = append(rows, []string{acct.CloudAccountID, acct.Name, string(acct.Role), acct.HighestPermission, mode, auto, string(acct.Status)})
 	}
-	writeTable(a.Stdout, []string{"CLOUD ACCOUNT", "NAME", "ROLE", "UP TO", "AUTOMATIC", "STATUS"}, rows)
+	writeTable(a.Stdout, []string{"CLOUD ACCOUNT", "NAME", "ROLE", "UP TO", "MODE", "AUTOMATIC", "STATUS"}, rows)
 	return nil
 }
 
 func (a *App) runMeMode(args []string) error {
-	fs := a.newFlagSet("me mode", `Usage: csg me mode read|write|full [--for DUR] [--code CODE]
+	fs := a.newFlagSet("me mode", `Usage: csg me mode ACCOUNT read|write|full [--for DUR] [--code CODE]
 
-Sets how much your agents get without asking you, on every cloud account,
-never beyond your role or the account's highest automatic level. Anything
-above read asks for a code from your authenticator app.
+Sets how much your agents get without asking you on one cloud account (its
+cloud account ID or name, from csg me accounts), never beyond your role
+there. Anything above read asks for a code from your authenticator app.
 `)
 	forDur := fs.String("for", "", "fall back to read after this long (e.g. 2h); default: until changed")
 	code := fs.String("code", "", "code from your authenticator app")
@@ -524,10 +527,10 @@ above read asks for a code from your authenticator app.
 	if err != nil {
 		return err
 	}
-	if len(positionals) != 1 {
-		return usagef("me mode takes one mode: read, write or full")
+	if len(positionals) != 2 {
+		return usagef("me mode takes an ACCOUNT and a mode: read, write or full")
 	}
-	mode := model.ApprovalMode(strings.ToLower(positionals[0]))
+	mode := model.ApprovalMode(strings.ToLower(positionals[1]))
 	if !mode.Valid() {
 		return usagef("mode must be read, write or full")
 	}
@@ -539,16 +542,37 @@ above read asks for a code from your authenticator app.
 	if err != nil {
 		return err
 	}
-	var out model.Person
-	if err := a.raising(client, *code, http.MethodPut, apiPrefix+"/me/approval-mode",
+	var list model.ListResponse[model.PersonAccount]
+	if err := client.get(context.Background(), apiPrefix+"/me/accounts", &list); err != nil {
+		return err
+	}
+	var matches []model.PersonAccount
+	for _, acct := range list.Items {
+		if acct.CloudAccountID == positionals[0] || acct.ProviderID == positionals[0] {
+			matches = []model.PersonAccount{acct}
+			break
+		}
+		if strings.EqualFold(acct.Name, positionals[0]) {
+			matches = append(matches, acct)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return usagef("no cloud account %q among yours (see csg me accounts)", positionals[0])
+	case 1:
+	default:
+		return usagef("%d of your cloud accounts are named %q: use the cloud account ID", len(matches), positionals[0])
+	}
+	var out model.PersonAccount
+	if err := a.raising(client, *code, http.MethodPut, apiPrefix+"/me/accounts/"+pathEscape(matches[0].ProviderID)+"/mode",
 		model.SetApprovalModeInput{Mode: mode, ExpiresInSeconds: seconds}, &out); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Stdout, "approval mode is %s", out.ApprovalMode)
+	fmt.Fprintf(a.Stdout, "%s: approval mode is %s", displayString(out.Name), out.ApprovalMode)
 	if out.ApprovalModeExpiresAt != nil {
 		fmt.Fprintf(a.Stdout, " until %s", out.ApprovalModeExpiresAt.Local().Format("2006-01-02 15:04"))
 	}
-	fmt.Fprintln(a.Stdout)
+	fmt.Fprintf(a.Stdout, "; agents get up to %s without asking\n", orDash(out.AutomaticUpTo))
 	return nil
 }
 
