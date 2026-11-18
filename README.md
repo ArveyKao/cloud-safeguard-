@@ -123,7 +123,7 @@ The rules for people, roles, requests and approval: [docs/CONTRACT.md](docs/CONT
 | `csg` sign-in for people, with supervisor commands (raising access needs an authenticator code) | ✅ |
 | Remote MCP over HTTPS: an agent connects with just a URL, signs in through the console (OAuth), and gets credentials through one-time links | ✅ tried with Claude Code |
 | AWS accounts: STS AssumeRole with a session policy per request; S3 buckets | ✅ mock-tested and against a fake STS; not yet run against a live AWS account |
-| Long-lived credentials (a cloud user and key) for supervisors and people they allow | 🔜 next (CONTRACT §17.14) |
+| Long-lived credentials (a cloud user and key that do not expire) for supervisors and people they allow: an agent gets only a console link, the owner creates the key and sees the secret once, it is deleted when they lose the right | ✅ mock-tested and against fake IAM/RAM; not yet run against a live cloud |
 | GCP, SSO, chat approvals, credential-free proxy mode | 🔜 later |
 
 The rules are in [docs/CONTRACT.md](docs/CONTRACT.md) §17.
@@ -177,9 +177,9 @@ never approve itself:
 ./build/csg supervisor roles set 1234567890123456 mei member --code 123456
 ```
 
-Or run the whole scripted demo (thirteen scenarios: setup, agent sign-in, automatic read, least
+Or run the whole scripted demo (fourteen scenarios: setup, agent sign-in, automatic read, least
 privilege, denial, approval, revocation, emergency stop, a supervisor on the command line,
-remote MCP, approval mode per account with refresh, an AWS account, audit) in one command:
+remote MCP, approval mode per account with refresh, an AWS account, a long-lived key, audit) in one command:
 
 ```bash
 make demo
@@ -194,12 +194,12 @@ The step-by-step path, the MCP setup and the real-cloud setup are in
 | --- | --- |
 | Server host | `csg init [--demo] [--data-dir DIR] [--supervisor NAME]` · `csg serve [--data-dir DIR] [--addr 127.0.0.1:8787] [--public-url URL]` · `csg supervisor recover --username NAME` |
 | Agent sign-in | `csg login --server URL [--name NAME]` · `csg whoami` · `csg version` |
-| Agent | `csg accounts` · `csg access request --account ID --resource R --permission P --ttl 15m [--max-lifetime 8h] [--name N] [--reason ...] [--wait 5m]` · `csg access status ID` · `csg access refresh ID` · `csg credential --lease ID --export\|--process aws\|aliyun` |
+| Agent | `csg accounts` · `csg access request --account ID --resource R --permission P --ttl 15m [--max-lifetime 8h] [--name N] [--reason ...] [--wait 5m]` · `csg access status ID` · `csg access refresh ID` · `csg access long-lived --account ID --resource R --permission P --reason ...` (prints a console link) · `csg credential --lease ID --export\|--process aws\|aliyun` |
 | Agent | `csg exec --account ID --resource R --permission P --ttl 15m -- CMD` · `csg credential --lease ID [--export\|--json]` · `csg revoke --lease ID` · `csg leases mine` |
-| MCP | `https://SERVER/mcp` (remote, OAuth sign-in in the console) or `csg mcp` (stdio); tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `refresh_credential`, `revoke` |
+| MCP | `https://SERVER/mcp` (remote, OAuth sign-in in the console) or `csg mcp` (stdio); tools `list_accounts`, `request_access`, `check_status`, `get_credential`, `refresh_credential`, `request_long_lived_credential`, `revoke` |
 | Person sign-in | `csg person login --server URL [--name NAME]` · `csg person whoami` · `csg person logout` |
-| Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode ACCOUNT read\|write\|full [--for DUR]` · `csg me sessions` · `csg me end-session ID` |
-| Supervisor | `csg supervisor people [add\|suspend\|activate\|reset\|make-supervisor\|remove-supervisor] …` · `csg supervisor roles [set\|remove] …` · `csg supervisor accounts [show\|test\|enable\|disable\|rename\|set-region\|set-role-arn\|rotate] …` · `csg supervisor settings [set …]` · `csg supervisor audit [verify]` · `csg supervisor requests [deny\|revoke] …` |
+| Person | `csg me requests [--status S]` · `csg me deny ID` · `csg me revoke ID` · `csg me agents` · `csg me revoke-agent ID` · `csg me accounts` · `csg me mode ACCOUNT read\|write\|full [--for DUR]` · `csg me sessions` · `csg me end-session ID` · `csg me long-lived [revoke ID]` |
+| Supervisor | `csg supervisor people [add\|suspend\|activate\|reset\|make-supervisor\|remove-supervisor] …` · `csg supervisor roles [set\|remove] …` · `csg supervisor accounts [show\|test\|enable\|disable\|rename\|set-region\|set-role-arn\|rotate] …` · `csg supervisor settings [set …]` · `csg supervisor audit [verify]` · `csg supervisor requests [deny\|revoke] …` · `csg supervisor long-lived [revoke ID]` · `csg supervisor people allow-long-lived\|disallow-long-lived NAME` |
 | Demo | `csg mock request METHOD /v1/PATH [JSON_BODY]` |
 
 Changes that raise access take `--code` (a code from your authenticator app), or ask for it
@@ -259,7 +259,7 @@ cloud-safeguard/
 │   ├── token/          # bearer token generation and hashing
 │   └── cli/            # csg commands and the MCP server
 ├── web/                # React + Vite console, embedded into the binary
-├── scripts/demo.sh     # end-to-end demo (S1–S13), driven by scripts/demo/
+├── scripts/demo.sh     # end-to-end demo (S1–S14), driven by scripts/demo/
 ├── docs/               # SPEC, CONTRACT, PRODUCT, SECURITY, ARCHITECTURE, QUICKSTART, API, DECISIONS
 └── Makefile            # build / test / demo entry points
 ```
@@ -295,9 +295,8 @@ Current boundaries:
 - **No independent security audit, and no live-cloud run yet.** `sts` mode is implemented
   and unit-tested against a fake STS endpoint only.
 
-Roadmap: next, long-lived credentials for supervisors and people they allow (CONTRACT
-§17.14), live Alibaba Cloud and AWS tests, more AWS resource types; then GCP, SSO, chat
-approvals and a credential-free proxy mode.
+Roadmap: next, live Alibaba Cloud and AWS tests, more AWS resource types; then GCP, SSO,
+chat approvals and a credential-free proxy mode.
 
 ## Documentation
 

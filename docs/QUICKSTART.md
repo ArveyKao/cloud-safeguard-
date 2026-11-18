@@ -263,10 +263,10 @@ End it with `csg person logout`, or from the console in **Settings → Command-l
 make demo
 ```
 
-It starts its own instance on port 18787 and runs thirteen scenarios end to end (setup, agent
+It starts its own instance on port 18787 and runs fourteen scenarios end to end (setup, agent
 sign-in, automatic read, least privilege, denial, approval, revocation on a role change,
 the supervisor's emergency stop, a supervisor on the command line, remote MCP, approval
-mode per account with refresh, an AWS account, audit and a secret-leak check), then prints `all S1-S13 scenarios passed`.
+mode per account with refresh, an AWS account, a long-lived key, audit and a secret-leak check), then prints `all S1-S14 scenarios passed`.
 
 ## 1.15 Clean up
 
@@ -501,6 +501,31 @@ credential arrives as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESS
 ./build/csg exec --account <account-id> --resource s3 --permission read --name claudecode --ttl 15m \
   -- aws s3 ls s3://claudecode
 ```
+
+## 2.10 Long-lived keys
+
+For something that needs a key that does not expire (a CDN origin, a bucket sync),
+Cloud Safeguard can create a cloud user with an access key. It is off until a supervisor
+turns it on per account, and only supervisors and people they allow can use it.
+
+1. **Turn it on (supervisor, console):** Cloud accounts → the account → *Long-lived keys* →
+   *Turn on…*. Create a separate IAM/RAM user with only the policy the dialog shows (on AWS
+   also the boundary policy `cloud-safeguard-boundary`, the role permissions of 2.9) and
+   paste its key. The broker key is never used for this.
+2. **Allow a person (supervisor):** People → *Allow long-lived keys* (or
+   `csg supervisor people allow-long-lived NAME --code CODE`).
+3. **Ask:** in the console (Cloud accounts → *+ New long-lived key*), or an agent with
+   `csg access long-lived ...` or the MCP tool `request_long_lived_credential`. The agent only
+   gets a console link.
+4. **Create:** the owner opens the link signed in, checks it and clicks *Create key*. The
+   secret is shown once; Cloud Safeguard keeps only the user name and key ID.
+5. **Revoke:** Cloud accounts → *Long-lived keys* → *Revoke*, or `csg me long-lived revoke ID`.
+   It is also deleted automatically when the owner loses the role, the permission or is
+   suspended, or the account is disabled.
+
+> ⚠️ Not yet run against a live cloud: the IAM and RAM calls are tested against fakes. On
+> Alibaba Cloud there is no permissions boundary, so the second key is as sensitive as an
+> administrator's.
 
 ---
 

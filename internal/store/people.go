@@ -71,19 +71,20 @@ func scanSession(row rowScanner) (Session, error) {
 }
 
 const personColumns = `id, username, display_name, status, supervisor, last_login_at, created_at, updated_at,
-	setup_issued_by, setup_issued_by_name, setup_issued_kind, setup_issued_at`
+	setup_issued_by, setup_issued_by_name, setup_issued_kind, setup_issued_at, long_lived`
 
 func scanPerson(row rowScanner) (model.Person, error) {
 	var (
 		p                    model.Person
 		supervisor           int
+		longLived            int
 		lastLogin            *int64
 		createdAt, updatedAt int64
 		issue                model.SetupIssue
 		issuedAt             *int64
 	)
 	if err := row.Scan(&p.ID, &p.Username, &p.DisplayName, &p.Status, &supervisor, &lastLogin, &createdAt, &updatedAt,
-		&issue.ByID, &issue.ByName, &issue.Kind, &issuedAt); err != nil {
+		&issue.ByID, &issue.ByName, &issue.Kind, &issuedAt, &longLived); err != nil {
 		return model.Person{}, mapErr(err)
 	}
 	if issue.Kind != "" && issuedAt != nil {
@@ -91,6 +92,7 @@ func scanPerson(row rowScanner) (model.Person, error) {
 		p.SetupIssued = &issue
 	}
 	p.Supervisor = intBool(supervisor)
+	p.LongLived = intBool(longLived)
 	p.LastLoginAt = timePtr(lastLogin)
 	p.CreatedAt = fromMillis(createdAt)
 	p.UpdatedAt = fromMillis(updatedAt)

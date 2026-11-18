@@ -1,11 +1,11 @@
-// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S13)
+// Command demo drives the Cloud Safeguard end-to-end demo (scenarios S1-S14)
 // against a running control plane in mock mode. scripts/demo.sh builds csg,
 // bootstraps a throwaway data directory, starts the server and runs this.
 //
 // People act through the same HTTP API the console uses (setup, sign-in with
 // an authenticator code, approvals); the agent acts through the real csg
 // binary. No secret is printed: setup codes, passwords, tokens and
-// credentials stay in memory, and S13 checks that none of them reached the
+// credentials stay in memory, and S14 checks that none of them reached the
 // server log or this program's own output.
 package main
 
@@ -91,7 +91,8 @@ func main() {
 		{"S10 an MCP client connects by URL: the owner approves in the console, the credential reaches a shell through a one-time link", d.s10remote},
 		{"S11 approval mode per account, and a credential refreshed under the same request", d.s11modeRefresh},
 		{"S12 an AWS account: read on one S3 bucket lists and reads it, never writes, never reaches IAM", d.s12aws},
-		{"S13 audit chain verifies and no secret leaked", d.s9},
+		{"S13 a long-lived key: the agent gets only a link, the owner creates it in the console, revoking deletes it", d.s13longLived},
+		{"S14 audit chain verifies and no secret leaked", d.s9},
 	}
 	failed := 0
 	for _, s := range scenarios {
@@ -108,7 +109,7 @@ func main() {
 	}
 }
 
-// say prints and remembers what was printed, for the leak check in S13.
+// say prints and remembers what was printed, for the leak check in S14.
 func (d *demo) say(format string, args ...any) {
 	text := fmt.Sprintf(format, args...)
 	d.printed.WriteString(text)
@@ -884,6 +885,70 @@ func (d *demo) s12aws() error {
 		return errors.New("a revoked AWS key still works")
 	}
 	d.say("      an AWS account (mock): read on bucket claudecode listed and read it; writing, another bucket and IAM were refused\n")
+	return nil
+}
+
+func (d *demo) s13longLived() error {
+	var accounts struct {
+		Items []model.Provider `json:"items"`
+	}
+	if err := d.must(d.sup, http.MethodGet, "/api/v1/supervisor/accounts", nil, &accounts, http.StatusOK); err != nil {
+		return err
+	}
+	providerID := ""
+	for _, p := range accounts.Items {
+		if p.CloudAccountID == demoAccount {
+			providerID = p.ID
+		}
+	}
+	// The supervisor turns the feature on for the account and allows mei.
+	if err := d.must(d.sup, http.MethodPut, "/api/v1/supervisor/accounts/"+providerID+"/user-admin", model.SetUserAdminKeyInput{}, nil, http.StatusOK); err != nil {
+		return err
+	}
+	yes := true
+	if err := d.must(d.sup, http.MethodPatch, "/api/v1/supervisor/people/"+d.mei.id, model.UpdatePersonInput{LongLived: &yes}, nil, http.StatusOK); err != nil {
+		return err
+	}
+	// The agent asks and gets a link, never a key.
+	stdout, stderr, code := d.agent(nil, "access", "long-lived", "--account", demoAccount, "--resource", "ecs", "--permission", "read",
+		"--name", "i-2ze0demo001", "--reason", "monitoring dashboard", "--json")
+	var asked model.LongLivedRequestResult
+	if code != 0 || json.Unmarshal([]byte(stdout), &asked) != nil || asked.Status != model.LongLivedPending {
+		return fmt.Errorf("csg access long-lived exit %d: %s", code, firstLine(stderr))
+	}
+	if strings.Contains(stdout, "secret") {
+		return errors.New("the agent's answer mentions a secret")
+	}
+	_, key, ok := strings.Cut(asked.Link, "/?long-lived=")
+	if !ok {
+		return errors.New("the answer has no console link")
+	}
+	d.secrets["the long-lived link key"] = key
+	// The owner opens it in the console and creates the key.
+	var secret model.LongLivedSecret
+	if err := d.must(d.mei, http.MethodPost, "/api/v1/me/long-lived-requests/"+key+"/create", nil, &secret, http.StatusOK); err != nil {
+		return err
+	}
+	d.secrets["the long-lived secret"] = secret.AccessKeySecret
+	call := func(method, path string) (string, int) {
+		out, errOut, code := d.agent([]string{"CSG_SERVER=" + d.server, "ALIBABA_CLOUD_ACCESS_KEY_SECRET=" + secret.AccessKeySecret},
+			"mock", "request", method, path)
+		return out + errOut, code
+	}
+	if out, code := call("GET", "/v1/ecs/instances/i-2ze0demo001"); code != 0 {
+		return fmt.Errorf("the long-lived key cannot read: %s", firstLine(out))
+	}
+	if out, code := call("POST", "/v1/ecs/instances/i-2ze0demo001/restart"); code == 0 || !strings.Contains(out, "Forbidden") {
+		return errors.New("a read-only long-lived key restarted an instance")
+	}
+	// Revoking deletes it.
+	if err := d.must(d.mei, http.MethodPost, "/api/v1/me/long-lived/"+secret.Credential.ID+"/revoke", nil, nil, http.StatusOK); err != nil {
+		return err
+	}
+	if out, code := call("GET", "/v1/ecs/instances/i-2ze0demo001"); code == 0 || !strings.Contains(out, "InvalidAccessKeyId") {
+		return errors.New("a revoked long-lived key still works")
+	}
+	d.say("      a long-lived key for mei: her agent got only a link; she created it, it could read and not restart, and revoking deleted it\n")
 	return nil
 }
 

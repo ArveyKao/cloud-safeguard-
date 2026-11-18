@@ -154,7 +154,8 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Making a supervisor or activating a person raises access.
-	if (in.Supervisor != nil && *in.Supervisor) || (in.Status != nil && *in.Status == model.PersonActive) {
+	if (in.Supervisor != nil && *in.Supervisor) || (in.Status != nil && *in.Status == model.PersonActive) ||
+		(in.LongLived != nil && *in.LongLived) {
 		if !s.stepUp(w, r) {
 			return
 		}
@@ -184,6 +185,18 @@ func (s *Server) handleUpdatePerson(w http.ResponseWriter, r *http.Request) {
 		if err := s.db.UpdatePersonDisplayName(ctx, id, name, now); err != nil {
 			s.storeErrorResponse(w, err, "person not found")
 			return
+		}
+	}
+	if in.LongLived != nil && *in.LongLived != person.LongLived {
+		if err := s.db.SetPersonLongLived(ctx, id, *in.LongLived, now); err != nil {
+			s.storeErrorResponse(w, err, "person not found")
+			return
+		}
+		s.personAudit(ctx, actor.person, "person.long_lived_changed", "ok", "critical", "person", id,
+			map[string]any{"username": person.Username, "long_lived": *in.LongLived})
+		if !*in.LongLived {
+			s.revokeLongLivedNoLongerAllowed(ctx, id, "", map[string]any{
+				"cause": "permission_removed", "caused_by": "person:" + actor.person.ID, "caused_by_username": actor.person.Username})
 		}
 	}
 	if in.Status != nil || in.Supervisor != nil {
@@ -465,6 +478,8 @@ func (s *Server) afterPersonAuthorityChange(ctx context.Context, actor model.Per
 	revoked, err := s.revokeOwnedAgentLeases(ctx, personID, "agent's owner is no longer active", map[string]any{
 		"caused_by": "person:" + actor.ID, "caused_by_username": actor.Username, "owner_id": personID,
 	})
+	s.revokeLongLivedNoLongerAllowed(ctx, personID, "", map[string]any{
+		"cause": "owner_changed", "caused_by": "person:" + actor.ID, "caused_by_username": actor.Username})
 	if err != nil {
 		s.logf("revoke leases of agents owned by %s: %v", personID, err)
 	}
@@ -486,6 +501,8 @@ func (s *Server) afterBindingReduced(ctx context.Context, actor model.Person, pe
 		"cause": "binding_reduced", "owner_id": personID, "provider_id": providerID,
 		"caused_by": "person:" + actor.ID, "caused_by_username": actor.Username,
 	})
+	s.revokeLongLivedNoLongerAllowed(ctx, personID, providerID, map[string]any{
+		"cause": "binding_reduced", "caused_by": "person:" + actor.ID, "caused_by_username": actor.Username})
 	if err != nil {
 		s.logf("revoke leases after binding change for %s on %s: %v", personID, providerID, err)
 	}

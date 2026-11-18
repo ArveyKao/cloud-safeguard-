@@ -288,7 +288,7 @@ func TestE2EMCPServer(t *testing.T) {
 	if v := result("1")["protocolVersion"]; v != "2025-06-18" {
 		t.Fatalf("protocol version = %v", v)
 	}
-	if tools, _ := result("2")["tools"].([]any); len(tools) != 6 {
+	if tools, _ := result("2")["tools"].([]any); len(tools) != 7 {
 		t.Fatalf("tools = %v", result("2"))
 	}
 	if s, isErr := text("3"); isErr || !strings.Contains(s, e2eAccount) {

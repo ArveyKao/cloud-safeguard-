@@ -178,7 +178,15 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   documentation's example), no SDK dependency. S3 templates; AWS deny statement; the IAM
   guard refuses IAM, Organizations and Identity Center for every cloud. Connection test
   warns when the role allows IAM. `AWS_*` variables. Mock S3 and IAM routes; console wizard
-  AWS choice; demo S12. Not run against live AWS.
+  AWS choice; demo S12. Not run against live AWS. Review: no blocker; 3 major and the
+  minor items fixed in 80bb0a1.
+- **Piece 6, long-lived credentials (2026-11-17):** owner chose a separate second key per
+  account and automatic deletion when the owner loses the right. Person flag, second key
+  (AWS with a fixed permissions boundary; RAM has none), request → console link → owner
+  confirms → cloud user, policy and key, secret shown once; revoke and automatic deletion;
+  `revoke_failed` with retry. Schema 12. Mock cloud accepts active long-lived mock keys.
+  MCP `request_long_lived_credential`, `csg access long-lived`, `csg me/supervisor
+  long-lived`. Demo S13. Not run against a live cloud.
 - **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
   README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
   Alibaba Cloud is untested.
@@ -198,7 +206,7 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console (target surface = api; browser E2E covers the console).
   No production deployment requested.
 - **Address / artifact:** `build/csg` (single binary), demo on `http://127.0.0.1:18787`.
-- **Final demo:** `make demo` → S1–S13 pass; console screenshots captured by verifier.
+- **Final demo:** `make demo` → S1–S14 pass; console screenshots captured by verifier.
 - **Evidence / review:** `scripts/demo.sh` transcript, `go test ./...`, `npm run build`,
   verifier report `changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md`, canonical
   `arvey-develop delivery check --phase complete` PASS.

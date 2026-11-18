@@ -319,6 +319,8 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		revoked = ids
+		actor, _ := sessionFromContext(r.Context())
+		s.revokeLongLivedOfAccount(r.Context(), prov.ID, map[string]any{"cause": "account_disabled", "caused_by": "person:" + actor.person.ID})
 	}
 	// Repointing the role or switching an account on or off changes what
 	// credentials can do: record it as a warning.

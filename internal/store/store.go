@@ -71,6 +71,9 @@ type Store interface {
 	// RotateProviderCredential replaces the encrypted broker credential and
 	// its masked AccessKey ID only.
 	RotateProviderCredential(ctx context.Context, id, encryptedCredential, maskedAccessKeyID string, now time.Time) error
+	// GetLongLived returns a long-lived credential (CONTRACT §17.14); the
+	// mock cloud uses it to accept the mock key of an active one.
+	GetLongLived(ctx context.Context, id string) (LongLivedRow, error)
 	// GetProviderCredential returns the encrypted broker credential blob.
 	GetProviderCredential(ctx context.Context, id string) (string, error)
 	// CountProviderCredentials counts providers that hold a credential.

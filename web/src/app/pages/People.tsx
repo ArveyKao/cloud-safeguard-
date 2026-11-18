@@ -29,6 +29,7 @@ export function PeoplePage({ me }: { me: Person }) {
                 <td>
                   <b>{p.display_name || p.username}</b> <span className="muted small">{p.username}</span>
                   {p.supervisor && <> <Badge tone="blue">supervisor</Badge></>}
+                  {!p.supervisor && p.long_lived && <> <Badge tone="amber">long-lived keys</Badge></>}
                 </td>
                 <td>{p.status === 'active' ? <Badge tone="green">active</Badge> : p.status === 'pending' ? <Badge tone="amber">waiting for setup</Badge> : <Badge>suspended</Badge>}</td>
                 <td className="muted">{ago(p.last_login_at)}</td>
@@ -51,6 +52,14 @@ export function PeoplePage({ me }: { me: Person }) {
                     async () => { await api.updatePerson(p.id, { supervisor: !p.supervisor }); toast(p.supervisor ? 'Supervisor removed' : 'Now a supervisor') }, !p.supervisor)}>
                     {p.supervisor ? 'Remove supervisor' : 'Make supervisor'}
                   </Button>
+                  {!p.supervisor && <Button kind="link" onClick={() => ask(p.long_lived ? `Stop ${label(p)} from holding long-lived keys?` : `Allow ${label(p)} to create long-lived keys?`,
+                    p.long_lived
+                      ? 'Every long-lived key they created is deleted in the cloud at once, and they cannot create new ones.'
+                      : 'They can create cloud users with access keys that do not expire, within their roles, after confirming each one in the console. Their agents can ask for one; only they see the key.',
+                    p.long_lived ? 'Stop' : 'Allow',
+                    async () => { await api.updatePerson(p.id, { long_lived: !p.long_lived }); toast(p.long_lived ? 'Long-lived keys stopped' : 'Long-lived keys allowed') }, !!p.long_lived)}>
+                    {p.long_lived ? 'Stop long-lived keys' : 'Allow long-lived keys'}
+                  </Button>}
                 </td>
               </tr>
             ))}

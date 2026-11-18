@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { api } from '../api'
 import type { ApprovalMode, Person, PersonAccount, Provider, Role } from '../types'
 import { navigate } from '../router'
+import { LongLivedCard, UserAdminSection } from './LongLived'
 import {
   Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, ago, roleHint, roleLabel, useAction, useConfirm, useLoad, useToast, when,
 } from '../ui'
@@ -55,6 +56,7 @@ export function AccountsPage({ person }: { person: Person }) {
         )}
         <p className="muted small">Your approval mode decides, per account, what your agents get without asking you. It never goes beyond your role there.</p>
       </Card>
+      <LongLivedCard person={person} accounts={mine.data?.items ?? []} />
       {editing && <ModeDialog account={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); mine.reload() }} />}
       {person.supervisor && <ManageAccounts onChange={mine.reload} />}
     </>
@@ -230,6 +232,8 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
               <Button disabled={!adding} busy={action.busy} onClick={() => run(async () => { await api.putBinding(account.id, adding, 'guest'); setAdding('') }, 'Added as guest')}>Add as guest</Button>
             </div>
           )}
+
+          <UserAdminSection account={account} onChange={onChange} />
 
           <h3>Connection</h3>
           <p className="muted small">

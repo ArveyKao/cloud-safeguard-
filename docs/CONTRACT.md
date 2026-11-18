@@ -1343,28 +1343,78 @@ one rule per cloud account, which only that person sets.
 - The broker identity may later come from the platform instead of a stored key (instance
   role, OIDC federation); the agent side does not change.
 
-### 17.14 Long-lived credentials (decided 2026-11-17, not built yet)
+### 17.14 Long-lived credentials (decided and implemented 2026-11-17)
 
 Some uses need a key that does not expire (a CDN origin, a bucket sync). Cloud Safeguard can
-create a cloud user with an access key for them, under strict control.
+create a cloud user with an access key for them, under strict control. The owner's decisions:
+a separate key per account does this (the broker key never gets IAM rights), and a key is
+deleted in the cloud as soon as its owner is no longer allowed to hold it.
 
-- **Who.** Supervisors, and people a supervisor has allowed (a person flag). Anyone else, and
-  their agents, are refused.
-- **Asking.** The person in the console, or one of their agents (API and MCP
-  `request_long_lived_credential`) with the §17.4 fields except `ttl_seconds`. The answer is
-  only a console link. Nothing is created and no secret goes to the agent.
-- **Creating.** The person opens the link signed in to the console (only that person can open
-  it), checks what will be created and confirms. Cloud Safeguard then creates the user, the
-  policy rendered from the same read/write/full template (with the IAM deny), attaches it,
-  creates the access key, and shows the secret once in the console. The secret is never
-  stored by Cloud Safeguard.
-- **No expiry.** The key lives until it is revoked. The console lists every long-lived
-  credential (account, user, scope, creator, created); its creator or any supervisor can
-  revoke it, which deletes the key, the policy and the user.
-- **Cloud side.** This needs a second, separate broker identity per account, enabled by a
-  supervisor, that may only manage users and policies named `csg-*` (on AWS also only with a
-  fixed permissions boundary that denies IAM). Agents' keys never come from it. Every create
-  and revoke is audited at critical level.
+**Enabling, per cloud account (supervisor, console only).**
+- `PUT /api/v1/supervisor/accounts/{id}/user-admin {access_key_id, access_key_secret}` stores
+  a second key, encrypted like the broker key and never shown again (masked ID only). Its own
+  policy, shown in the console, allows only:
+  - AWS: `iam:CreateUser` on `arn:aws:iam::ACCOUNT:user/csg/*` with the condition
+    `iam:PermissionsBoundary = arn:aws:iam::ACCOUNT:policy/cloud-safeguard-boundary`, and
+    `iam:PutUserPolicy`, `iam:DeleteUserPolicy`, `iam:CreateAccessKey`, `iam:DeleteAccessKey`,
+    `iam:DeleteUser` on `user/csg/*`. The boundary policy (created by the supervisor, also
+    shown) is the role's permission policy of §17.13: whatever is put on a `csg` user, it
+    can never do more, and never IAM.
+  - Alibaba Cloud: `ram:CreateUser`, `ram:DeleteUser`, `ram:CreateAccessKey`,
+    `ram:DeleteAccessKey`, `ram:AttachPolicyToUser`, `ram:DetachPolicyFromUser` on
+    `user/csg-*`, and `ram:CreatePolicy`, `ram:DeletePolicy` on `policy/csg-*`. RAM has no
+    permissions boundary, so here the policy Cloud Safeguard writes (a §17.4 template plus
+    the IAM deny) is the only limit: a leak of this key is more serious than of the broker
+    key.
+- The connection test of the second key checks it can sign a harmless call.
+- `DELETE /api/v1/supervisor/accounts/{id}/user-admin` removes it; refused (409) while
+  long-lived credentials of that account exist. Both are audited at critical level.
+
+**Who.** Supervisors, and people a supervisor has allowed (`PATCH
+/api/v1/supervisor/people/{id} {long_lived: true}`; a raise, so a command-line session
+needs a code). The person must also hold a role on the account that permits the
+permission. Anyone else, and their agents, are refused.
+
+**Asking.** `POST /api/v1/me/long-lived` (person session) or `POST
+/api/v1/agent/long-lived` (agent token; MCP `request_long_lived_credential`) with
+`cloud_account_id`, `resource`, `permission`, optional `resource_name`, and `reason`
+(required). The checks of §17.4 apply (template, name pattern, role, IAM prohibition), plus
+the person's permission and the account's second key. The answer is `{id, status: pending,
+link, expires_at}`: a console link `/?long-lived=KEY` valid for one hour. The key is stored
+only as a hash and masked in the logs. Nothing is created and no secret goes to the agent.
+
+**Creating (console only).** The agent's owner, or the person who asked, opens the link
+signed in to the console (to anyone else it does not exist). The page shows the account,
+resource type, name, permission and reason, who asked, and what will be created. The person
+confirms (`POST /api/v1/me/long-lived-requests/{key}/create`) or declines (`…/deny`). Every
+check runs again. Cloud Safeguard then creates, in the cloud:
+- a user `csg-<id>` (AWS: path `/csg/`, with the boundary),
+- a policy rendered from the same read/write/full template, with the cloud's IAM deny
+  (AWS: an inline user policy; Alibaba Cloud: a custom policy `csg-<id>`, attached),
+- an access key,
+
+and answers with the access key ID and secret, once. Cloud Safeguard stores the user name,
+the policy name and the access key ID, never the secret. If any step fails, what was created
+is deleted again and the request is `failed` with the cloud's error.
+
+**No expiry, and deletion.**
+- The key lives until it is revoked: by its owner (`POST /api/v1/me/long-lived/{id}/revoke`)
+  or any supervisor (`POST /api/v1/supervisor/long-lived/{id}/revoke`), from the console or
+  the command line. Revoking deletes the access key, the policy and the user, in that order.
+- It is revoked automatically, with the same deletion, when its owner is suspended or reset,
+  loses the permission (flag removed, or supervisor flag removed without the flag), loses the
+  role on the account or keeps a role that no longer permits its permission, or when the
+  account is disabled.
+- If a deletion fails in the cloud, the credential is `revoke_failed` with the error; a
+  supervisor can retry the revoke. It is never shown as gone while the key may still exist.
+- `GET /api/v1/me/long-lived` lists a person's own; `GET /api/v1/supervisor/long-lived`
+  lists all (account, cloud user, scope, owner, who asked, created, status).
+- Every request, create, deny, revoke and failure is audited; create and revoke at critical
+  level. The secret and the link key never reach a log or the audit log.
+
+**Mock mode.** For a mock account, no cloud is called: the "secret" is a signed mock token
+naming the credential, which the mock cloud accepts while the credential is active, with the
+credential's policy.
 
 ### 17.8 Implementation status
 
@@ -1383,7 +1433,7 @@ create a cloud user with an access key for them, under strict control.
 | Remote MCP over HTTPS with OAuth sign-in (§17.10) | done; tried with Claude Code 2.1.221 (sign-in, tools, credential link) |
 | Approval mode per cloud account (§17.11), refresh (§17.12) | implemented, schema version 11 |
 | AWS (§17.13) | implemented with S3; tested against a fake STS and in mock mode, not against live AWS |
-| Long-lived credentials (§17.14) | decided, not built |
+| Long-lived credentials (§17.14) | implemented, schema version 12; tested in mock mode and against fake IAM and RAM, not against a live cloud |
 | Lifecycle revocation for owned agents (§17.6) | implemented: owner suspended or reset, binding lowered or removed |
 | MCP server (§17.7) and agent CLI (`csg login` sign-in, `accounts`, `access`, `exec --account`) | implemented |
 | Console redesign (sign-in, Inbox, Agents, Cloud accounts, Activity, People, Settings) | implemented; the admin-token console is removed |

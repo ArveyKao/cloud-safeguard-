@@ -19,7 +19,7 @@ type rowScanner interface {
 // ================= Providers =================
 
 const providerColumns = `id, name, type, mode, region, role_arn, access_key_id_masked,
-	status, last_tested_at, last_test_ok, created_at, updated_at, cloud_account_id`
+	status, last_tested_at, last_test_ok, created_at, updated_at, cloud_account_id, user_admin_key_masked`
 
 // scanProvider scans one provider row (credential blob excluded).
 func scanProvider(row rowScanner) (model.Provider, error) {
@@ -33,7 +33,7 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 	err := row.Scan(
 		&p.ID, &p.Name, &p.Type, &p.Mode, &p.Region, &p.RoleARN,
 		&p.AccessKeyIDMasked, &p.Status, &lastTestedAt, &lastTestOK,
-		&createdAt, &updatedAt, &p.CloudAccountID,
+		&createdAt, &updatedAt, &p.CloudAccountID, &p.UserAdminKeyMasked,
 	)
 	if err != nil {
 		return model.Provider{}, mapErr(err)
@@ -49,7 +49,7 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 func (db *DB) CreateProvider(ctx context.Context, p model.Provider, encryptedCredential string) error {
 	_, err := db.sql.ExecContext(ctx,
 		`INSERT INTO providers(`+providerColumns+`, encrypted_credential)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)`,
 		p.ID, p.Name, string(p.Type), string(p.Mode), p.Region, p.RoleARN,
 		p.AccessKeyIDMasked, string(p.Status),
 		millisPtr(p.LastTestedAt), boolPtrInt(p.LastTestOK),

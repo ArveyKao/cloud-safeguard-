@@ -324,7 +324,7 @@ func (a *App) runPersonWhoami(args []string) error {
 
 func (a *App) runMe(args []string) error {
 	if len(args) == 0 {
-		return usagef("usage: csg me requests|deny|revoke|agents|revoke-agent|accounts|mode|sessions|end-session")
+		return usagef("usage: csg me requests|deny|revoke|agents|revoke-agent|accounts|mode|sessions|end-session|long-lived")
 	}
 	rest := args[1:]
 	switch args[0] {
@@ -348,6 +348,8 @@ func (a *App) runMe(args []string) error {
 		return a.runMeSessions(rest)
 	case "end-session":
 		return a.runMeEndSession(rest)
+	case "long-lived":
+		return a.runLongLived(rest, false)
 	}
 	return usagef("unknown me subcommand %q", args[0])
 }

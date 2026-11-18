@@ -200,7 +200,13 @@ const connectionTestPolicy = `{"Version":"1","Statement":[{"Effect":"Allow","Act
 // error codes/messages or a transport reason, never the broker AccessKey or the
 // signed request URL (which embeds the AccessKey ID).
 func callSTS(ctx context.Context, accessKeySecret string, params map[string]string) ([]byte, error) {
-	requestURL := stsEndpoint + "?" + signedQuery(params, accessKeySecret)
+	return callAliyunRPC(ctx, stsEndpoint, accessKeySecret, params)
+}
+
+// callAliyunRPC signs the params and performs one Alibaba Cloud RPC call to
+// endpoint, with the same sanitized errors as callSTS.
+func callAliyunRPC(ctx context.Context, endpoint, accessKeySecret string, params map[string]string) ([]byte, error) {
+	requestURL := endpoint + "?" + signedQuery(params, accessKeySecret)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {

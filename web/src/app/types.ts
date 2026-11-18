@@ -17,6 +17,8 @@ export interface Person {
   display_name: string
   status: 'pending' | 'active' | 'suspended'
   supervisor: boolean
+  /** May create long-lived credentials (supervisors always may). */
+  long_lived?: boolean
   setup_issued?: SetupIssue
   last_login_at?: string
   created_at: string
@@ -71,6 +73,8 @@ export interface Provider {
   role_arn?: string
   cloud_account_id?: string
   access_key_id_masked: string
+  /** Masked ID of the second key for long-lived credentials; empty when off. */
+  user_admin_key_masked?: string
   status: 'active' | 'disabled'
   last_tested_at?: string
   last_test_ok?: boolean
@@ -178,4 +182,39 @@ export interface PolicySettings {
 export interface List<T> {
   items: T[]
   total: number
+}
+
+export type LongLivedStatus = 'pending' | 'creating' | 'active' | 'denied' | 'expired' | 'failed' | 'revoking' | 'revoked' | 'revoke_failed'
+
+/** A long-lived credential (CONTRACT §17.14). Never holds the secret. */
+export interface LongLivedCredential {
+  id: string
+  provider_id: string
+  cloud_account_id: string
+  cloud_account_name: string
+  provider_type: string
+  owner_id: string
+  owner_name?: string
+  agent_id?: string
+  agent_name?: string
+  resource: string
+  permission: string
+  resource_name?: string
+  reason: string
+  status: LongLivedStatus
+  cloud_user?: string
+  access_key_id?: string
+  failure_reason?: string
+  revoke_reason?: string
+  created_at: string
+  expires_at: string
+}
+
+export interface LongLivedRequestResult { id: string; status: LongLivedStatus; link: string; expires_at: string }
+
+export interface LongLivedSecret {
+  credential: LongLivedCredential
+  access_key_id: string
+  access_key_secret: string
+  env: { name: string; value: string }[]
 }

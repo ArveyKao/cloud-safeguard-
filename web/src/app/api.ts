@@ -3,7 +3,7 @@
  * CSRF token from /auth/me is kept in memory only and sent on every change.
  * No token is ever stored in localStorage.
  */
-import type { AccessRequest, Agent, AgentSignIn, ApprovalMode, AuditEvent, List, Person, PersonAccount, PersonWithSetupCode, PolicySettings, Provider, Role, RoleBinding, SessionInfo, SetupBeginResult, CLISignIn, CLISession, MCPConnection } from './types'
+import type { LongLivedCredential, LongLivedRequestResult, LongLivedSecret, AccessRequest, Agent, AgentSignIn, ApprovalMode, AuditEvent, List, Person, PersonAccount, PersonWithSetupCode, PolicySettings, Provider, Role, RoleBinding, SessionInfo, SetupBeginResult, CLISignIn, CLISession, MCPConnection } from './types'
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -87,6 +87,13 @@ export const api = {
   approveCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/approve`, {}),
   denyCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/deny`, {}),
   cancelCLISignIn: (code: string) => call<{ status: string }>('POST', `/me/cli-signins/${enc(code)}/cancel`, {}),
+  askLongLived: (input: { cloud_account_id: string; resource: string; permission: string; resource_name?: string; reason: string }) =>
+    call<LongLivedRequestResult>('POST', '/me/long-lived', input),
+  myLongLived: () => call<List<LongLivedCredential>>('GET', '/me/long-lived'),
+  revokeLongLived: (id: string) => call<LongLivedCredential>('POST', `/me/long-lived/${enc(id)}/revoke`, {}),
+  longLivedRequest: (key: string) => call<LongLivedCredential>('GET', `/me/long-lived-requests/${enc(key)}`),
+  createLongLived: (key: string) => call<LongLivedSecret>('POST', `/me/long-lived-requests/${enc(key)}/create`, {}),
+  denyLongLived: (key: string) => call<LongLivedCredential>('POST', `/me/long-lived-requests/${enc(key)}/deny`, {}),
   cliSessions: () => call<List<CLISession>>('GET', '/me/cli-sessions'),
   revokeCLISession: (id: string) => call<{ ok: boolean }>('POST', `/me/cli-sessions/${enc(id)}/revoke`, {}),
   setMode: (providerId: string, mode: ApprovalMode, expires_in_seconds: number) =>
@@ -96,7 +103,7 @@ export const api = {
   people: () => call<List<Person>>('GET', '/supervisor/people'),
   createPerson: (username: string, display_name: string, supervisor: boolean) =>
     call<PersonWithSetupCode>('POST', '/supervisor/people', { username, display_name, supervisor }),
-  updatePerson: (id: string, patch: { status?: string; supervisor?: boolean; display_name?: string }) =>
+  updatePerson: (id: string, patch: { status?: string; supervisor?: boolean; display_name?: string; long_lived?: boolean }) =>
     call<Person>('PATCH', `/supervisor/people/${enc(id)}`, patch),
   resetPerson: (id: string) => call<PersonWithSetupCode>('POST', `/supervisor/people/${enc(id)}/reset`, {}),
   bindings: (providerId: string) => call<List<RoleBinding>>('GET', `/supervisor/bindings?provider_id=${enc(providerId)}`),
@@ -110,6 +117,11 @@ export const api = {
   testAccount: (id: string) => call<TestResult>('POST', `/supervisor/accounts/${enc(id)}/test`, {}),
   rotateAccount: (id: string, access_key_id: string, access_key_secret: string) =>
     call<Provider>('POST', `/supervisor/accounts/${enc(id)}/rotate`, { access_key_id, access_key_secret }),
+  setUserAdmin: (id: string, access_key_id: string, access_key_secret: string) =>
+    call<Provider>('PUT', `/supervisor/accounts/${enc(id)}/user-admin`, { access_key_id, access_key_secret }),
+  clearUserAdmin: (id: string) => call<Provider>('DELETE', `/supervisor/accounts/${enc(id)}/user-admin`),
+  allLongLived: () => call<List<LongLivedCredential>>('GET', '/supervisor/long-lived'),
+  supRevokeLongLived: (id: string) => call<LongLivedCredential>('POST', `/supervisor/long-lived/${enc(id)}/revoke`, {}),
   settings: () => call<PolicySettings>('GET', '/supervisor/settings'),
   putSettings: (s: PolicySettings) => call<PolicySettings>('PUT', '/supervisor/settings', s),
   audit: (limit = 100) => call<List<AuditEvent>>('GET', `/supervisor/audit?limit=${limit}`),

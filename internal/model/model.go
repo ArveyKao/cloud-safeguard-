@@ -223,8 +223,11 @@ type Provider struct {
 	CloudAccountID string `json:"cloud_account_id,omitempty"`
 	// AccessKeyIDMasked is a display-only form such as "LTAI****9f2c". The raw
 	// broker AccessKey ID is never returned by the API.
-	AccessKeyIDMasked string         `json:"access_key_id_masked"`
-	Status            ProviderStatus `json:"status"`
+	AccessKeyIDMasked string `json:"access_key_id_masked"`
+	// UserAdminKeyMasked is the masked ID of the second key that creates
+	// long-lived credentials (CONTRACT §17.14); empty when not enabled.
+	UserAdminKeyMasked string         `json:"user_admin_key_masked,omitempty"`
+	Status             ProviderStatus `json:"status"`
 	// LastTestedAt / LastTestOK report the most recent connection test.
 	LastTestedAt *time.Time `json:"last_tested_at,omitempty"`
 	LastTestOK   *bool      `json:"last_test_ok,omitempty"`

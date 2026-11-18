@@ -26,7 +26,7 @@ every problem as a GitHub issue.
 
 ```bash
 go build -o build/csg ./cmd/csg
-./scripts/demo.sh            # must end with "all S1-S13 scenarios passed"
+./scripts/demo.sh            # must end with "all S1-S14 scenarios passed"
 go test ./...                # must pass
 ./build/csg init --demo --data-dir ./build/qa-data
 ./build/csg serve --data-dir ./build/qa-data
@@ -54,6 +54,10 @@ is listed in CONTRACT §17.8; `docs/QUICKSTART.md` walks through the whole flow.
   bucket and `/v1/iam/users` are refused; the credential comes as `AWS_*` variables. The
   add-account wizard has an AWS choice that shows the IAM user, trust and permission
   policies with the account ID filled in.
+- Long-lived keys: off until a supervisor turns them on per account and allows a person;
+  an agent's request gives only a console link; only the owner can open it (and not from
+  a `csg` session); the secret is shown once; revoking deletes it, and so do removing the
+  person's role or permission, suspending or resetting them, and disabling the account.
 - A credential can be refreshed (`csg access refresh ID`, MCP `refresh_credential`): a new
   key under the same request, at most once a minute, within its refresh window (8 hours
   unless the agent declares another, at most the supervisor's limit). A revoked or expired

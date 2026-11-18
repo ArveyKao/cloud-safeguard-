@@ -36,6 +36,9 @@ type Person struct {
 	// role bindings and limits, and is Administrator on every cloud account
 	// while active (CONTRACT §17.1).
 	Supervisor bool `json:"supervisor"`
+	// LongLived allows a person who is not a supervisor to create long-lived
+	// credentials (CONTRACT §17.14). Only a supervisor sets it.
+	LongLived bool `json:"long_lived"`
 	// SetupIssued records who issued the setup code the person's current
 	// password and authenticator were set up with. Whoever holds a setup
 	// code can complete the setup, so this is what traces an account a
@@ -79,6 +82,13 @@ type UpdatePersonInput struct {
 	DisplayName *string       `json:"display_name,omitempty"`
 	Status      *PersonStatus `json:"status,omitempty"`
 	Supervisor  *bool         `json:"supervisor,omitempty"`
+	LongLived   *bool         `json:"long_lived,omitempty"`
+}
+
+// MayCreateLongLived reports whether the person may create long-lived
+// credentials: an active supervisor, or an active person with the flag.
+func (p Person) MayCreateLongLived() bool {
+	return p.Status == PersonActive && (p.Supervisor || p.LongLived)
 }
 
 // PutBindingInput is the supervisor request body for setting a role binding.

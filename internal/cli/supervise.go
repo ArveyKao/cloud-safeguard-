@@ -40,8 +40,10 @@ func (a *App) runSupervisorCommands(args []string) error {
 		return a.runSupAudit(rest)
 	case "requests":
 		return a.runSupRequests(rest)
+	case "long-lived":
+		return a.runLongLived(rest, true)
 	}
-	return usagef("unknown supervisor area %q (people, roles, accounts, settings, audit, requests, recover)", area)
+	return usagef("unknown supervisor area %q (people, roles, accounts, settings, audit, requests, long-lived, recover)", area)
 }
 
 // supFlags are the flags shared by supervisor subcommands.
@@ -145,6 +147,10 @@ need a code from your authenticator app.
 		update.Supervisor = &yes
 	case "remove-supervisor":
 		update.Supervisor = &no
+	case "allow-long-lived":
+		update.LongLived = &yes
+	case "disallow-long-lived":
+		update.LongLived = &no
 	default:
 		return usagef("unknown people subcommand %q", sub)
 	}
@@ -155,7 +161,8 @@ need a code from your authenticator app.
 	if *f.jsonOut {
 		return a.printJSON(out)
 	}
-	fmt.Fprintf(a.Stdout, "%s: status %s, supervisor %s\n", out.Username, out.Status, yesNo(out.Supervisor))
+	fmt.Fprintf(a.Stdout, "%s: status %s, supervisor %s, long-lived credentials %s\n", out.Username, out.Status, yesNo(out.Supervisor),
+		yesNo(out.Supervisor || out.LongLived))
 	return nil
 }
 

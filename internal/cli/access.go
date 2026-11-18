@@ -208,7 +208,7 @@ func (f accessFlags) input() (model.AccessRequestInput, error) {
 // runAccess implements `csg access request|status`.
 func (a *App) runAccess(args []string) error {
 	if len(args) == 0 {
-		return usagef("usage: csg access request|status|refresh ...")
+		return usagef("usage: csg access request|status|refresh|long-lived ...")
 	}
 	switch args[0] {
 	case "request":
@@ -217,8 +217,51 @@ func (a *App) runAccess(args []string) error {
 		return a.runAccessStatus(args[1:])
 	case "refresh":
 		return a.runAccessRefresh(args[1:])
+	case "long-lived":
+		return a.runAccessLongLived(args[1:])
 	}
-	return usagef("unknown access subcommand %q (request, status, refresh)", args[0])
+	return usagef("unknown access subcommand %q (request, status, refresh, long-lived)", args[0])
+}
+
+func (a *App) runAccessLongLived(args []string) error {
+	fs := a.newFlagSet("access long-lived", `Usage: csg access long-lived --account ID --resource R --permission P --reason TEXT [--name NAME] [--json]
+
+Asks for a long-lived key (a cloud user with an access key that does not
+expire). Only if your owner is allowed by a supervisor. You get a console link,
+never the key: your owner opens it, checks it and creates the key.
+`)
+	cf := a.addClientFlags(fs)
+	account := fs.String("account", "", "cloud account ID (required)")
+	resource := fs.String("resource", "", "resource type (required)")
+	permission := fs.String("permission", "", "read, write or full (required)")
+	name := fs.String("name", "", "one resource; default all of that type")
+	reason := fs.String("reason", "", "what the key is for (required)")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	positionals, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 0 || strings.TrimSpace(*account) == "" || strings.TrimSpace(*resource) == "" ||
+		strings.TrimSpace(*permission) == "" || strings.TrimSpace(*reason) == "" {
+		return usagef("--account, --resource, --permission and --reason are required")
+	}
+	client, err := a.agentClient(cf)
+	if err != nil {
+		return err
+	}
+	var out model.LongLivedRequestResult
+	if err := client.post(context.Background(), apiPrefix+"/agent/long-lived", model.LongLivedRequestInput{
+		CloudAccountID: strings.TrimSpace(*account), Resource: strings.TrimSpace(*resource),
+		Permission: strings.ToLower(strings.TrimSpace(*permission)), ResourceName: strings.TrimSpace(*name), Reason: strings.TrimSpace(*reason),
+	}, &out); err != nil {
+		return err
+	}
+	if *jsonOut {
+		return a.printJSON(out)
+	}
+	fmt.Fprintf(a.Stdout, "request:  %s\nlink:     %s\nexpires:  %s\nnext:     your owner opens the link in the console and creates the key; it is shown only to them\n",
+		displayString(out.ID), displayString(out.Link), out.ExpiresAt.Local().Format(time.RFC3339))
+	return nil
 }
 
 func (a *App) runAccessRefresh(args []string) error {

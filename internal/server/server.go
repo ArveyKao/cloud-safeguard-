@@ -71,6 +71,9 @@ type Config struct {
 	// MinterFactory optionally overrides provider minters (tests inject fakes).
 	// When nil the server uses provider.NewFor(provider.Type, provider.Mode).
 	MinterFactory func(p model.Provider) (provider.Minter, error)
+	// UserAdminFactory optionally overrides the long-lived credential user
+	// admins (tests inject fakes). When nil: provider.NewUserAdmin.
+	UserAdminFactory func(p model.Provider) (provider.UserAdmin, error)
 	// Now optionally overrides the clock (tests use a fixed clock).
 	Now func() time.Time
 	// PasswordParams optionally overrides the Argon2id cost (tests lower it).
@@ -101,6 +104,8 @@ type Server struct {
 	version       string
 	now           func() time.Time
 	minterFactory func(model.Provider) (provider.Minter, error)
+	// userAdminFactory creates long-lived credentials (CONTRACT §17.14).
+	userAdminFactory func(model.Provider) (provider.UserAdmin, error)
 
 	// pwParams is the Argon2id cost for new password hashes; dummyHash is
 	// verified against for unknown accounts so they take the same time;
@@ -278,8 +283,14 @@ func New(cfg Config) (*Server, error) {
 		version:       version,
 		now:           now,
 		minterFactory: factory,
-		startedAt:     now().UTC(),
-		logWriter:     log.New(os.Stderr, "", log.LstdFlags),
+		userAdminFactory: func() func(model.Provider) (provider.UserAdmin, error) {
+			if cfg.UserAdminFactory != nil {
+				return cfg.UserAdminFactory
+			}
+			return defaultUserAdminFactory
+		}(),
+		startedAt: now().UTC(),
+		logWriter: log.New(os.Stderr, "", log.LstdFlags),
 	}
 	s.pwParams = authn.DefaultParams
 	if cfg.PasswordParams != nil {

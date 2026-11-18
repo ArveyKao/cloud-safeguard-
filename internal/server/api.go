@@ -45,6 +45,7 @@ func (s *Server) buildHandler() http.Handler {
 	// for the credential and revoke endpoints above.
 	agentMux.HandleFunc("GET /api/v1/agent/accounts", s.handleAgentListAccounts)
 	agentMux.HandleFunc("POST /api/v1/agent/access-requests", s.handleAgentCreateAccessRequest)
+	agentMux.HandleFunc("POST /api/v1/agent/long-lived", s.handleAgentLongLivedRequest)
 	agentMux.HandleFunc("GET /api/v1/agent/access-requests/{id}", s.handleAgentGetAccessRequest)
 	agentMux.HandleFunc("POST /api/v1/agent/access-requests/{id}/refresh", s.handleAgentRefreshAccessRequest)
 	agentMux.HandleFunc("/", s.handleUnknownAPI)
@@ -81,6 +82,12 @@ func (s *Server) buildHandler() http.Handler {
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/approve", s.consoleOnly(s.handleApproveCLISignIn))
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/deny", s.handleDenyCLISignIn)
 	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/cancel", s.handleCancelCLISignIn)
+	meMux.HandleFunc("POST /api/v1/me/long-lived", s.handleMyLongLivedRequest)
+	meMux.HandleFunc("GET /api/v1/me/long-lived", s.handleListMyLongLived)
+	meMux.HandleFunc("POST /api/v1/me/long-lived/{id}/revoke", s.handleRevokeLongLived(true))
+	meMux.HandleFunc("GET /api/v1/me/long-lived-requests/{key}", s.handleGetLongLivedRequest)
+	meMux.HandleFunc("POST /api/v1/me/long-lived-requests/{key}/create", s.consoleOnly(s.handleCreateLongLived))
+	meMux.HandleFunc("POST /api/v1/me/long-lived-requests/{key}/deny", s.handleDenyLongLivedRequest)
 	meMux.HandleFunc("GET /api/v1/me/mcp-connections/{key}", s.handleGetMCPConnection)
 	meMux.HandleFunc("POST /api/v1/me/mcp-connections/{key}/approve", s.consoleOnly(s.handleApproveMCPConnection))
 	meMux.HandleFunc("POST /api/v1/me/mcp-connections/{key}/deny", s.handleDenyMCPConnection)
@@ -112,6 +119,10 @@ func (s *Server) buildHandler() http.Handler {
 	supervisorMux.HandleFunc("PUT /api/v1/supervisor/settings", s.handlePutSettings)
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit", s.handleListAudit)
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit/verify", s.handleVerifyAudit)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/long-lived", s.handleListAllLongLived)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/long-lived/{id}/revoke", s.handleRevokeLongLived(false))
+	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/user-admin", s.consoleOnly(s.handleSetUserAdmin))
+	supervisorMux.HandleFunc("DELETE /api/v1/supervisor/accounts/{provider}/user-admin", s.handleClearUserAdmin)
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases", s.handleListLeases)
 	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases/{id}", s.handleGetLease)
 	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/deny", s.handleDenyLease)
@@ -256,7 +267,8 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 // is a secret until used, so they are masked: everything after the prefix,
 // except a final approve or deny.
 func logPath(path string) string {
-	for _, prefix := range []string{"/api/v1/me/signins/", "/api/v1/me/cli-signins/", "/api/v1/me/mcp-connections/", credentialLinkPrefix} {
+	for _, prefix := range []string{"/api/v1/me/signins/", "/api/v1/me/cli-signins/", "/api/v1/me/mcp-connections/",
+		"/api/v1/me/long-lived-requests/", credentialLinkPrefix} {
 		i := strings.Index(path, prefix)
 		if i < 0 {
 			i = strings.Index(strings.ToLower(path), strings.ToLower(prefix))
@@ -269,7 +281,7 @@ func logPath(path string) string {
 			return path
 		}
 		masked := path[:i+len(prefix)] + "***"
-		for _, action := range []string{"/approve", "/deny"} {
+		for _, action := range []string{"/approve", "/deny", "/create"} {
 			if strings.HasSuffix(rest, action) {
 				return masked + action
 			}

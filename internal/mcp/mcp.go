@@ -143,6 +143,19 @@ func (s *Server) Tools() []Tool {
 			InputSchema: schema([]string{"request_id"}, map[string]any{"request_id": str("The id returned by request_access.")}),
 		},
 		{
+			Name: "request_long_lived_credential",
+			Description: "Ask for a long-lived cloud key (a cloud user with an access key that does not expire), for things like a CDN origin " +
+				"or a bucket sync. Only if the person who owns you is allowed by a supervisor. You never receive the key: the answer is a " +
+				"console link. Give it to the user; they open it, check it and create the key themselves.",
+			InputSchema: schema([]string{"cloud_account_id", "resource", "permission", "reason"}, map[string]any{
+				"cloud_account_id": str("Cloud account ID, from list_accounts."),
+				"resource":         str("Resource type, from list_accounts."),
+				"permission":       map[string]any{"type": "string", "enum": []string{"read", "write", "full"}},
+				"resource_name":    str("Optional: one resource (bucket, instance ID, domain). Omit for all of that type."),
+				"reason":           str("What the key is for. Shown to the person who creates it."),
+			}),
+		},
+		{
 			Name:        "revoke",
 			Description: s.RevokeDescription,
 			InputSchema: schema([]string{"request_id"}, map[string]any{
@@ -370,6 +383,19 @@ func (s *Server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			return "", err
 		}
 		return ToJSON(out), nil
+
+	case "request_long_lived_credential":
+		in := model.LongLivedRequestInput{CloudAccountID: getStr("cloud_account_id"), Resource: getStr("resource"),
+			Permission: getStr("permission"), ResourceName: getStr("resource_name"), Reason: getStr("reason")}
+		var out model.LongLivedRequestResult
+		if err := s.Backend.Call(ctx, "POST", apiPrefix+"/agent/long-lived", in, &out); err != nil {
+			return "", err
+		}
+		return ToJSON(map[string]any{
+			"id": out.ID, "status": out.Status, "link": out.Link, "link_expires_at": out.ExpiresAt.UTC().Format(time.RFC3339),
+			"next": "Give the user this link. They open it signed in to the Cloud Safeguard console, check it and create the key; " +
+				"the secret is shown only to them. You will not receive it.",
+		}), nil
 
 	case "refresh_credential":
 		id, err := requestID()

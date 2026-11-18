@@ -268,6 +268,24 @@ func (h *handler) authenticate(r *http.Request) (*authContext, *cloudError) {
 		}
 	}
 
+	// 4a. A long-lived credential (CONTRACT §17.14) works while it is active.
+	if strings.HasPrefix(payload.LeaseID, "llc_") {
+		llc, err := h.store.GetLongLived(r.Context(), payload.LeaseID)
+		if err != nil || llc.ProviderID != payload.ProviderID || llc.Status != model.LongLivedActive {
+			return nil, &cloudError{
+				status:  http.StatusUnauthorized,
+				code:    "InvalidAccessKeyId.Inactive",
+				message: "The access key has been deleted",
+			}
+		}
+		doc, err := parsePolicyDoc(payload.Policy)
+		if err != nil {
+			return nil, &cloudError{status: http.StatusUnauthorized, code: "InvalidSecurityToken", message: "The key carries an invalid policy"}
+		}
+		return &authContext{lease: model.Lease{ID: llc.ID, ProviderID: llc.ProviderID, AgentID: llc.AgentID},
+			payload: payload, policy: doc, cloud: prov.Type}, nil
+	}
+
 	// 4. Lease must still be active and unexpired (immediate revocation).
 	lease, err := h.store.GetLease(r.Context(), payload.LeaseID)
 	if err != nil {

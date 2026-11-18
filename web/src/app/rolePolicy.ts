@@ -86,3 +86,34 @@ export const awsRolePermissions = () => json({
     { Effect: 'Deny', Action: ['iam:*', 'organizations:*', 'sts:AssumeRole'], Resource: '*' },
   ],
 })
+
+// ---- long-lived keys (CONTRACT §17.14): a second key per account ----
+
+/** AWS: may only manage csg users, and only with the fixed boundary. */
+export const awsUserAdminPolicy = (accountId: string) => json({
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow', Action: 'iam:CreateUser', Resource: `arn:aws:iam::${accountId}:user/csg/*`,
+      Condition: { StringEquals: { 'iam:PermissionsBoundary': `arn:aws:iam::${accountId}:policy/cloud-safeguard-boundary` } },
+    },
+    {
+      Effect: 'Allow',
+      Action: ['iam:PutUserPolicy', 'iam:DeleteUserPolicy', 'iam:CreateAccessKey', 'iam:DeleteAccessKey', 'iam:DeleteUser'],
+      Resource: `arn:aws:iam::${accountId}:user/csg/*`,
+    },
+  ],
+})
+
+/** Alibaba Cloud: may only manage users and policies named csg-*. */
+export const userAdminPolicy = (accountId: string) => json({
+  Version: '1',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Action: ['ram:CreateUser', 'ram:DeleteUser', 'ram:CreateAccessKey', 'ram:DeleteAccessKey', 'ram:AttachPolicyToUser', 'ram:DetachPolicyFromUser'],
+      Resource: `acs:ram::${accountId}:user/csg-*`,
+    },
+    { Effect: 'Allow', Action: ['ram:CreatePolicy', 'ram:DeletePolicy', 'ram:AttachPolicyToUser', 'ram:DetachPolicyFromUser'], Resource: `acs:ram::${accountId}:policy/csg-*` },
+  ],
+})

@@ -28,7 +28,7 @@ const (
 
 // CurrentSchemaVersion is the schema version this binary writes and expects.
 // It is exported because the bootstrap path records it in the meta table.
-const CurrentSchemaVersion = 11
+const CurrentSchemaVersion = 12
 
 // migration is one ordered schema step. Migration index i moves the schema
 // from version i to i+1.
@@ -321,6 +321,34 @@ var migrations = []migration{
 		},
 		transform: migrateAccountModes,
 	},
+	{ // version 11 -> 12: long-lived credentials (CONTRACT §17.14)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS long_lived_credentials (
+				id             TEXT PRIMARY KEY,
+				link_hash      TEXT NOT NULL UNIQUE,
+				provider_id    TEXT NOT NULL,
+				owner_id       TEXT NOT NULL,
+				agent_id       TEXT NOT NULL DEFAULT '',
+				agent_name     TEXT NOT NULL DEFAULT '',
+				capability_id  TEXT NOT NULL,
+				resource_name  TEXT NOT NULL,
+				reason         TEXT NOT NULL DEFAULT '',
+				status         TEXT NOT NULL,
+				cloud_user     TEXT NOT NULL DEFAULT '',
+				cloud_policy   TEXT NOT NULL DEFAULT '',
+				access_key_id  TEXT NOT NULL DEFAULT '',
+				failure_reason TEXT NOT NULL DEFAULT '',
+				revoke_reason  TEXT NOT NULL DEFAULT '',
+				created_at     INTEGER NOT NULL,
+				expires_at     INTEGER NOT NULL,
+				decided_at     INTEGER,
+				revoked_at     INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_long_lived_owner ON long_lived_credentials(owner_id, status)`,
+			`CREATE INDEX IF NOT EXISTS idx_long_lived_provider ON long_lived_credentials(provider_id, status)`,
+		},
+		transform: addLongLivedColumns,
+	},
 }
 
 // tableColumns returns the names of a table's columns.
@@ -339,6 +367,37 @@ func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]boo
 		have[name] = true
 	}
 	return have, rows.Err()
+}
+
+// addLongLivedColumns adds the person flag and the second provider key of
+// schema 12 where they are missing.
+func addLongLivedColumns(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	for _, t := range []struct {
+		table string
+		cols  []struct{ name, ddl string }
+	}{
+		{"persons", []struct{ name, ddl string }{
+			{"long_lived", `ALTER TABLE persons ADD COLUMN long_lived INTEGER NOT NULL DEFAULT 0`},
+		}},
+		{"providers", []struct{ name, ddl string }{
+			{"user_admin_credential", `ALTER TABLE providers ADD COLUMN user_admin_credential TEXT NOT NULL DEFAULT ''`},
+			{"user_admin_key_masked", `ALTER TABLE providers ADD COLUMN user_admin_key_masked TEXT NOT NULL DEFAULT ''`},
+		}},
+	} {
+		have, err := tableColumns(ctx, tx, t.table)
+		if err != nil {
+			return err
+		}
+		for _, c := range t.cols {
+			if have[c.name] {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, c.ddl); err != nil {
+				return fmt.Errorf("store: add %s.%s: %w", t.table, c.name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // migrateAccountModes adds the refresh columns of leases and turns each

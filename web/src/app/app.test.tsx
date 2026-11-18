@@ -8,6 +8,7 @@ import { InboxPage } from './pages/Inbox'
 import { PeoplePage } from './pages/People'
 import { AccountsPage } from './pages/Accounts'
 import { AddAccountPage } from './pages/AddAccount'
+import { LongLivedConfirmPage } from './pages/LongLived'
 import { SignInApprovalPage } from './pages/SignInApproval'
 import { rememberSignIn, takeSignIn } from './App'
 import { CLISignInApprovalPage } from './pages/CLISignInApproval'
@@ -184,6 +185,40 @@ describe('add an AWS account', () => {
     expect(sent.type).toBe('aws')
     expect(sent.role_arn).toBe('arn:aws:iam::123456789012:role/cloud-safeguard')
     expect(sent.region).toBe('eu-west-1')
+  })
+})
+
+describe('long-lived key', () => {
+  const req = {
+    id: 'llc_1', provider_id: 'prv_1', cloud_account_id: '123456789012', cloud_account_name: 'prod', provider_type: 'aws',
+    owner_id: 'per_1', agent_id: 'agt_1', agent_name: 'claude-code', resource: 's3', permission: 'read', resource_name: 'claudecode',
+    reason: 'CDN origin', status: 'pending', created_at: new Date().toISOString(), expires_at: new Date(Date.now() + 3600_000).toISOString(),
+  }
+
+  it('creates only after confirming, and shows the secret once', async () => {
+    routes['GET /me/long-lived-requests/KEY'] = req
+    routes['POST /me/long-lived-requests/KEY/create'] = {
+      credential: { ...req, status: 'active', cloud_user: 'csg-1' }, access_key_id: 'AKIALONG', access_key_secret: 'the-secret',
+      env: [{ name: 'AWS_ACCESS_KEY_ID', value: 'AKIALONG' }, { name: 'AWS_SECRET_ACCESS_KEY', value: 'the-secret' }],
+    }
+    wrap(<LongLivedConfirmPage code="KEY" />)
+    const create = await screen.findByRole('button', { name: 'Create key' })
+    await screen.findByText('claude-code')
+    expect((create as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.click(create)
+    await screen.findByText('Long-lived key created')
+    expect(screen.getByLabelText('Secret').textContent).toBe('the-secret')
+    expect(changes().map((c) => c.method + ' ' + c.path)).toEqual(['POST /me/long-lived-requests/KEY/create'])
+  })
+
+  it('declines without creating', async () => {
+    routes['GET /me/long-lived-requests/KEY'] = req
+    routes['POST /me/long-lived-requests/KEY/deny'] = { ...req, status: 'denied' }
+    wrap(<LongLivedConfirmPage code="KEY" />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Decline' }))
+    await screen.findByText('Nothing was created.')
+    expect(changes().map((c) => c.path)).toEqual(['/me/long-lived-requests/KEY/deny'])
   })
 })
 

@@ -66,6 +66,12 @@ Prints the response body; exits 1 on HTTP >= 400.
 	if mockToken == "" {
 		mockToken = strings.TrimSpace(a.Getenv("AWS_SESSION_TOKEN"))
 	}
+	// A long-lived mock key has no session token: its secret is the token.
+	for _, name := range []string{"ALIBABA_CLOUD_ACCESS_KEY_SECRET", "AWS_SECRET_ACCESS_KEY"} {
+		if mockToken == "" {
+			mockToken = strings.TrimSpace(a.Getenv(name))
+		}
+	}
 	if mockToken == "" {
 		return usagef("ALIBABA_CLOUD_SECURITY_TOKEN or AWS_SESSION_TOKEN is not set: fetch a lease credential first (csg credential --lease ID --export)")
 	}
