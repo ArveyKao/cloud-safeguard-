@@ -120,7 +120,7 @@ tells you which test resources exist.
 
 - SECURITY, API, ARCHITECTURE, SPEC, DECISIONS and PRODUCT still describe v0.1 and say so at
   the top.
-- AWS and GCP are not supported.
+- AWS is supported with S3 only, in the standard partition, and tested in mock mode and against a fake STS, not live AWS. GCP is not supported.
 - The console has no button for the supervisor's emergency stop (it is in the API).
 
 ## Reporting

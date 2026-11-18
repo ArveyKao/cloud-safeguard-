@@ -22,7 +22,7 @@ const DenyStatement = `{"Effect":"Deny","Action":["ram:*","sts:AssumeRole*"],"Re
 // AWSDenyStatement is the same deny for AWS (CONTRACT §17.13): IAM, the
 // account's organization and identity center, and every way of getting
 // other credentials from STS.
-const AWSDenyStatement = `{"Effect":"Deny","Action":["iam:*","organizations:*","sso:*","sso-directory:*","identitystore:*","sts:AssumeRole*","sts:GetFederationToken","sts:GetSessionToken"],"Resource":"*"}`
+const AWSDenyStatement = `{"Effect":"Deny","Action":["iam:*","organizations:*","account:*","sso:*","sso-directory:*","sso-oauth:*","identitystore:*","signin:*","sts:AssumeRole*","sts:GetFederationToken","sts:GetSessionToken","sts:GetServiceBearerToken"],"Resource":"*"}`
 
 // DenyStatementFor is the deny statement appended for a provider type.
 func DenyStatementFor(provider model.ProviderType) string {
@@ -42,7 +42,8 @@ const (
 // cloud: no capability may allow any of their actions, whatever the cloud
 // of the capability.
 var identityServices = map[string]bool{
-	"ram": true, "iam": true, "organizations": true, "sso": true, "sso-directory": true, "identitystore": true,
+	"ram": true, "iam": true, "organizations": true, "account": true, "sso": true, "sso-directory": true, "sso-oauth": true,
+	"identitystore": true, "signin": true,
 }
 
 // stsReadAction is the single STS action any capability may allow.

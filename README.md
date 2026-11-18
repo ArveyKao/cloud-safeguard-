@@ -295,8 +295,9 @@ Current boundaries:
 - **No independent security audit, and no live-cloud run yet.** `sts` mode is implemented
   and unit-tested against a fake STS endpoint only.
 
-Roadmap: next, a live Alibaba
-Cloud test and a check with real MCP clients (Claude, Cursor); then AWS and GCP, SSO, chat approvals and a credential-free proxy mode.
+Roadmap: next, long-lived credentials for supervisors and people they allow (CONTRACT
+§17.14), live Alibaba Cloud and AWS tests, more AWS resource types; then GCP, SSO, chat
+approvals and a credential-free proxy mode.
 
 ## Documentation
 

@@ -90,12 +90,17 @@ type awsSigner struct {
 	accessKeyID, secretAccessKey, sessionToken string
 }
 
+// region is the account's region, or the default. A malformed one is
+// refused by awsEndpoint: it would become part of a host name.
 func region(p model.Provider) string {
 	if p.Region == "" {
 		return AWSDefaultRegion
 	}
 	return p.Region
 }
+
+// errBadRegion is returned for a region that is not a region name.
+var errBadRegion = errors.New("provider aws: the region is not a region name such as us-east-1")
 
 // Mint implements Minter for AWS.
 func (awsMinter) Mint(ctx context.Context, req MintRequest) (model.Credential, error) {
@@ -114,6 +119,9 @@ func (awsMinter) Mint(ctx context.Context, req MintRequest) (model.Credential, e
 	}
 	if !json.Valid(req.PolicyJSON) {
 		return model.Credential{}, fmt.Errorf("provider aws: policy is not valid JSON")
+	}
+	if !model.ValidRegion(model.ProviderAWS, region(req.Provider)) {
+		return model.Credential{}, errBadRegion
 	}
 	policy := compactJSON(req.PolicyJSON)
 	if len(policy) > AWSMaxPolicyLength {
@@ -166,9 +174,13 @@ func assumeAWSRole(ctx context.Context, signer awsSigner, p model.Provider, sess
 // awsConnectionTestPolicy lets the test's credential only ask who it is.
 const awsConnectionTestPolicy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:GetCallerIdentity","Resource":"*"}]}`
 
-// awsIAMProbePolicy lets the probe credential read one harmless IAM summary.
-// If that call succeeds, the role itself allows IAM, which it should not.
-const awsIAMProbePolicy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:GetAccountSummary","Resource":"*"}]}`
+// awsIAMProbeActions are harmless IAM reads. The probe credential may only
+// call these; if any succeeds, the role itself allows IAM, which it should
+// not.
+var awsIAMProbeActions = []string{"GetAccountSummary", "ListUsers", "ListRoles", "ListPolicies"}
+
+// awsIAMProbePolicy lets the probe credential make only those reads.
+const awsIAMProbePolicy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:GetAccountSummary","iam:ListUsers","iam:ListRoles","iam:ListPolicies"],"Resource":"*"}]}`
 
 // Test implements Minter for AWS: the broker key is valid
 // (GetCallerIdentity), it can assume the role, and the role does not allow
@@ -183,6 +195,9 @@ func (awsMinter) Test(ctx context.Context, req MintRequest) error {
 	if req.Provider.RoleARN == "" {
 		return fmt.Errorf("provider aws: role ARN is required")
 	}
+	if !model.ValidRegion(model.ProviderAWS, region(req.Provider)) {
+		return errBadRegion
+	}
 	broker := awsSigner{accessKeyID: req.BrokerAccessKeyID, secretAccessKey: req.BrokerAccessKeySecret}
 	identity := url.Values{"Action": {"GetCallerIdentity"}, "Version": {awsSTSVersion}}
 	if _, err := callAWS(ctx, broker, awsSTSEndpoint(region(req.Provider)), region(req.Provider), "sts", identity); err != nil {
@@ -193,13 +208,20 @@ func (awsMinter) Test(ctx context.Context, req MintRequest) error {
 	}
 	probe, err := assumeAWSRole(ctx, broker, req.Provider, "csg-iam-check", AWSMinDuration, awsIAMProbePolicy)
 	if err != nil {
-		return nil // the role can be assumed; the check itself could not run
+		return &TestWarning{Message: "the connection works, but whether the role allows IAM could not be checked: " + err.Error()}
 	}
 	signer := awsSigner{accessKeyID: probe.AccessKeyID, secretAccessKey: probe.SecretAccessKey, sessionToken: probe.SessionToken}
-	summary := url.Values{"Action": {"GetAccountSummary"}, "Version": {awsIAMVersion}}
-	if _, err := callAWS(ctx, signer, awsIAMEndpoint, awsIAMSignature, "iam", summary); err == nil {
-		return &TestWarning{Message: "the connection works, but the role " + req.Provider.RoleARN +
-			" allows IAM (iam:GetAccountSummary succeeded): remove IAM from the role's permissions"}
+	for _, action := range awsIAMProbeActions {
+		_, err := callAWS(ctx, signer, awsIAMEndpoint, awsIAMSignature, "iam", url.Values{"Action": {action}, "Version": {awsIAMVersion}})
+		if err == nil {
+			return &TestWarning{Message: "the connection works, but the role " + req.Provider.RoleARN +
+				" allows IAM (iam:" + action + " succeeded): remove IAM from the role's permissions"}
+		}
+		// Only a refusal says the role denies it; anything else means the
+		// check could not run.
+		if !strings.HasPrefix(err.Error(), "AccessDenied") {
+			return &TestWarning{Message: "the connection works, but whether the role allows IAM could not be checked: " + err.Error()}
+		}
 	}
 	return nil
 }

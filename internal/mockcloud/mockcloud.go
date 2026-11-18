@@ -60,6 +60,7 @@ type authContext struct {
 	payload   provider.MockTokenPayload
 	policy    policyDoc
 	agentName string
+	cloud     model.ProviderType
 }
 
 // cloudError is an Aliyun-shaped API error.
@@ -189,6 +190,16 @@ func (h *handler) wrap(rt route) http.HandlerFunc {
 			return
 		}
 
+		// A route belongs to one cloud: an Alibaba Cloud token never reaches
+		// S3 or IAM, an AWS token never reaches ECS, DNS or RAM, whatever its
+		// policy says.
+		if routeCloud(rt.service) != ac.cloud {
+			cerr := &cloudError{status: http.StatusUnauthorized, code: "InvalidSecurityToken",
+				message: "The security token is not valid for this service"}
+			h.auditAPIDenied(reqID, rt, cerr)
+			writeCloudError(w, reqID, cerr)
+			return
+		}
 		resource := rt.resource(r, ac)
 		if !policyAllows(ac.policy, rt.action, resource) {
 			cerr := &cloudError{
@@ -307,7 +318,7 @@ func (h *handler) authenticate(r *http.Request) (*authContext, *cloudError) {
 		}
 	}
 
-	ac := &authContext{lease: lease, payload: payload, policy: doc}
+	ac := &authContext{lease: lease, payload: payload, policy: doc, cloud: prov.Type}
 	if agent, err := h.store.GetAgent(r.Context(), lease.AgentID); err == nil {
 		ac.agentName = agent.Name
 	}

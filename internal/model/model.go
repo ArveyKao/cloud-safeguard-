@@ -503,8 +503,9 @@ type EnvVar struct {
 // to know how to convert credentials themselves.
 type CredentialEnvelope struct {
 	Credential Credential `json:"credential"`
-	// Env contains ALIBABA_CLOUD_ACCESS_KEY_ID, ALIBABA_CLOUD_ACCESS_KEY_SECRET,
-	// ALIBABA_CLOUD_SECURITY_TOKEN, plus CSG_LEASE_ID / CSG_SERVER.
+	// Env contains the cloud's credential variables (ALIBABA_CLOUD_* for
+	// Alibaba Cloud, AWS_* for AWS) plus CSG_LEASE_ID / CSG_SERVER /
+	// CSG_CAPABILITY.
 	Env []EnvVar `json:"env"`
 }
 
@@ -659,6 +660,34 @@ func CloudAccountIDFromRoleARN(t ProviderType, roleARN string) string {
 		return m[1]
 	}
 	return ""
+}
+
+// awsRegion and aliyunRegion are the shapes of region names. A region ends up
+// in an endpoint host name and in AWS_REGION, so nothing else is accepted:
+// no dots, slashes, colons or at signs.
+var (
+	awsRegion    = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$`)
+	aliyunRegion = regexp.MustCompile(`^[a-z]{2}-[a-z0-9]+(-[a-z0-9]+){0,3}$`)
+)
+
+// ValidRegion reports whether region is a well-formed region name of the
+// provider type (for example us-east-1, cn-hangzhou).
+func ValidRegion(t ProviderType, region string) bool {
+	if len(region) > 40 {
+		return false
+	}
+	if t == ProviderAWS {
+		return awsRegion.MatchString(region)
+	}
+	return aliyunRegion.MatchString(region)
+}
+
+// RegionExample is an example region of a provider type, for messages.
+func RegionExample(t ProviderType) string {
+	if t == ProviderAWS {
+		return "us-east-1"
+	}
+	return "cn-hangzhou"
 }
 
 // RoleARNExample is an example role ARN of a provider type, for messages.

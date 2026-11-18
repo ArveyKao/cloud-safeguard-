@@ -95,7 +95,9 @@ the master key.
 
 Credential envelope env vars (exact, in this order): `ALIBABA_CLOUD_ACCESS_KEY_ID`,
 `ALIBABA_CLOUD_ACCESS_KEY_SECRET`, `ALIBABA_CLOUD_SECURITY_TOKEN`, `CSG_LEASE_ID`,
-`CSG_SERVER` (base URL of the control plane), `CSG_CAPABILITY` (capability id).
+`CSG_SERVER` (base URL of the control plane), `CSG_CAPABILITY` (capability id). For an AWS
+request (§17.13) the first three are instead `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, followed by `AWS_REGION` and `AWS_DEFAULT_REGION`.
 
 ## 4. Admin API (`/api/v1/admin`, bearer = admin token)
 
@@ -873,7 +875,8 @@ each part. This section is the running behaviour. Rationale: ADR-015.
 - Templates are defined in code (`internal/capcatalog/access.go`), not stored, and cannot be
   created or edited through any API. Their IDs have the reserved form
   `<cloud>.access.<resource>.<permission>` (for example `aliyun.access.ecs.write`); a stored
-  capability may not use such an ID. Resource types today: `ecs`, `dns`, `oss`.
+  capability may not use such an ID. Resource types today: `ecs`, `dns`, `oss` on Alibaba
+  Cloud, `s3` on AWS (§17.13).
 - `resource_name` names one resource (an instance ID, a domain, a bucket), is at most 253
   characters and is validated against the resource type's pattern. Left out, the request
   covers all resources of that type in the account. Wildcards inside a name are refused.
@@ -884,7 +887,8 @@ each part. This section is the running behaviour. Rationale: ADR-015.
   Requests waiting for approval count towards the agent's limit on active credentials, and
   the limit is checked again at approval.
 - `cloud_account_id` is taken from the provider's role ARN when the provider is created, is
-  unique, and never changes: a provider's role ARN may only be replaced by one in the same
+  unique across clouds (agents name an account by it alone, so an Alibaba Cloud UID and an
+  AWS account ID that happen to be equal cannot both be connected), and never changes: a provider's role ARN may only be replaced by one in the same
   cloud account, so role bindings can never move to another account.
 - An unknown cloud account and one the owner has no role on get the same 403. Malformed
   requests are 400 and leave no record.
@@ -1219,7 +1223,9 @@ returns a **one-time link** instead of the secret:
 - the link is `<origin>/api/v1/credential-links/{token}`, valid for 60 seconds, usable once,
   with `POST` only (so a link preview cannot use it up);
 - using it returns shell `export` lines (`ALIBABA_CLOUD_ACCESS_KEY_ID`, `…_SECRET`,
-  `…_SECURITY_TOKEN`, `CSG_LEASE_ID`, `CSG_SERVER`, `CSG_CAPABILITY`, values single-quoted)
+  `…_SECURITY_TOKEN`, or for AWS `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`; then `CSG_LEASE_ID`, `CSG_SERVER`,
+  `CSG_CAPABILITY`, values single-quoted)
   and an `echo` to stderr saying until when it is valid, with `Cache-Control: no-store`; the
   tool tells the agent to run `eval "$(curl -fsS -X POST '<link>')"` (the link shell-quoted) in the shell that runs
   the cloud command, so the secret goes into that shell, not into the conversation; a link
@@ -1301,26 +1307,39 @@ one rule per cloud account, which only that person sets.
   keeps it in step with the templates. Not `AdministratorAccess` or `PowerUserAccess`: the
   broker key could reach everything they allow. The connection test calls
   `GetCallerIdentity`, assumes the role once with a policy that allows nothing useful, and
-  once more with a policy that allows only `iam:GetAccountSummary`; if that call succeeds,
-  the role allows IAM and the test passes with a warning (`warning` in the result, audited).
+  once more with a policy that allows only four harmless IAM reads (`GetAccountSummary`,
+  `ListUsers`, `ListRoles`, `ListPolicies`); if any succeeds, the role allows IAM and the test
+  passes with a warning (`warning` in the result, audited). If the check cannot run, the
+  test passes with a warning that says so.
 - First resource type: `s3` (bucket; objects are items). `resource_name` is the bucket name
-  (3-63 lowercase letters, digits, dots and dashes). read = `s3:Get*`, `s3:List*`; write adds
+  (3-63 lowercase letters, digits, dots and dashes). read = `s3:GetObject`,
+  `s3:GetObjectVersion`, `s3:GetBucketLocation`, `s3:ListBucket`, `s3:ListBucketVersions`,
+  `s3:ListBucketMultipartUploads`, `s3:ListMultipartUploadParts` (listed, not `s3:Get*`,
+  which would also read bucket policies and ACLs); write adds
   `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload`; full adds `s3:CreateBucket`,
-  `s3:DeleteBucket`. Bucket policies, ACLs and ownership are in no template.
+  `s3:DeleteBucket`. Reading or writing bucket policies, ACLs and ownership is in no template,
+  and a template may allow only the actions its resource type declares.
 - Policies use version `2012-10-17` and the resources `arn:aws:s3:::BUCKET` and
   `arn:aws:s3:::BUCKET/*`. Every session policy also carries
-  `{"Effect":"Deny","Action":["iam:*","organizations:*","sso:*","sso-directory:*","identitystore:*","sts:AssumeRole*","sts:GetFederationToken","sts:GetSessionToken"],"Resource":"*"}`,
-  and the IAM guard refuses the identity services of every cloud (RAM, IAM, Organizations,
-  Identity Center) in any capability.
+  `{"Effect":"Deny","Action":["iam:*","organizations:*","account:*","sso:*","sso-directory:*","sso-oauth:*","identitystore:*","signin:*","sts:AssumeRole*","sts:GetFederationToken","sts:GetSessionToken","sts:GetServiceBearerToken"],"Resource":"*"}`,
+  and the IAM guard refuses those identity and account services of every cloud (and RAM) in
+  any capability.
+- The region must be a region name (`^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$`, such as `eu-west-1`;
+  Alibaba Cloud regions have their own shape, such as `cn-hangzhou`): it becomes part of the
+  STS host name and of `AWS_REGION`. Only the standard partition (`arn:aws:`) is supported;
+  `aws-cn` and `aws-us-gov` are refused.
 - STS is called at the account's region (`sts.REGION.amazonaws.com`, `us-east-1` by default),
   signed with Signature Version 4; validity 900 s to the role's maximum session duration.
   The account ID is the 12 digits of the role ARN (`arn:aws:iam::ACCOUNT:role/NAME`).
 - The credential is handed over as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
   `AWS_SESSION_TOKEN`, `AWS_REGION` and `AWS_DEFAULT_REGION` (plus `CSG_*`), in the
   envelope, `--export`, `csg exec`, the MCP credential file and the one-time link.
+- `csg exec` never passes the parent shell's own cloud variables (`AWS_*`, `ALIBABA_CLOUD_*`,
+  `ALICLOUD_*`, `ALIYUN_*`, `CSG_*`) to the command: only the request's credential.
 - Mock mode: the mock cloud serves `GET /v1/s3/buckets/{bucket}/objects`, `GET|PUT|DELETE
   /v1/s3/buckets/{bucket}/objects/{key}` and `GET /v1/iam/users` (always refused), with the
-  fixture bucket `claudecode`.
+  fixture bucket `claudecode`. Its S3 and IAM routes accept only tokens of AWS accounts, and
+  its ECS, DNS and RAM routes only tokens of Alibaba Cloud accounts.
 - The broker identity may later come from the platform instead of a stored key (instance
   role, OIDC federation); the agent side does not change.
 

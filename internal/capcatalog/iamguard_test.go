@@ -481,7 +481,8 @@ func TestRejectDuplicateKeysUsesUnicodeFolding(t *testing.T) {
 // capability (CONTRACT §17.13), and every AWS template carries the AWS deny.
 func TestAWSIdentityServicesAreRefused(t *testing.T) {
 	for _, action := range []string{"iam:PassRole", "iam:*", "IAM:CreateUser", "organizations:ListAccounts", "sso:CreatePermissionSet",
-		"sso-directory:CreateUser", "identitystore:CreateUser", "sts:AssumeRole", "sts:GetFederationToken"} {
+		"sso-directory:CreateUser", "identitystore:CreateUser", "sso-oauth:CreateToken", "account:CloseAccount", "signin:CreateTrustedIdentityPropagationApplicationForConsole",
+		"sts:AssumeRole", "sts:GetFederationToken", "sts:GetServiceBearerToken"} {
 		doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["` + action + `"],"Resource":["*"]}]}`
 		for _, access := range []model.AccessLevel{model.AccessRead, model.AccessWrite, model.AccessAdmin} {
 			if err := CheckPolicy(access, []byte(doc)); err == nil {

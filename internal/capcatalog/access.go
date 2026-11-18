@@ -162,9 +162,12 @@ var resourceSpecs = []resourceSpec{
 		resources:   []string{"arn:aws:s3:::{{resource_name}}", "arn:aws:s3:::{{resource_name}}/*"},
 		namePattern: `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`,
 		nameHint:    "a bucket name such as claudecode",
-		read:        []string{"s3:Get*", "s3:List*"},
-		// Bucket policies, ACLs and ownership are deliberately absent: they
-		// can open a bucket to other accounts or to everyone.
+		// Listed one by one, not s3:Get* / s3:List*: those include reading
+		// bucket policies, ACLs, ownership and replication settings, which
+		// say who else can reach the bucket. Writing those is in no template
+		// either: it can open a bucket to other accounts or to everyone.
+		read: []string{"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket",
+			"s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts"},
 		write: []string{"s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
 		full:  []string{"s3:CreateBucket", "s3:DeleteBucket"},
 	},
@@ -336,9 +339,15 @@ func CheckAccessTemplateLevel(t AccessTemplate, policy []byte) error {
 		return fmt.Errorf("access template %s: %v", t.Capability.ID, err)
 	}
 	service := ""
+	declared := map[string]bool{}
 	for _, spec := range resourceSpecs {
 		if accessTemplateID(spec.provider, spec.resource, t.Permission) == t.Capability.ID {
 			service = spec.service
+			for _, list := range [][]string{spec.read, spec.write, spec.full} {
+				for _, action := range list {
+					declared[action] = true
+				}
+			}
 		}
 	}
 	if service == "" {
@@ -359,6 +368,9 @@ func CheckAccessTemplateLevel(t AccessTemplate, policy []byte) error {
 		for _, action := range actions {
 			if !strings.HasPrefix(action, service+":") {
 				return fmt.Errorf("access template %s allows %q outside service %q", t.Capability.ID, action, service)
+			}
+			if !declared[action] {
+				return fmt.Errorf("access template %s allows %q, which its resource type does not declare", t.Capability.ID, action)
 			}
 			if need := classifyAction(action); need.Rank() > t.Permission.Rank() {
 				return fmt.Errorf("access template %s (%s) allows %q, which needs %s",

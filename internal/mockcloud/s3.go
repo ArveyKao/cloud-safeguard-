@@ -2,6 +2,8 @@ package mockcloud
 
 import (
 	"net/http"
+
+	"github.com/arveykao/cloud-safeguard/internal/model"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +37,14 @@ func newS3State() *s3State {
 		},
 		"other-team-bucket": {"secret.txt": "not yours\n"},
 	}}
+}
+
+// routeCloud is the cloud a route's service belongs to.
+func routeCloud(service string) model.ProviderType {
+	if service == s3Service || service == iamService {
+		return model.ProviderAWS
+	}
+	return model.ProviderAliyun
 }
 
 func s3BucketARN(r *http.Request) string { return "arn:aws:s3:::" + r.PathValue("bucket") }

@@ -54,6 +54,10 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, "region is required")
 		return
 	}
+	if !model.ValidRegion(in.Type, in.Region) {
+		s.badRequest(w, "region must be a region name such as "+model.RegionExample(in.Type))
+		return
+	}
 	switch in.Mode {
 	case model.ModeSTS:
 		if strings.TrimSpace(in.AccessKeyID) == "" || strings.TrimSpace(in.AccessKeySecret) == "" || in.RoleARN == "" {
@@ -129,7 +133,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.CreateProvider(r.Context(), prov, encrypted); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			s.writeError(w, http.StatusConflict, model.ErrCodeConflict,
-				"cloud account "+prov.CloudAccountID+" is already connected")
+				"cloud account "+prov.CloudAccountID+" is already connected (account IDs are unique across Alibaba Cloud and AWS, since agents name an account by its ID alone)")
 			return
 		}
 		s.writeHandlerError(w, err)
@@ -220,6 +224,10 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		region := strings.TrimSpace(*in.Region)
 		if region == "" {
 			s.badRequest(w, "region must not be empty")
+			return
+		}
+		if !model.ValidRegion(prov.Type, region) {
+			s.badRequest(w, "region must be a region name such as "+model.RegionExample(prov.Type))
 			return
 		}
 		if prov.Region != region {

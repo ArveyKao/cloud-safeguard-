@@ -473,7 +473,9 @@ these with your 12-digit account ID filled in.
     {
       "Effect": "Allow",
       "Action": [
-        "s3:Get*", "s3:List*", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+        "s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions",
+        "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts",
+        "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
         "s3:CreateBucket", "s3:DeleteBucket",
         "sts:GetCallerIdentity"
       ],
@@ -489,7 +491,8 @@ reach everything they allow. The connection test warns when the role can use IAM
 
 Each request is one `AssumeRole` call to the region's STS endpoint with a session policy
 for that request (for example read on the bucket `claudecode` only), and every session
-policy also denies IAM, Organizations, Identity Center and any other STS credential. The
+policy also denies IAM, Organizations, account settings, Identity Center and the STS calls
+that hand out other credentials. Only the standard partition (`arn:aws:`) is supported. The
 credential arrives as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`
 (with `AWS_REGION`), which the AWS CLI and SDKs read; or use
 `credential_process = csg credential --lease ID --process aws` in `~/.aws/config`.

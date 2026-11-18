@@ -115,6 +115,13 @@ func TestAWSMockAccountEndToEnd(t *testing.T) {
 		}
 	}
 
+	// An AWS token never reaches the Alibaba Cloud routes, whatever its policy.
+	for _, path := range []string{"/v1/ecs/instances", "/v1/ram/users", "/v1/dns/zones"} {
+		if got := call(http.MethodGet, path, nil); got != http.StatusUnauthorized {
+			t.Errorf("AWS token on %s: %d", path, got)
+		}
+	}
+
 	// Write: objects in the bucket change; still no IAM.
 	writeRec := rawRequest(t, handler, http.MethodPost, "/api/v1/agent/access-requests", agentToken, model.AccessRequestInput{
 		CloudAccountID: "123456789012", Resource: "s3", Permission: "write", ResourceName: "claudecode", TTLSeconds: 600,
@@ -157,12 +164,14 @@ func TestAWSRequestPolicy(t *testing.T) {
 		t.Fatalf("request %+v", req)
 	}
 	policy := string(a.minter.lastRequest(t).PolicyJSON)
-	for _, want := range []string{`"Version":"2012-10-17"`, `"arn:aws:s3:::claudecode"`, `"arn:aws:s3:::claudecode/*"`, `"s3:Get*"`, `"iam:*"`, `"sts:AssumeRole*"`} {
+	for _, want := range []string{`"Version":"2012-10-17"`, `"arn:aws:s3:::claudecode"`, `"arn:aws:s3:::claudecode/*"`, `"s3:GetObject"`, `"s3:ListBucket"`, `"iam:*"`, `"sts:AssumeRole*"`} {
 		if !strings.Contains(policy, want) {
 			t.Errorf("policy lacks %s: %s", want, policy)
 		}
 	}
-	if strings.Contains(policy, "PutObject") || strings.Contains(policy, "ram:") {
+	// No wildcard that would include bucket policies, ACLs or ownership.
+	if strings.Contains(policy, "PutObject") || strings.Contains(policy, "ram:") || strings.Contains(policy, `"s3:Get*"`) ||
+		strings.Contains(policy, `"s3:List*"`) || strings.Contains(policy, "Policy\"") || strings.Contains(policy, "Acl") {
 		t.Errorf("policy: %s", policy)
 	}
 	// A bucket name that is not one: refused before anything is minted.
@@ -188,5 +197,50 @@ func TestConnectionTestWarning(t *testing.T) {
 	out = decodeEnvelope[providerTestResult](t, a.sup.do(http.MethodPost, supAccounts+"/"+a.providerID+"/test", nil))
 	if out.OK || out.Warning != "" {
 		t.Fatalf("failed test %+v", out)
+	}
+}
+
+// Regions and role ARNs are checked: a region becomes part of an endpoint
+// host name and of AWS_REGION; only the standard partition is supported.
+func TestAWSAccountInputChecks(t *testing.T) {
+	a := newAccessEnv(t, model.RoleAdministrator)
+	base := model.CreateProviderInput{Name: "aws", Type: model.ProviderAWS, Mode: model.ModeMock, Region: "eu-west-1",
+		RoleARN: "arn:aws:iam::123456789012:role/cloud-safeguard"}
+	for _, region := range []string{"evil.com/x", "us-east-1.attacker.com", "us-east-1.amazonaws.com@attacker", "US-EAST-1", "us east 1", "cn-hangzhou"} {
+		in := base
+		in.Region = region
+		if rec := a.sup.do(http.MethodPost, supAccounts, in); rec.Code != http.StatusBadRequest {
+			t.Errorf("region %q: %d", region, rec.Code)
+		}
+	}
+	for _, arn := range []string{"arn:aws-cn:iam::123456789012:role/x", "arn:aws-us-gov:iam::123456789012:role/x", "arn:aws:iam::12345678901:role/x"} {
+		in := base
+		in.RoleARN = arn
+		if rec := a.sup.do(http.MethodPost, supAccounts, in); rec.Code != http.StatusBadRequest {
+			t.Errorf("role ARN %q: %d", arn, rec.Code)
+		}
+	}
+	rec := a.sup.do(http.MethodPost, supAccounts, base)
+	requireStatus(t, rec, http.StatusCreated)
+	prov := decodeEnvelope[model.Provider](t, rec)
+	evil := "evil.com/x"
+	requireStatus(t, a.sup.do(http.MethodPatch, supAccounts+"/"+prov.ID, model.UpdateProviderInput{Region: &evil}), http.StatusBadRequest)
+	// Alibaba Cloud regions keep their own shape.
+	ali := newMockAccount("ali", "6543210987654321")
+	ali.Region = "cn-shanghai-finance-1"
+	requireStatus(t, a.sup.do(http.MethodPost, supAccounts, ali), http.StatusCreated)
+
+	// A region stored before these checks never reaches AWS_REGION.
+	requireStatus(t, a.sup.do(http.MethodPut, supAccounts+"/"+prov.ID+"/people/"+a.mei.person.ID,
+		model.PutBindingInput{Role: model.RoleGuest}), http.StatusOK)
+	req := a.request(model.AccessRequestInput{CloudAccountID: "123456789012", Resource: "s3", Permission: "read", TTLSeconds: 900})
+	if _, err := a.srv.db.SQL().Exec(`UPDATE providers SET region = 'evil.com/x' WHERE id = ?`, prov.ID); err != nil {
+		t.Fatal(err)
+	}
+	envelope := decodeEnvelope[model.CredentialEnvelope](t, a.credential(req.ID))
+	for _, kv := range envelope.Env {
+		if strings.HasPrefix(kv.Name, "ALIBABA") || kv.Name == "AWS_REGION" && kv.Value != provider.AWSDefaultRegion {
+			t.Fatalf("env %s=%s", kv.Name, kv.Value)
+		}
 	}
 }

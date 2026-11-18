@@ -129,6 +129,23 @@ func TestCredentialNamesFromTheServerAreFiltered(t *testing.T) {
 	if code != ExitOK || ta.out() != "[][][]" {
 		t.Fatalf("child env exit %d: %q", code, ta.out())
 	}
+
+	// Nor any long-lived cloud credential of the parent shell: only the
+	// short-lived one reaches the command.
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAPARENTLONGLIVED")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "parent-secret")
+	t.Setenv("AWS_PROFILE", "admin")
+	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "parent-aliyun-secret")
+	t.Setenv("ALICLOUD_ACCESS_KEY", "LTAIPARENT")
+	ta.stdout.Reset()
+	code = ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--", "sh", "-c",
+		`printf '[%s][%s][%s][%s][%s]' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_PROFILE" "$ALICLOUD_ACCESS_KEY" "$ALIBABA_CLOUD_ACCESS_KEY_ID"`)
+	if code != ExitOK || ta.out() != "[][][][][LTAI1234567890ABCD]" {
+		t.Fatalf("parent cloud credentials reached the child: exit %d %q", code, ta.out())
+	}
+	if out := ta.out(); strings.Contains(out, "parent") || strings.Contains(out, "PARENT") {
+		t.Fatal("a parent secret reached the child")
+	}
 }
 
 // An interrupted csg exec passes the signal on and revokes, even with --keep.

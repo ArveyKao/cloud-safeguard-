@@ -44,13 +44,20 @@ func safeCredentialEnv(envelope *model.CredentialEnvelope) []model.EnvVar {
 	return out
 }
 
-// childEnv is the parent environment without the CLI's own control token,
-// which is broader than the credential and must not reach the command.
+// inheritedCloudEnv matches the variables a child must not inherit: the
+// CLI's own token and every cloud credential or profile setting of the
+// parent (a long-lived key there could win over the short-lived one, or be
+// read by the command).
+var inheritedCloudEnv = regexp.MustCompile(`^(ALIBABA_CLOUD_|ALICLOUD_|ALIYUN_|AWS_|CSG_)`)
+
+// childEnv is the parent environment without the CLI's own control token
+// and without any cloud credential of the parent, then the credential's
+// own variables.
 func childEnv(extra []string) []string {
 	env := make([]string, 0, len(os.Environ())+len(extra))
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
-		if name == "CSG_TOKEN" {
+		if inheritedCloudEnv.MatchString(strings.ToUpper(name)) {
 			continue
 		}
 		env = append(env, kv)

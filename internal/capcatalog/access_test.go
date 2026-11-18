@@ -200,9 +200,9 @@ func TestAccessTemplateActionsAreExactlyAsReviewed(t *testing.T) {
 		"aliyun.access.oss.write": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
 		"aliyun.access.oss.full": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload",
 			"oss:PutBucket", "oss:DeleteBucket"},
-		"aws.access.s3.read":  {"s3:Get*", "s3:List*"},
-		"aws.access.s3.write": {"s3:Get*", "s3:List*", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
-		"aws.access.s3.full": {"s3:Get*", "s3:List*", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+		"aws.access.s3.read":  {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts"},
+		"aws.access.s3.write": {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
+		"aws.access.s3.full": {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
 			"s3:CreateBucket", "s3:DeleteBucket"},
 	}
 	if len(want) != len(accessTemplates) {
@@ -267,7 +267,7 @@ func TestDocumentedRolePolicyMatchesTheTemplates(t *testing.T) {
 	}{
 		{model.ProviderAliyun, "ecs:Describe*", regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram|s3|iam):[A-Za-z*]+)["']`),
 			regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']ram:\*["'],\s*["']sts:AssumeRole["']\]`)},
-		{model.ProviderAWS, "s3:Get*", regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram|s3|iam):[A-Za-z*]+)["']`),
+		{model.ProviderAWS, "s3:GetObject", regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram|s3|iam):[A-Za-z*]+)["']`),
 			regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']iam:\*["'],\s*["']organizations:\*["'],\s*["']sts:AssumeRole["']\]`)},
 	} {
 		want := map[string]bool{"sts:GetCallerIdentity": true} // the connection test
@@ -318,6 +318,18 @@ func TestDocumentedRolePolicyMatchesTheTemplates(t *testing.T) {
 			if !cloud.deny.MatchString(text) {
 				t.Errorf("%s: the %s role policy does not carry its deny", file, cloud.provider)
 			}
+		}
+	}
+}
+
+// The level check accepts only the actions a resource type declares: a
+// bucket policy or ACL action is refused even where its level would pass.
+func TestLevelCheckAcceptsOnlyDeclaredActions(t *testing.T) {
+	tpl, _ := LookupAccessTemplate(model.ProviderAWS, "s3", PermissionFull)
+	for _, action := range []string{"s3:GetBucketPolicy", "s3:GetBucketAcl", "s3:GetObjectAcl", "s3:PutBucketPolicy", "s3:Get*", "s3:PutBucketAcl"} {
+		doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["` + action + `"],"Resource":["*"]}]}`
+		if err := CheckAccessTemplateLevel(tpl, []byte(doc)); err == nil {
+			t.Errorf("level check accepted %s in the s3 full template", action)
 		}
 	}
 }

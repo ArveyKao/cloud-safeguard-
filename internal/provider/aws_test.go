@@ -37,7 +37,8 @@ type fakeAWS struct {
 	forms     []url.Values
 	headers   []http.Header
 	assumeErr string // an error code AssumeRole answers with
-	iamAllows bool   // whether GetAccountSummary succeeds
+	iamAllows string // the one IAM action the role allows, if any
+	iamBroken bool   // IAM answers with a server error
 }
 
 func (f *fakeAWS) serve(t *testing.T) *httptest.Server {
@@ -67,13 +68,17 @@ func (f *fakeAWS) serve(t *testing.T) *httptest.Server {
 			fmt.Fprintf(w, `<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>ASIATEMP%d</AccessKeyId>`+
 				`<SecretAccessKey>temp-secret</SecretAccessKey><SessionToken>temp-token</SessionToken><Expiration>%s</Expiration>`+
 				`</Credentials></AssumeRoleResult></AssumeRoleResponse>`, len(f.forms), exp)
-		case "GetAccountSummary":
+		case "GetAccountSummary", "ListUsers", "ListRoles", "ListPolicies":
 			if r.Header.Get("X-Amz-Security-Token") != "temp-token" {
 				w.WriteHeader(http.StatusForbidden)
 				fmt.Fprint(w, `<ErrorResponse><Error><Code>InvalidClientTokenId</Code></Error></ErrorResponse>`)
 				return
 			}
-			if !f.iamAllows {
+			if f.iamBroken {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if f.iamAllows != form.Get("Action") {
 				w.WriteHeader(http.StatusForbidden)
 				fmt.Fprint(w, `<ErrorResponse><Error><Code>AccessDenied</Code><Message>not authorized</Message></Error></ErrorResponse>`)
 				return
@@ -167,17 +172,37 @@ func TestAWSConnectionTest(t *testing.T) {
 	for _, form := range f.forms {
 		actions = append(actions, form.Get("Action"))
 	}
-	if strings.Join(actions, ",") != "GetCallerIdentity,AssumeRole,AssumeRole,GetAccountSummary" {
+	if strings.Join(actions, ",") != "GetCallerIdentity,AssumeRole,AssumeRole,GetAccountSummary,ListUsers,ListRoles,ListPolicies" {
 		t.Fatalf("calls %v", actions)
 	}
-	if !strings.Contains(f.forms[1].Get("Policy"), "sts:GetCallerIdentity") || !strings.Contains(f.forms[2].Get("Policy"), "iam:GetAccountSummary") {
+	if !strings.Contains(f.forms[1].Get("Policy"), "sts:GetCallerIdentity") || !strings.Contains(f.forms[2].Get("Policy"), "iam:ListUsers") ||
+		strings.Contains(f.forms[2].Get("Policy"), "iam:*") {
 		t.Fatal("probe policies are not the narrow ones")
 	}
-	// A role that allows IAM: passed, with a warning.
-	f.iamAllows = true
+	// A role that allows any of the IAM reads: passed, with a warning that
+	// names it.
 	var warning *TestWarning
-	if err := (awsMinter{}).Test(context.Background(), awsRequest()); !errors.As(err, &warning) || !strings.Contains(warning.Message, "allows IAM") {
-		t.Fatalf("warning: %v", err)
+	for _, action := range []string{"GetAccountSummary", "ListRoles"} {
+		f.iamAllows = action
+		if err := (awsMinter{}).Test(context.Background(), awsRequest()); !errors.As(err, &warning) || !strings.Contains(warning.Message, "iam:"+action+" succeeded") {
+			t.Fatalf("%s warning: %v", action, err)
+		}
+	}
+	// When IAM cannot answer, the test passes and says the check could not run.
+	f.iamAllows, f.iamBroken = "", true
+	if err := (awsMinter{}).Test(context.Background(), awsRequest()); !errors.As(err, &warning) || !strings.Contains(warning.Message, "could not be checked") {
+		t.Fatalf("broken IAM: %v", err)
+	}
+	f.iamBroken = false
+	// A region that is not a region name is refused before any call.
+	calls := len(f.forms)
+	bad := awsRequest()
+	bad.Provider.Region = "evil.com/x"
+	if err := (awsMinter{}).Test(context.Background(), bad); err == nil || errors.As(err, &warning) {
+		t.Fatalf("bad region test: %v", err)
+	}
+	if _, err := (awsMinter{}).Mint(context.Background(), bad); err == nil || len(f.forms) != calls {
+		t.Fatalf("bad region mint: %v, %d calls", err, len(f.forms)-calls)
 	}
 	// A key that cannot assume the role fails.
 	f.assumeErr = "AccessDenied"
@@ -200,3 +225,22 @@ func TestNewForChoosesTheCloud(t *testing.T) {
 		t.Fatalf("gcp: %v", err)
 	}
 }
+
+// A signed POST with a session token, recomputed independently: it covers
+// the form body and the
+// X-Amz-Security-Token header the documented GET example does not. The
+// expected value was computed with Python hashlib and hmac, not this code.
+func TestAWSSignatureOfAPostWithASessionToken(t *testing.T) {
+	body := "Action=GetAccountSummary&Version=2010-05-08"
+	req, _ := http.NewRequest(http.MethodPost, "https://iam.amazonaws.com/", strings.NewReader(body))
+	req.Header.Set("Content-Type", awsContentType)
+	signAWS(req, "iam.amazonaws.com", body, awsSigner{accessKeyID: "ASIAEXAMPLE", secretAccessKey: "secret-example", sessionToken: "token-example"},
+		"us-east-1", "iam", time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC))
+	got := req.Header.Get("Authorization")
+	want := "AWS4-HMAC-SHA256 Credential=ASIAEXAMPLE/20261117/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=" + expectedPostSignature
+	if got != want {
+		t.Fatalf("authorization\n got %s\nwant %s", got, want)
+	}
+}
+
+const expectedPostSignature = "b82e31dbf569c423fceb1be7b2549f8da3e384dae1c7bf0c41b1c66bad144b99"

@@ -460,10 +460,12 @@ func (s *Server) credentialEnvelope(credential model.Credential, lease model.Lea
 		{Name: "ALIBABA_CLOUD_SECURITY_TOKEN", Value: credential.SecurityToken},
 	}
 	// An AWS credential uses the names the AWS CLI and SDKs read (§17.13).
-	if prov, err := s.db.GetProvider(r.Context(), lease.ProviderID); err == nil && prov.Type == model.ProviderAWS {
-		region := prov.Region
-		if region == "" {
-			region = provider.AWSDefaultRegion
+	// The cloud comes from the request's template, so a provider row that
+	// cannot be read never turns an AWS key into Alibaba variables.
+	if strings.HasPrefix(lease.CapabilityID, string(model.ProviderAWS)+".") {
+		region := provider.AWSDefaultRegion
+		if prov, err := s.db.GetProvider(r.Context(), lease.ProviderID); err == nil && model.ValidRegion(model.ProviderAWS, prov.Region) {
+			region = prov.Region
 		}
 		env = []model.EnvVar{
 			{Name: "AWS_ACCESS_KEY_ID", Value: credential.AccessKeyID},

@@ -69,7 +69,7 @@ type Config struct {
 	// Version overrides the reported version (default model.Version).
 	Version string
 	// MinterFactory optionally overrides provider minters (tests inject fakes).
-	// When nil the server uses provider.New(provider.Mode).
+	// When nil the server uses provider.NewFor(provider.Type, provider.Mode).
 	MinterFactory func(p model.Provider) (provider.Minter, error)
 	// Now optionally overrides the clock (tests use a fixed clock).
 	Now func() time.Time
