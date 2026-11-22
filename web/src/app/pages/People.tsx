@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { Person, PersonWithSetupCode } from '../types'
-import { Badge, Button, Card, ErrorNote, Field, Modal, PageHead, Secret, ago, useAction, useConfirm, useLoad, useToast, when } from '../ui'
+import { Badge, Button, Card, ErrorNote, Field, Modal, PageHead, STILL_VALID, Secret, ago, useAction, useConfirm, useLoad, useToast, when } from '../ui'
 
 /** Supervisors create people, reset them, suspend them and grant the flag. */
 export function PeoplePage({ me }: { me: Person }) {
@@ -36,17 +36,17 @@ export function PeoplePage({ me }: { me: Person }) {
                 <td className="muted small">{p.setup_issued ? `code from ${p.setup_issued.by_name}, ${when(p.setup_issued.at)}` : '—'}</td>
                 <td className="right nowrap">
                   {p.id !== me.id && p.status !== 'suspended' && <Button kind="link" onClick={() => ask(`Suspend ${label(p)}?`,
-                    'They are signed out at once and cannot sign in. Their agents stop working and every credential they hold is revoked.',
+                    `They are signed out at once and cannot sign in. Their agents stop working and every credential they hold is revoked. ${STILL_VALID}`,
                     'Suspend', async () => { await api.updatePerson(p.id, { status: 'suspended' }); toast(`${p.username} suspended`) })}>Suspend</Button>}
                   {p.status === 'suspended' && p.setup_issued && <Button kind="link" onClick={() => ask(`Activate ${label(p)}?`,
                     'They can sign in again with their password and authenticator. Their agents work again, within their roles.',
                     'Activate', async () => { await api.updatePerson(p.id, { status: 'active' }); toast(`${p.username} active`) }, false)}>Activate</Button>}
                   <Button kind="link" onClick={() => ask(`Reset ${label(p)}?`,
-                    'Their password and authenticator are erased, they are signed out, their approval mode goes back to read and their agents\' credentials are revoked. You get a new setup code to give them.',
+                    `Their password and authenticator are erased, they are signed out, their approval mode goes back to read and their agents' credentials are revoked. ${STILL_VALID} You get a new setup code to give them.`,
                     'Reset', async () => { setIssued(await api.resetPerson(p.id)) })}>Reset</Button>
                   <Button kind="link" onClick={() => ask(p.supervisor ? `Remove ${label(p)} as supervisor?` : `Make ${label(p)} a supervisor?`,
                     p.supervisor
-                      ? 'They can no longer manage cloud accounts, people, roles or limits, and they stop being Administrator on every cloud account. They keep the roles given to them by name; credentials their agents hold beyond those are revoked.'
+                      ? `They can no longer manage cloud accounts, people, roles or limits, and they stop being Administrator on every cloud account. They keep the roles given to them by name; credentials their agents hold beyond those are revoked. ${STILL_VALID}`
                       : 'They can add cloud accounts, add and suspend people, change everyone\'s roles and the platform limits. They also become Administrator on every cloud account, so their agents can ask for full access there.',
                     p.supervisor ? 'Remove supervisor' : 'Make supervisor',
                     async () => { await api.updatePerson(p.id, { supervisor: !p.supervisor }); toast(p.supervisor ? 'Supervisor removed' : 'Now a supervisor') }, !p.supervisor)}>

@@ -4,7 +4,7 @@ import type { ApprovalMode, Person, PersonAccount, Provider, Role } from '../typ
 import { navigate } from '../router'
 import { LongLivedCard, UserAdminSection } from './LongLived'
 import {
-  Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, ago, roleHint, roleLabel, useAction, useConfirm, useLoad, useToast, when,
+  Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, STILL_VALID, ago, roleHint, roleLabel, useAction, useConfirm, useLoad, useToast, when,
 } from '../ui'
 
 const MODES: { value: ApprovalMode; title: string; text: string }[] = [
@@ -180,7 +180,7 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
     `Make ${nameOf(personId)} ${roleLabel[to].toLowerCase()} on ${account.name}?`,
     to === 'administrator'
       ? `Their agents will be able to ask for full access here, including creating and deleting resources.`
-      : `Their agents get at most ${roleHint[to]} here. Credentials beyond that are revoked at once.`,
+      : `Their agents get at most ${roleHint[to]} here. Credentials beyond that are revoked at once. ${STILL_VALID}`,
     'Change role', () => api.putBinding(account.id, personId, to), 'Role changed', to !== 'administrator' && from !== to && roleRank(to) < roleRank(from))
 
   return (
@@ -215,7 +215,7 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
                         </select>
                       </td>
                       <td className="right"><Button kind="link" onClick={() => ask(`Remove ${nameOf(b.person_id)} from ${account.name}?`,
-                        'They and their agents lose all access here, and their credentials on this account are revoked at once.',
+                        `They and their agents lose all access here, and their credentials on this account are revoked at once. ${STILL_VALID}`,
                         'Remove', () => api.deleteBinding(account.id, b.person_id), 'Role removed', true)}>Remove</Button></td>
                     </tr>
                   )
@@ -250,7 +250,7 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
             <Button onClick={() => setRotating(true)}>Replace AccessKey</Button>
             {account.status === 'active'
               ? <Button kind="danger" onClick={() => ask(`Disable ${account.name}?`,
-                'No agent can get access to it until it is enabled again, and every credential issued on it is revoked at once.',
+                `No agent can get access to it until it is enabled again, and every credential issued on it is revoked at once. ${STILL_VALID}`,
                 'Disable', () => api.updateAccount(account.id, { status: 'disabled' }), 'Disabled; its credentials were revoked', true)}>Disable</Button>
               : <Button onClick={() => run(() => api.updateAccount(account.id, { status: 'active' }), 'Enabled')}>Enable</Button>}
           </div>

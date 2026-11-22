@@ -433,8 +433,10 @@ their deadline; no agent or script changes.
 
 ## 2.9 An AWS account
 
-> ⚠️ Not yet run against a live AWS account. The STS calls are tested against a fake
-> endpoint. References: [AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
+> Run against a live AWS account (2026-11-18): read and write credentials on one bucket
+> worked there and were refused on another bucket, for bucket create/delete and for IAM.
+> Revoking stops Cloud Safeguard handing a key out, but AWS cannot cancel an STS key
+> already issued: it works until it expires, so keep TTLs short. References: [AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
 > (the session policy intersects the role's policy),
 > [session policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html#policies_session).
 
@@ -526,7 +528,8 @@ turns it on per account, and only supervisors and people they allow can use it.
    suspended or reset (also by `csg supervisor recover`, within a minute), or the account is
    disabled. If the cloud refuses a deletion it shows *deletion failed*; a supervisor retries.
 
-> ⚠️ Not yet run against a live cloud: the IAM and RAM calls are tested against fakes. On
+> Run against a live AWS account (2026-11-18): create, the boundary, the policy and revoke
+> (the user is deleted, so the key stops working) all work. Not yet run on Alibaba Cloud. On
 > Alibaba Cloud there is no permissions boundary and the second key may write `csg`
 > policies with any content, so treat it as an account administrator's key.
 

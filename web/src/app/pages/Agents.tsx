@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { Agent } from '../types'
-import { Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, ago, useAction, useLoad, useToast } from '../ui'
+import { Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, STILL_VALID, ago, useAction, useLoad, useToast } from '../ui'
 
 export function AgentsPage() {
   const agents = useLoad(() => api.myAgents(), [], 15000)
@@ -81,7 +81,7 @@ function RevokeAgent({ agent, onClose, onDone }: { agent: Agent; onClose: () => 
   const toast = useToast()
   return (
     <Modal title={`Revoke ${agent.name}?`} onClose={onClose}>
-      <p>Its token stops working at once and every credential it holds is revoked. To use it again, sign it in again with csg login.</p>
+      <p>Its token stops working at once and every credential it holds is revoked. {STILL_VALID} To use it again, sign it in again with csg login.</p>
       <ErrorNote error={action.error} />
       <div className="row-actions">
         <Button onClick={onClose}>Cancel</Button>

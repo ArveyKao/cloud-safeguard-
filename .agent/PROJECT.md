@@ -186,12 +186,17 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   confirms → cloud user, policy and key, secret shown once; revoke and automatic deletion;
   `revoke_failed` with retry. Schema 12. Mock cloud accepts active long-lived mock keys.
   MCP `request_long_lived_credential`, `csg access long-lived`, `csg me/supervisor
-  long-lived`. Demo S13. Not run against a live cloud. Review of 2c0ce85: 3 blockers (local
+  long-lived`. Demo S13. Review of 2c0ce85: 3 blockers (local
   recovery, create racing a lost right, crash cleanup), 3 majors (AWS boundary step, RAM key
   wording, managed-identity key) and minors, all fixed in the follow-up commit: full
   list-and-delete cleanup, recheck after create, startup recovery and a recheck every sweep.
-  Open question for a live test: whether AWS needs `iam:PutUserPermissionsBoundary` (added)
-  and how RAM evaluates the two-resource attach statement.
+  Live AWS test (2026-11-18), agent signed in with csg login: STS read (auto) and write
+  (approved in the Inbox) worked on the granted bucket only; another bucket, bucket
+  create/delete and IAM were refused. A revoked STS key kept working until expiry (known,
+  SECURITY.md §6.3); the console's revoke dialogs now say so. Long-lived: create, boundary, policy and revoke all work with a second key
+  that lacks `iam:PutUserPermissionsBoundary`, so it was dropped; the policy simulator denies
+  CreateUser without the boundary or with another one. Still open: how RAM evaluates the
+  two-resource attach statement (real Alibaba Cloud untested).
 - **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
   README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
   Alibaba Cloud is untested.

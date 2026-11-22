@@ -105,7 +105,7 @@ export const awsUserAdminPolicy = (accountId: string) => {
     Version: '2012-10-17',
     Statement: [
       {
-        Effect: 'Allow', Action: ['iam:CreateUser', 'iam:PutUserPermissionsBoundary', 'iam:PutUserPolicy'],
+        Effect: 'Allow', Action: ['iam:CreateUser', 'iam:PutUserPolicy'],
         Resource: users, Condition: boundary,
       },
       {

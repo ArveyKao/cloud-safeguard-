@@ -238,3 +238,10 @@ export const roleHint: Record<string, string> = {
   guest: 'read only', member: 'read, change existing', administrator: 'read, change, create, delete',
 }
 export const permissionTone = (p: string) => (p === 'full' ? 'amber' : p === 'write' ? 'blue' : 'grey') as 'amber' | 'blue' | 'grey'
+
+/**
+ * Revoking stops Cloud Safeguard handing a key out, but a real cloud cannot
+ * cancel an STS key it already issued: it works until it expires (SECURITY.md
+ * §6.3). Long-lived keys are different: revoking deletes the cloud user.
+ */
+export const STILL_VALID = 'A short-lived key already handed out keeps working in the cloud until it expires: the cloud cannot cancel it early.'

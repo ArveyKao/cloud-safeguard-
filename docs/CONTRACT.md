@@ -1354,7 +1354,7 @@ deleted in the cloud as soon as its owner is no longer allowed to hold it.
 - `PUT /api/v1/supervisor/accounts/{id}/user-admin {access_key_id, access_key_secret}` stores
   a second key, encrypted like the broker key and never shown again (masked ID only). Its own
   policy, shown in the console, allows only:
-  - AWS: `iam:CreateUser`, `iam:PutUserPermissionsBoundary` and `iam:PutUserPolicy` on
+  - AWS: `iam:CreateUser` and `iam:PutUserPolicy` on
     `arn:aws:iam::ACCOUNT:user/csg/csg-*`
     with the condition `iam:PermissionsBoundary =
     arn:aws:iam::ACCOUNT:policy/cloud-safeguard-boundary`, and `iam:ListAccessKeys`,
@@ -1362,6 +1362,8 @@ deleted in the cloud as soon as its owner is no longer allowed to hold it.
     `user/csg/csg-*`. The boundary is a customer managed policy `cloud-safeguard-boundary`
     the supervisor creates first; the console shows its content, the role's permission
     policy of §17.13: whatever is put on a `csg` user, it can never do more, and never IAM.
+    CreateUser sets the boundary itself; `iam:PutUserPermissionsBoundary` is not needed
+    (live-tested), so the key can never change a boundary later.
   - Alibaba Cloud: `ram:CreateUser`, `ram:DeleteUser`, `ram:ListAccessKeys`,
     `ram:CreateAccessKey`, `ram:DeleteAccessKey` on `user/csg-*`; `ram:CreatePolicy`,
     `ram:DeletePolicy` on `policy/csg-*`; and `ram:AttachPolicyToUser`,

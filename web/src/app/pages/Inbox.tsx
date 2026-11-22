@@ -82,7 +82,7 @@ export function InboxPage({ person, onChange }: { person: Person; onChange: () =
                     {r.status === 'active' && (
                       <Button kind="link" onClick={() => confirm({
                         title: `Revoke ${r.agent_name}'s ${r.permission} access?`,
-                        body: 'The credential stops being handed out at once. The agent can ask again.',
+                        body: `It stops being handed out at once and the agent can ask again. The key the agent already has keeps working in the cloud until it expires (${ago(r.expires_at)}): the cloud cannot cancel it early.`,
                         confirmLabel: 'Revoke', danger: true,
                         run: async () => { await api.revokeRequest(r.id); toast('Revoked'); refresh() },
                       })}>Revoke</Button>
