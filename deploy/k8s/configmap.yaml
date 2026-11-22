@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloud-safeguard
+  namespace: cloud-safeguard
+data:
+  public-url: https://csg.example.com     # the origin people open the console at
+  trusted-proxy: 10.0.0.0/8               # your ingress controller's pod/node range

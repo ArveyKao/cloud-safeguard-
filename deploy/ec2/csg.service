@@ -1,0 +1,28 @@
+# /etc/systemd/system/csg.service — Cloud Safeguard on a VM (EC2, ECS instance, any Linux)
+[Unit]
+Description=Cloud Safeguard control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=csg
+Group=csg
+EnvironmentFile=-/etc/csg/csg.env
+ExecStart=/usr/local/bin/csg serve --data-dir /var/lib/csg --addr 127.0.0.1:8787 --public-url ${CSG_PUBLIC_URL} --trusted-proxy 127.0.0.1
+Restart=on-failure
+RestartSec=3
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/csg
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

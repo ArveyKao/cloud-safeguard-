@@ -1,0 +1,4 @@
+# /etc/caddy/Caddyfile — HTTPS in front of Cloud Safeguard (automatic Let's Encrypt)
+{$CSG_DOMAIN} {
+	reverse_proxy 127.0.0.1:8787
+}
