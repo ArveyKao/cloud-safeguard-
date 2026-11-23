@@ -493,7 +493,9 @@ func TestAccountModeMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	future, past := peopleNow.Add(240*time.Hour).UnixMilli(), int64(1)
+	// The migration drops modes expired by the real clock, so "future" must be
+	// after both the wall clock and peopleNow.
+	future, past := time.Now().Add(240*time.Hour).UnixMilli(), int64(1)
 	for _, stmt := range []string{
 		`DROP TABLE account_modes`,
 		`ALTER TABLE leases DROP COLUMN refresh_until`,
