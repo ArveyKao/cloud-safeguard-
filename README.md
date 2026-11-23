@@ -308,5 +308,6 @@ chat approvals and a credential-free proxy mode.
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model and incident response, written for v0.1 (being rewritten) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | v0.1 architecture (out of date; the vault, audit chain and mock cloud parts still apply) |
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | Demo walkthrough, MCP setup, real Alibaba Cloud setup, troubleshooting |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | Running it for real: Docker, Kubernetes, EC2 |
 | [docs/API.md](docs/API.md) | v0.1 endpoint reference (out of date; see CONTRACT §17.8) |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Architecture decision records for v0.1 |

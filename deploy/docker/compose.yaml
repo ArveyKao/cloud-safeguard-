@@ -1,0 +1,33 @@
+# Cloud Safeguard with Caddy in front for HTTPS (automatic Let's Encrypt).
+#   export CSG_DOMAIN=csg.example.com     # DNS A record pointing at this host
+#   docker compose -f deploy/docker/compose.yaml up -d
+#   docker compose -f deploy/docker/compose.yaml logs csg   # the first supervisor's setup code
+# Local try-out without a domain: CSG_DOMAIN=localhost (Caddy uses its own local CA).
+name: cloud-safeguard
+services:
+  csg:
+    build: { context: ../.., dockerfile: Dockerfile }
+    image: cloud-safeguard:latest
+    restart: unless-stopped
+    environment:
+      CSG_PUBLIC_URL: https://${CSG_DOMAIN:?set CSG_DOMAIN}
+      CSG_TRUSTED_PROXY: 172.16.0.0/12
+      # CSG_MASTER_KEY: keep the key out of the volume by setting it here from a secret store
+    volumes:
+      - csg-data:/data
+    expose: ["8787"]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    command: caddy reverse-proxy --from ${CSG_DOMAIN} --to csg:8787
+    volumes:
+      - caddy-data:/data
+    depends_on: [csg]
+volumes:
+  csg-data:
+  caddy-data:

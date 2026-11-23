@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-safeguard
+  namespace: cloud-safeguard
+spec:
+  selector: { app: cloud-safeguard }
+  ports:
+    - { name: http, port: 80, targetPort: http }

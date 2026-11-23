@@ -1,0 +1,60 @@
+# One replica only: Cloud Safeguard keeps its state in SQLite on this volume.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cloud-safeguard
+  namespace: cloud-safeguard
+  labels: { app: cloud-safeguard }
+spec:
+  serviceName: cloud-safeguard
+  replicas: 1
+  selector:
+    matchLabels: { app: cloud-safeguard }
+  template:
+    metadata:
+      labels: { app: cloud-safeguard }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: csg
+          image: cloud-safeguard:latest      # replace with your registry image, e.g. <account>.dkr.ecr.<region>.amazonaws.com/cloud-safeguard:<tag>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8787 }
+          env:
+            - name: CSG_PUBLIC_URL
+              valueFrom: { configMapKeyRef: { name: cloud-safeguard, key: public-url } }
+            - name: CSG_TRUSTED_PROXY
+              valueFrom: { configMapKeyRef: { name: cloud-safeguard, key: trusted-proxy } }
+            - name: CSG_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: cloud-safeguard, key: master-key } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 1Gi } }

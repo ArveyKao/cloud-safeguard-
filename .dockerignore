@@ -1,0 +1,11 @@
+.git
+build
+data
+.demo
+bin
+changes
+web/node_modules
+web/dist
+**/*.db*
+**/master.key
+.env*
