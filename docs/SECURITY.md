@@ -1,5 +1,9 @@
 # Cloud Safeguard — Security Model (v0.1)
 
+> **Out of date since 2026-11-15.** This page describes v0.1. The admin token and agent grants were removed; people now
+> sign in to the console, agents sign in with `csg login` and ask for access per cloud account.
+> The running behaviour is [CONTRACT.md](CONTRACT.md) §17. A rewrite of this page is pending.
+
 Status: describes the shipped v0.1 security model. Normative behavior lives in
 [CONTRACT.md](CONTRACT.md); product scope in [SPEC.md](SPEC.md). This document is explicit
 about **what v0.1 protects, what it only mitigates, and what it does not protect against.**

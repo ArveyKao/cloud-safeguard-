@@ -33,3 +33,9 @@ node_modules/
 
 # Agent scratch space
 .agent/scratch/
+
+# Local build output (go build -o build/csg ./cmd/csg)
+/build/
+
+# local preview configuration
+/.claude/launch.json

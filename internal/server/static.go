@@ -54,13 +54,13 @@ func (s *Server) handleMockCloud(w http.ResponseWriter, r *http.Request) {
 // handleStatic serves the embedded dashboard with SPA fallback: unknown
 // non-API GET paths return index.html so client-side routes work.
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		s.writeError(w, http.StatusMethodNotAllowed, model.ErrCodeInvalidRequest, "method not allowed")
+	// API paths must never fall back to the SPA shell, whatever the method.
+	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" || r.URL.Path == "/healthz" || r.URL.Path == "/healthz/" {
+		s.handleUnknownAPI(w, r)
 		return
 	}
-	// API paths must never fall back to the SPA shell.
-	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/healthz" {
-		s.handleUnknownAPI(w, r)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		s.writeError(w, http.StatusMethodNotAllowed, model.ErrCodeInvalidRequest, "method not allowed")
 		return
 	}
 
@@ -76,6 +76,12 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
 		fileServer.ServeHTTP(w, r)
+		return
+	}
+	// A missing asset is a 404, not the app: otherwise a bad deploy shows up
+	// as a confusing MIME error instead of a missing file.
+	if strings.HasPrefix(rel, "assets/") {
+		http.NotFound(w, r)
 		return
 	}
 	s.serveIndexHTML(w, r, fsys)

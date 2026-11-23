@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,36 +12,37 @@ import (
 )
 
 const (
-	adminTokenA = "csg_adm_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	adminTokenB = "csg_adm_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 	agentTokenA = "csg_agt_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+	agentTokenB = "csg_agt_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+	// oldAdminToken has the prefix of the removed admin token.
+	oldAdminToken = "csg_adm_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 )
 
-// capsServer returns a fake admin API whose capability list contains one ID.
-func capsServer(t *testing.T, capabilityID, wantToken string) *httptest.Server {
+// accountsServer returns a fake agent API whose account list has one name.
+func accountsServer(t *testing.T, accountName, wantToken string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/admin/capabilities" {
+		if r.URL.Path != "/api/v1/agent/accounts" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 			writeErrorEnvelope(w, http.StatusNotFound, "not_found", "unexpected path")
 			return
 		}
 		requireAuth(t, r, wantToken)
-		writeEnvelope(w, http.StatusOK, model.ListResponse[model.Capability]{
-			Items: []model.Capability{{ID: capabilityID, Name: capabilityID, Risk: model.RiskLow, Enabled: true}},
+		writeEnvelope(w, http.StatusOK, model.ListResponse[model.AgentAccount]{
+			Items: []model.AgentAccount{{CloudAccountID: "1234567890123456", Name: accountName, Role: model.RoleGuest, HighestPermission: "read"}},
 			Total: 1,
 		})
 	}))
 }
 
 func TestConfigPrecedence(t *testing.T) {
-	serverA := capsServer(t, "cap_from_file", adminTokenA)
+	serverA := accountsServer(t, "account_from_file", agentTokenA)
 	defer serverA.Close()
-	serverB := capsServer(t, "cap_from_env", adminTokenB)
+	serverB := accountsServer(t, "account_from_env", agentTokenB)
 	defer serverB.Close()
 
 	ta := newTestApp(t)
-	path, err := ta.app.saveFileConfig(fileConfig{Server: serverA.URL, Token: adminTokenA, Kind: "admin"})
+	path, err := ta.app.saveFileConfig(fileConfig{Server: serverA.URL, Token: agentTokenA, Kind: "agent"})
 	if err != nil {
 		t.Fatalf("saveFileConfig: %v", err)
 	}
@@ -55,91 +55,38 @@ func TestConfigPrecedence(t *testing.T) {
 	}
 
 	// 1. Config file only.
-	if code := ta.run("caps", "list"); code != ExitOK {
+	if code := ta.run("accounts"); code != ExitOK {
 		t.Fatalf("file config: exit = %d, stderr = %s", code, ta.errOut())
 	}
-	if !strings.Contains(ta.out(), "cap_from_file") {
+	if !strings.Contains(ta.out(), "account_from_file") {
 		t.Fatalf("file config output = %q", ta.out())
 	}
 
 	// 2. Environment beats the file.
 	ta = newTestApp(t)
-	if _, err := ta.app.saveFileConfig(fileConfig{Server: serverA.URL, Token: adminTokenA, Kind: "admin"}); err != nil {
+	if _, err := ta.app.saveFileConfig(fileConfig{Server: serverA.URL, Token: agentTokenA, Kind: "agent"}); err != nil {
 		t.Fatalf("saveFileConfig: %v", err)
 	}
 	ta.env["CSG_SERVER"] = serverB.URL
-	ta.env["CSG_TOKEN"] = adminTokenB
-	if code := ta.run("caps", "list"); code != ExitOK {
+	ta.env["CSG_TOKEN"] = agentTokenB
+	if code := ta.run("accounts"); code != ExitOK {
 		t.Fatalf("env config: exit = %d, stderr = %s", code, ta.errOut())
 	}
-	if !strings.Contains(ta.out(), "cap_from_env") {
+	if !strings.Contains(ta.out(), "account_from_env") {
 		t.Fatalf("env config output = %q", ta.out())
 	}
 
 	// 3. Flags beat the environment.
-	if code := ta.run("caps", "list", "--server", serverA.URL, "--token", adminTokenA); code != ExitOK {
+	if code := ta.run("accounts", "--server", serverA.URL, "--token", agentTokenA); code != ExitOK {
 		t.Fatalf("flag config: exit = %d, stderr = %s", code, ta.errOut())
 	}
-	if !strings.Contains(ta.out(), "cap_from_file") {
+	if !strings.Contains(ta.out(), "account_from_file") {
 		t.Fatalf("flag config output = %q", ta.out())
 	}
 }
 
-func TestLoginAdminThenWhoami(t *testing.T) {
-	var loginCalls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/admin/login":
-			loginCalls++
-			requireAuth(t, r, adminTokenA)
-			writeEnvelope(w, http.StatusOK, model.LoginResult{OK: true, Role: "admin", Version: model.Version})
-		default:
-			t.Errorf("unexpected path %s", r.URL.Path)
-			writeErrorEnvelope(w, http.StatusNotFound, "not_found", "unexpected path")
-		}
-	}))
-	defer srv.Close()
-
-	ta := newTestApp(t)
-	if code := ta.run("login", "--server", srv.URL, "--token", adminTokenA); code != ExitOK {
-		t.Fatalf("login exit = %d, stderr = %s", code, ta.errOut())
-	}
-	if !strings.Contains(ta.out(), "logged in as admin") {
-		t.Fatalf("login output = %q", ta.out())
-	}
-	if !strings.Contains(ta.out(), "config saved to") {
-		t.Fatalf("login output missing config path: %q", ta.out())
-	}
-
-	path := filepath.Join(ta.home, ".config", "cloud-safeguard", "config.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read saved config: %v", err)
-	}
-	var cfg fileConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("decode saved config: %v", err)
-	}
-	if cfg.Server != srv.URL || cfg.Token != adminTokenA || cfg.Kind != "admin" {
-		t.Fatalf("saved config = %+v", cfg)
-	}
-
-	// whoami uses the saved config (no env/flags).
-	ta.stdout.Reset()
-	ta.stderr.Reset()
-	if code := ta.run("whoami"); code != ExitOK {
-		t.Fatalf("whoami exit = %d, stderr = %s", code, ta.errOut())
-	}
-	if !strings.Contains(ta.out(), "role:      admin") {
-		t.Fatalf("whoami output = %q", ta.out())
-	}
-	if loginCalls != 2 {
-		t.Fatalf("login endpoint calls = %d, want 2 (login + whoami)", loginCalls)
-	}
-}
-
-func TestLoginAgentThenWhoamiJSON(t *testing.T) {
-	agent := model.Agent{ID: "agt_demo1", Name: "claude-code", Status: model.AgentActive, Grants: []string{"aliyun.cloud.read"}, MaxTTLSeconds: 3600, MaxConcurrentLeases: 3}
+func TestWhoami(t *testing.T) {
+	agent := model.Agent{ID: "agt_demo1", Name: "claude-code", Status: model.AgentActive, OwnerID: "per_mei"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/agent/me" {
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -152,15 +99,7 @@ func TestLoginAgentThenWhoamiJSON(t *testing.T) {
 	defer srv.Close()
 
 	ta := newTestApp(t)
-	if code := ta.run("login", "--server", srv.URL, "--token", agentTokenA); code != ExitOK {
-		t.Fatalf("login exit = %d, stderr = %s", code, ta.errOut())
-	}
-	if !strings.Contains(ta.out(), "agent claude-code") {
-		t.Fatalf("login output = %q", ta.out())
-	}
-
-	ta.stdout.Reset()
-	ta.stderr.Reset()
+	ta.useServer(srv.URL, agentTokenA)
 	if code := ta.run("whoami", "--json"); code != ExitOK {
 		t.Fatalf("whoami --json exit = %d, stderr = %s", code, ta.errOut())
 	}
@@ -171,6 +110,16 @@ func TestLoginAgentThenWhoamiJSON(t *testing.T) {
 	if payload.Agent.Name != "claude-code" || payload.ActiveLeases != 2 {
 		t.Fatalf("whoami payload = %+v", payload)
 	}
+
+	ta.stdout.Reset()
+	if code := ta.run("whoami"); code != ExitOK {
+		t.Fatalf("whoami exit = %d, stderr = %s", code, ta.errOut())
+	}
+	for _, want := range []string{"claude-code (agt_demo1)", "active leases: 2", srv.URL} {
+		if !strings.Contains(ta.out(), want) {
+			t.Fatalf("whoami output %q has no %q", ta.out(), want)
+		}
+	}
 }
 
 func TestLoginValidation(t *testing.T) {
@@ -180,34 +129,32 @@ func TestLoginValidation(t *testing.T) {
 	defer srv.Close()
 
 	ta := newTestApp(t)
-	if code := ta.run("login", "--token", adminTokenA); code != ExitUsage {
+	if code := ta.run("login"); code != ExitUsage {
 		t.Fatalf("login without server exit = %d, want %d", code, ExitUsage)
 	}
-	if code := ta.run("login", "--server", srv.URL); code != ExitUsage {
-		t.Fatalf("login without token exit = %d, want %d", code, ExitUsage)
+	// login starts an agent sign-in; this fake server refuses everything, so
+	// the sign-in fails as an auth error.
+	if code := ta.run("login", "--server", srv.URL); code != ExitAuth {
+		t.Fatalf("refused sign-in exit = %d, want %d", code, ExitAuth)
 	}
-	if code := ta.run("login", "--server", srv.URL, "--token", "not-a-csg-token"); code != ExitUsage {
-		t.Fatalf("login with unknown prefix exit = %d, want %d", code, ExitUsage)
-	}
-	if code := ta.run("login", "--server", "not-a-url", "--token", adminTokenA); code != ExitUsage {
+	if code := ta.run("login", "--server", "not-a-url"); code != ExitUsage {
 		t.Fatalf("login with bad url exit = %d, want %d", code, ExitUsage)
 	}
-
-	// A server 401 surfaces as an auth exit code.
-	if code := ta.run("login", "--server", srv.URL, "--token", adminTokenA); code != ExitAuth {
-		t.Fatalf("login with rejected token exit = %d, want %d; stderr = %q", code, ExitAuth, ta.errOut())
+	// A token cannot be pasted in any more: agents sign in.
+	if code := ta.run("login", "--server", srv.URL, "--token", agentTokenA); code != ExitUsage {
+		t.Fatalf("login --token exit = %d, want %d", code, ExitUsage)
 	}
 }
 
 func TestMissingConfigurationExitCodes(t *testing.T) {
 	ta := newTestApp(t)
-	if code := ta.run("caps", "list"); code != ExitUsage {
+	if code := ta.run("accounts"); code != ExitUsage {
 		t.Fatalf("no server exit = %d, want %d; stderr = %q", code, ExitUsage, ta.errOut())
 	}
 
 	ta = newTestApp(t)
 	ta.env["CSG_SERVER"] = "http://127.0.0.1:8787"
-	if code := ta.run("caps", "list"); code != ExitAuth {
+	if code := ta.run("accounts"); code != ExitAuth {
 		t.Fatalf("no token exit = %d, want %d; stderr = %q", code, ExitAuth, ta.errOut())
 	}
 
@@ -219,6 +166,8 @@ func TestMissingConfigurationExitCodes(t *testing.T) {
 	}
 }
 
+// A token that is not an agent token (the removed admin token, for one) is
+// refused before anything is sent to the server.
 func TestWrongTokenKindIsAuthError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("server must not be called for a token-kind mismatch (path %s)", r.URL.Path)
@@ -226,38 +175,31 @@ func TestWrongTokenKindIsAuthError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ta := newTestApp(t)
-	ta.useServer(server.URL, adminTokenA)
-	if code := ta.run("leases", "mine"); code != ExitAuth {
-		t.Fatalf("admin token for agent command exit = %d, want %d; stderr = %q", code, ExitAuth, ta.errOut())
-	}
-	if !strings.Contains(ta.errOut(), "agent token required") {
-		t.Fatalf("stderr = %q", ta.errOut())
-	}
-
-	ta = newTestApp(t)
-	ta.useServer(server.URL, agentTokenA)
-	if code := ta.run("caps", "list"); code != ExitAuth {
-		t.Fatalf("agent token for admin command exit = %d, want %d", code, ExitAuth)
-	}
-	if !strings.Contains(ta.errOut(), "admin token required") {
-		t.Fatalf("stderr = %q", ta.errOut())
+	for _, command := range [][]string{{"leases", "mine"}, {"accounts"}, {"whoami"}} {
+		ta := newTestApp(t)
+		ta.useServer(server.URL, oldAdminToken)
+		if code := ta.run(command...); code != ExitAuth {
+			t.Fatalf("%v with an admin token exit = %d, want %d; stderr = %q", command, code, ExitAuth, ta.errOut())
+		}
+		if !strings.Contains(ta.errOut(), "agent token required") {
+			t.Fatalf("%v stderr = %q", command, ta.errOut())
+		}
 	}
 }
 
 func TestServer401MapsToAuthExit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeErrorEnvelope(w, http.StatusUnauthorized, "unauthorized", "invalid admin token")
+		writeErrorEnvelope(w, http.StatusUnauthorized, "unauthorized", "invalid agent token")
 	}))
 	defer srv.Close()
 
 	ta := newTestApp(t)
-	ta.useServer(srv.URL, adminTokenA)
-	code := ta.run("caps", "list")
+	ta.useServer(srv.URL, agentTokenA)
+	code := ta.run("accounts")
 	if code != ExitAuth {
 		t.Fatalf("exit = %d, want %d; stderr = %q", code, ExitAuth, ta.errOut())
 	}
-	if !strings.Contains(ta.errOut(), "invalid admin token") {
+	if !strings.Contains(ta.errOut(), "invalid agent token") {
 		t.Fatalf("stderr = %q", ta.errOut())
 	}
 }
@@ -269,8 +211,8 @@ func TestServer403MapsToOperationExit(t *testing.T) {
 	defer srv.Close()
 
 	ta := newTestApp(t)
-	ta.useServer(srv.URL, adminTokenA)
-	if code := ta.run("caps", "list"); code != ExitOperationErr {
+	ta.useServer(srv.URL, agentTokenA)
+	if code := ta.run("accounts"); code != ExitOperationErr {
 		t.Fatalf("exit = %d, want %d; stderr = %q", code, ExitOperationErr, ta.errOut())
 	}
 }

@@ -85,6 +85,56 @@ func newAuditID() (string, error) {
 // AppendAudit assigns Seq/ID/Time when zero, computes the hash chain and
 // persists the event, mutating ev in place.
 func (db *DB) AppendAudit(ctx context.Context, ev *model.AuditEvent) error {
+	return db.appendAudit(ctx, ev, nil)
+}
+
+// errNothingToRecord stops RecordMigrationAudit's transaction when the kept
+// report is already gone.
+var errNothingToRecord = errors.New("store: no migration report to record")
+
+// RecordMigrationAudit appends the audit event of a schema upgrade and
+// forgets the kept migration report in the same transaction, so the upgrade
+// is recorded exactly once whatever interrupts the caller. When the kept
+// report is no longer there (another process recorded it first) nothing is
+// written; recorded then is false.
+func (db *DB) RecordMigrationAudit(ctx context.Context, ev *model.AuditEvent) (recorded bool, err error) {
+	err = db.appendAudit(ctx, ev, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE key = ?`, metaPendingMigrationReport)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n == 0 {
+			return errNothingToRecord
+		}
+		return nil
+	})
+	db.migration = nil
+	if errors.Is(err, errNothingToRecord) {
+		return false, nil
+	}
+	if err != nil {
+		// Still kept in the database; the next open reads it again.
+		return false, err
+	}
+	return true, nil
+}
+
+// AppendAuditWithMeta appends an audit event and sets one meta value in the
+// same transaction: both happen, or neither.
+func (db *DB) AppendAuditWithMeta(ctx context.Context, ev *model.AuditEvent, key, value string) error {
+	return db.appendAudit(ctx, ev, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO meta(key, value) VALUES(?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+		return err
+	})
+}
+
+// appendAudit appends ev; alongside, when not nil, runs in the same
+// transaction after the event is inserted.
+func (db *DB) appendAudit(ctx context.Context, ev *model.AuditEvent, alongside func(tx *sql.Tx) error) error {
 	if ev == nil {
 		return errors.New("store: nil audit event")
 	}
@@ -94,6 +144,16 @@ func (db *DB) AppendAudit(ctx context.Context, ev *model.AuditEvent) error {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin audit append: %w", err)
+	}
+
+	// Take the database's write lock before reading the tail of the chain.
+	// appendMu orders appends inside this process; another process (csg
+	// supervisor recover while the server runs, two starts at once) is
+	// ordered by this lock. Reading first and writing afterwards would let
+	// two processes link to the same tail, or be refused by SQLite.
+	if _, err := tx.ExecContext(ctx, `UPDATE meta SET value = value WHERE key = ?`, MetaSchemaVersion); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("store: lock for audit append: %w", mapErr(err))
 	}
 
 	var (
@@ -152,6 +212,15 @@ func (db *DB) AppendAudit(ctx context.Context, ev *model.AuditEvent) error {
 	); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("store: insert audit event: %w", mapErr(err))
+	}
+	if alongside != nil {
+		if err := alongside(tx); err != nil {
+			tx.Rollback()
+			if errors.Is(err, errNothingToRecord) {
+				return err
+			}
+			return fmt.Errorf("store: alongside audit append: %w", mapErr(err))
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit audit event: %w", err)

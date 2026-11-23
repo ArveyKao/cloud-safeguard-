@@ -10,17 +10,21 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/arveykao/cloud-safeguard/internal/authn"
 	"github.com/arveykao/cloud-safeguard/internal/mockcloud"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/provider"
@@ -53,15 +57,40 @@ type Config struct {
 	Addr string
 	// DataDir holds the SQLite database, master.key and runtime files.
 	DataDir string
-	// MasterKey optionally overrides the master key loaded from DataDir.
+	// MasterKey optionally supplies the master key instead of DataDir's
+	// master.key or $CSG_MASTER_KEY. It must be the key the data was
+	// encrypted with; the data directory is checked against it.
 	MasterKey []byte
+	// TrustMasterKey accepts the supplied key for a directory that holds
+	// nothing encrypted and no master.key, so nothing can verify the key. It
+	// never overrides a key the data or a master.key proves wrong (see
+	// checkVaultKey).
+	TrustMasterKey bool
 	// Version overrides the reported version (default model.Version).
 	Version string
 	// MinterFactory optionally overrides provider minters (tests inject fakes).
-	// When nil the server uses provider.New(provider.Mode).
+	// When nil the server uses provider.NewFor(provider.Type, provider.Mode).
 	MinterFactory func(p model.Provider) (provider.Minter, error)
+	// UserAdminFactory optionally overrides the long-lived credential user
+	// admins (tests inject fakes). When nil: provider.NewUserAdmin.
+	UserAdminFactory func(p model.Provider) (provider.UserAdmin, error)
 	// Now optionally overrides the clock (tests use a fixed clock).
 	Now func() time.Time
+	// PasswordParams optionally overrides the Argon2id cost (tests lower it).
+	PasswordParams *authn.Params
+	// PublicOrigin is the origin people open the console at, e.g.
+	// "https://csg.example.com". Set it when a proxy terminates TLS in front
+	// of the server: browser requests must then come from exactly this
+	// origin, and the session cookie is marked Secure when it is https.
+	// When empty, the origin is derived from each request (its Host header
+	// and whether the connection itself is TLS).
+	PublicOrigin string
+	// TrustedProxies lists the addresses or CIDR ranges of reverse proxies
+	// in front of the server. Only when the direct peer is one of them is
+	// X-Forwarded-For used to find the client address (for rate limits, the
+	// sign-in approval screen and the audit log). Empty: the direct peer is
+	// always the client.
+	TrustedProxies []string
 }
 
 // Server is a running control-plane instance.
@@ -75,9 +104,25 @@ type Server struct {
 	version       string
 	now           func() time.Time
 	minterFactory func(model.Provider) (provider.Minter, error)
+	// userAdminFactory creates long-lived credentials (CONTRACT §17.14).
+	userAdminFactory func(model.Provider) (provider.UserAdmin, error)
+
+	// pwParams is the Argon2id cost for new password hashes; dummyHash is
+	// verified against for unknown accounts so they take the same time;
+	// hashSlots bounds concurrent Argon2id computations.
+	pwParams  authn.Params
+	dummyHash string
+	hashSlots chan struct{}
+	// publicOrigin is the normalized Config.PublicOrigin, or "".
+	publicOrigin string
+	// trustedProxies is the parsed Config.TrustedProxies.
+	trustedProxies []netip.Prefix
 
 	handler   http.Handler
 	mockCloud http.Handler
+	// agentAPI is the agent API without authentication, for the remote MCP
+	// endpoint and credential links, which authenticate the agent themselves.
+	agentAPI  http.Handler
 	startedAt time.Time
 
 	// lifecycleMu guards the live listener/HTTP server/effective address so
@@ -86,6 +131,42 @@ type Server struct {
 	httpServer   *http.Server
 	listener     net.Listener
 	returnedAddr string
+
+	// accountsMu serializes edits of cloud accounts and the role bindings
+	// written on them.
+	accountsMu sync.Mutex
+	// settingsMu and bindingsMu make "read the current value, decide whether
+	// the change raises access (and so needs an authenticator code), write"
+	// one step: a change in between cannot turn a lowering into a raise.
+	// Lock order: settingsMu or bindingsMu, then a person's lock (stepUp),
+	// then accountsMu.
+	settingsMu sync.Mutex
+	bindingsMu sync.Mutex
+	// leaseLocks serializes minting and activation per lease, so two approvals
+	// of one lease (double click, retry, approval racing auto-approval) never
+	// mint twice. The server is a single process per data dir (ADR-002).
+	leaseLocksMu sync.Mutex
+	leaseLocks   map[string]*leaseLock
+
+	// personLocks serialize sign-in and authority changes per person, so the
+	// lockout count is exact under parallel logins and a login can never
+	// finish around a concurrent suspend or reset. Single process per data
+	// dir (ADR-002).
+	personLocksMu sync.Mutex
+	personLocks   map[string]chan struct{}
+
+	// agentLocks serialize the requests of one agent (lockAgentRequests).
+	agentLocksMu sync.Mutex
+	agentLocks   map[string]*sync.Mutex
+
+	// Test-only hooks that pause the lease pipeline at exact points, so
+	// tests can reproduce races deterministically. Always nil in production.
+	hookBeforeAutoLock    func(leaseID string)
+	hookAfterLeaseRecheck func(leaseID string)
+	// hookAfterAuthorityWrite runs after an authority-reducing edit commits
+	// and before its lease re-check sweep (kind: capability, agent, provider,
+	// policy).
+	hookAfterAuthorityWrite func(kind string)
 
 	sweepCancel context.CancelFunc
 	sweepDone   chan struct{}
@@ -98,7 +179,7 @@ type Server struct {
 
 // defaultMinterFactory resolves the real provider minters.
 func defaultMinterFactory(p model.Provider) (provider.Minter, error) {
-	return provider.New(p.Mode)
+	return provider.NewFor(p.Type, p.Mode)
 }
 
 // New opens the store, loads the vault and builds the HTTP handler. It does not
@@ -155,7 +236,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	// An initialized install always carries both the schema version and the
-	// admin token hash; anything else means `csg init` never ran (or the data
+	// bootstrap time; anything else means `csg init` never ran (or the data
 	// dir is damaged).
 	if _, err := db.GetMeta(context.Background(), store.MetaSchemaVersion); err != nil {
 		db.Close()
@@ -164,12 +245,33 @@ func New(cfg Config) (*Server, error) {
 		}
 		return nil, fmt.Errorf("server: read schema version: %w", err)
 	}
-	if _, err := db.GetMeta(context.Background(), store.MetaAdminTokenHash); err != nil {
+	if _, err := db.GetMeta(context.Background(), store.MetaBootstrapTime); err != nil {
 		db.Close()
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, notInitializedErr(cfg.DataDir)
 		}
-		return nil, fmt.Errorf("server: read admin token: %w", err)
+		return nil, fmt.Errorf("server: read bootstrap time: %w", err)
+	}
+
+	// Refuse to run with a master key other than the one this data
+	// directory was encrypted with (see checkVaultKey).
+	if err := checkVaultKey(context.Background(), db, v, cfg.DataDir, key, cfg.TrustMasterKey); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Record what an upgrade changed (the deleted admin token and revoked
+	// agents, for one) before the check below can stop the start.
+	if err := auditMigrationReport(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: record the schema upgrade: %w", err)
+	}
+	// Without a supervisor nobody can sign in, add people or connect a cloud
+	// account, and there is no other credential: an install upgraded from a
+	// version that had only the admin token is in this state. Refuse to run
+	// rather than serve a console nobody can enter.
+	if err := requireSupervisor(context.Background(), db, cfg.DataDir); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	s := &Server{
@@ -181,13 +283,76 @@ func New(cfg Config) (*Server, error) {
 		version:       version,
 		now:           now,
 		minterFactory: factory,
-		startedAt:     now().UTC(),
-		logWriter:     log.New(os.Stderr, "", log.LstdFlags),
+		userAdminFactory: func() func(model.Provider) (provider.UserAdmin, error) {
+			if cfg.UserAdminFactory != nil {
+				return cfg.UserAdminFactory
+			}
+			return defaultUserAdminFactory
+		}(),
+		startedAt: now().UTC(),
+		logWriter: log.New(os.Stderr, "", log.LstdFlags),
+	}
+	s.pwParams = authn.DefaultParams
+	if cfg.PasswordParams != nil {
+		s.pwParams = *cfg.PasswordParams
+	}
+	s.hashSlots = make(chan struct{}, maxConcurrentHashes)
+	if s.dummyHash, err = authn.HashPassword("timing-equalizer-not-a-password", s.pwParams); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: prepare password hashing: %w", err)
+	}
+	if s.publicOrigin, err = parsePublicOrigin(cfg.PublicOrigin); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if s.trustedProxies, err = parseTrustedProxies(cfg.TrustedProxies); err != nil {
+		db.Close()
+		return nil, err
 	}
 	s.mockCloud = mockcloud.NewHandler(mockcloud.Deps{Store: db, SigningKey: s.signingKey})
 	s.handler = s.buildHandler()
-	s.startSweeper()
+	if err := s.revokeUnsupportedLeases(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: revoke leases that are no longer supported: %w", err)
+	}
+	// Re-check every pending and active lease once at startup. Authority can
+	// change while the server is down or in a crash between a status change
+	// and its sweep: local recovery resets a person, someone edits the
+	// database. Whatever is no longer authorized is revoked before serving.
+	if _, err := s.revalidateLeasesAs(context.Background(), store.LeaseFilter{},
+		"no longer authorized (startup check)", map[string]any{"caused_by": "startup check"}); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: re-check leases at startup: %w", err)
+	}
+	interrupted, err := s.interruptedLongLived(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("server: recover long-lived credentials: %w", err)
+	}
+	s.startSweeper(interrupted)
 	return s, nil
+}
+
+// ErrNoSupervisor is returned by New when no person holds the supervisor
+// flag.
+var ErrNoSupervisor = errors.New("server: no supervisor exists")
+
+// requireSupervisor fails when no person holds the supervisor flag, whatever
+// their status: a pending one still has a setup code, and the last active
+// one can never be removed through the API.
+func requireSupervisor(ctx context.Context, db *store.DB, dataDir string) error {
+	people, err := db.ListPersons(ctx)
+	if err != nil {
+		return fmt.Errorf("server: list people: %w", err)
+	}
+	for _, p := range people {
+		if p.Supervisor {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w in %q, so nobody could sign in (the admin token of older versions no longer exists). "+
+		"Create the first supervisor on this machine with: csg supervisor recover --username NAME --data-dir %s",
+		ErrNoSupervisor, dataDir, dataDir)
 }
 
 // notInitializedErr builds the clear bootstrap error required by CONTRACT §11.
@@ -200,27 +365,36 @@ func notInitializedErr(dataDir string) error {
 
 // loadMasterKeyForServe loads the master key without creating one.
 func loadMasterKeyForServe(cfg Config) ([]byte, error) {
+	// Read-only: this never creates a key. A key that is supplied wins over
+	// the file; checkVaultKey then proves it against the data.
 	if len(cfg.MasterKey) > 0 {
 		if len(cfg.MasterKey) != 32 {
 			return nil, vault.ErrInvalidKey
 		}
 		return append([]byte(nil), cfg.MasterKey...), nil
 	}
-	if os.Getenv("CSG_MASTER_KEY") == "" {
-		keyPath := filepath.Join(cfg.DataDir, "master.key")
-		if _, err := os.Stat(keyPath); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil, notInitializedErr(cfg.DataDir)
-			}
-			return nil, fmt.Errorf("server: stat master key: %w", err)
+	if raw := strings.TrimSpace(os.Getenv("CSG_MASTER_KEY")); raw != "" {
+		key, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(key) != 32 {
+			return nil, errors.New("server: CSG_MASTER_KEY must be 32 bytes, base64-encoded")
 		}
+		return key, nil
 	}
-	key, err := vault.LoadOrCreateKey(cfg.DataDir)
+	key, err := os.ReadFile(filepath.Join(cfg.DataDir, "master.key"))
+	if errors.Is(err, fs.ErrNotExist) {
+		// A database without a key file was initialized with the key in the
+		// environment: say that, not "run csg init", which would refuse.
+		if fileExists(filepath.Join(cfg.DataDir, store.DBFileName)) {
+			return nil, fmt.Errorf("server: data directory %q has a database but no master.key, and $CSG_MASTER_KEY is not set. "+
+				"Set CSG_MASTER_KEY to the key this directory was created with, or restore master.key", cfg.DataDir)
+		}
+		return nil, notInitializedErr(cfg.DataDir)
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("server: read master key: %w", err)
 	}
 	if len(key) != 32 {
-		return nil, vault.ErrInvalidKey
+		return nil, fmt.Errorf("server: master.key is %d bytes: %w", len(key), vault.ErrInvalidKey)
 	}
 	return key, nil
 }
@@ -316,12 +490,16 @@ func (s *Server) Close() error {
 }
 
 // startSweeper launches the background lease sweeper (every sweepInterval).
-func (s *Server) startSweeper() {
+// It first deletes the long-lived credentials a crash interrupted and those
+// whose owner lost the right while the server was down (cloud calls, so not
+// before serving).
+func (s *Server) startSweeper(interrupted []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.sweepCancel = cancel
 	s.sweepDone = make(chan struct{})
 	go func() {
 		defer close(s.sweepDone)
+		s.recoverLongLived(ctx, interrupted)
 		ticker := time.NewTicker(sweepInterval)
 		defer ticker.Stop()
 		for {

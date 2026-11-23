@@ -86,11 +86,28 @@ func (a *App) saveFileConfig(cfg fileConfig) (string, error) {
 		return "", fmt.Errorf("cannot encode config: %v", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	// Write a 0600 temporary file and rename it over the config, so the token
+	// is never in a file with a looser mode, and a symlink at the config path
+	// is replaced rather than followed.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*")
+	if err != nil {
 		return "", fmt.Errorf("cannot write config: %v", err)
 	}
-	// Best effort: an existing file keeps its old mode through os.WriteFile.
-	_ = os.Chmod(path, 0o600)
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return "", fmt.Errorf("cannot write config: %v", err)
+	}
 	return path, nil
 }
 
@@ -194,14 +211,10 @@ func validateServerURL(server string) error {
 
 // tokenKindLabel describes a token kind for error messages.
 func tokenKindLabel(kind string) string {
-	switch kind {
-	case "admin":
-		return "an admin token"
-	case "agent":
+	if kind == "agent" {
 		return "an agent token"
-	default:
-		return "not a csg token (expected a csg_adm_ or csg_agt_ prefix)"
 	}
+	return "not an agent token (expected a csg_agt_ prefix)"
 }
 
 // apiClient is the typed client of the control plane.
@@ -209,23 +222,14 @@ type apiClient struct {
 	baseURL string
 	token   string
 	http    HTTPDoer
+	// authCode, when set, is sent as a fresh authenticator code with the
+	// request (CONTRACT §17.9).
+	authCode string
 }
 
 // newAPIClient builds a client from a resolved config.
 func (a *App) newAPIClient(cfg *resolvedConfig) *apiClient {
 	return &apiClient{baseURL: cfg.Server, token: cfg.Token, http: a.httpClient()}
-}
-
-// adminClient resolves config and requires an admin token (exit 3 otherwise).
-func (a *App) adminClient(cf *clientFlags) (*apiClient, error) {
-	cfg, err := a.resolveConfig(cf)
-	if err != nil {
-		return nil, err
-	}
-	if cfg.Kind != "admin" {
-		return nil, authf("admin token required (configured token is %s)", tokenKindLabel(cfg.Kind))
-	}
-	return a.newAPIClient(cfg), nil
 }
 
 // agentClient resolves config and requires an agent token (exit 3 otherwise).
@@ -235,7 +239,7 @@ func (a *App) agentClient(cf *clientFlags) (*apiClient, error) {
 		return nil, err
 	}
 	if cfg.Kind != "agent" {
-		return nil, authf("agent token required (configured token is %s; use csg login with an agent token)", tokenKindLabel(cfg.Kind))
+		return nil, authf("agent token required (configured token is %s; sign in with csg login)", tokenKindLabel(cfg.Kind))
 	}
 	return a.newAPIClient(cfg), nil
 }
@@ -266,7 +270,12 @@ func (c *apiClient) do(ctx context.Context, method, path string, body, out any) 
 	if err != nil {
 		return fmt.Errorf("cannot build request: %v", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if c.authCode != "" {
+		req.Header.Set(authenticatorCodeHeader, c.authCode)
+	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

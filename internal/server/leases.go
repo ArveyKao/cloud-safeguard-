@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
@@ -69,83 +72,10 @@ func (s *Server) writeHandlerError(w http.ResponseWriter, err error) {
 
 // ================= agent lease endpoints =================
 
-// handleAgentCreateLease implements POST /api/v1/agent/leases.
-func (s *Server) handleAgentCreateLease(w http.ResponseWriter, r *http.Request) {
-	ag, ok := agentFromContext(r.Context())
-	if !ok {
-		s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "agent token required")
-		return
-	}
-	var in model.CreateLeaseInput
-	if err := s.decodeJSON(w, r, &in); err != nil {
-		s.badRequest(w, "invalid request body: "+err.Error())
-		return
-	}
-	lease, err := s.createLease(r.Context(), ag, in)
-	if err != nil {
-		s.writeHandlerError(w, err)
-		return
-	}
-	s.writeData(w, http.StatusCreated, lease)
-}
-
-// createLease runs the policy engine and persists the lease (in every
-// outcome), minting credentials when auto-approved.
-func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.CreateLeaseInput) (model.Lease, error) {
-	now := s.nowUTC()
-
-	capability, err := s.db.GetCapability(ctx, in.CapabilityID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return model.Lease{}, errNotFoundAPI("capability not found")
-		}
-		return model.Lease{}, err
-	}
-	if in.TTLSeconds < 0 {
-		return model.Lease{}, errBadRequestAPI("ttl_seconds must not be negative")
-	}
-	// Params are validated before policy and before a lease row is created.
-	if err := capcatalog.ValidateParams(capability, in.Params); err != nil {
-		return model.Lease{}, errBadRequestAPI(err.Error())
-	}
-
-	providers, err := s.db.ListProviders(ctx)
-	if err != nil {
-		return model.Lease{}, err
-	}
-	var selected *model.Provider
-	for i := range providers {
-		if providers[i].Type == capability.ProviderType {
-			selected = &providers[i]
-			break
-		}
-	}
-
-	settings, err := s.db.GetPolicySettings(ctx)
-	if err != nil {
-		return model.Lease{}, err
-	}
-	activeCount, err := s.db.CountActiveLeases(ctx, ag.ID)
-	if err != nil {
-		return model.Lease{}, err
-	}
-	lastMinute, err := s.db.CountLeasesSince(ctx, ag.ID, now.Add(-time.Minute))
-	if err != nil {
-		return model.Lease{}, err
-	}
-
-	decision := policy.Evaluate(policy.Input{
-		Agent:                   ag,
-		Capability:              capability,
-		Provider:                selected,
-		Settings:                settings,
-		RequestedTTLSeconds:     in.TTLSeconds,
-		Reason:                  in.Reason,
-		BreakGlass:              in.BreakGlass,
-		ActiveLeaseCount:        activeCount,
-		LeasesCreatedLastMinute: lastMinute,
-	})
-
+// submitLease persists a decided lease request (in every outcome) and, when
+// the decision is auto-approve, mints and activates it. It is the shared
+// second half of an access request (createAccessRequest decides it).
+func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability model.Capability, selected *model.Provider, decision model.PolicyDecision, auditExtra map[string]any, in model.CreateLeaseInput, now time.Time) (model.Lease, error) {
 	leaseID, err := newID("lea_")
 	if err != nil {
 		return model.Lease{}, err
@@ -159,6 +89,7 @@ func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.Creat
 		Risk:                capability.Risk,
 		Params:              in.Params,
 		Reason:              in.Reason,
+		MaxLifetimeSeconds:  in.MaxLifetimeSeconds,
 		RequestedTTLSeconds: in.TTLSeconds,
 		EffectiveTTLSeconds: decision.EffectiveTTLSeconds,
 		Status:              model.LeasePending,
@@ -192,25 +123,40 @@ func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.Creat
 	if decision.Outcome == model.OutcomeDeny {
 		requestedStatus = "denied"
 	}
-	s.agentAudit(ctx, ag, "lease.requested", requestedStatus, "info", "lease", lease.ID, map[string]any{
+	requested := map[string]any{
 		"capability":  capability.ID,
 		"risk":        string(capability.Risk),
 		"params":      in.Params,
 		"ttl_seconds": decision.EffectiveTTLSeconds,
 		"decision":    string(decision.Outcome),
 		"break_glass": in.BreakGlass,
-	})
+	}
+	for k, v := range auditExtra {
+		requested[k] = v
+	}
+	s.agentAudit(ctx, ag, "lease.requested", requestedStatus, "info", "lease", lease.ID, requested)
 
 	switch decision.Outcome {
 	case model.OutcomeAutoApprove:
+		if s.hookBeforeAutoLock != nil {
+			s.hookBeforeAutoLock(lease.ID)
+		}
+		unlock := s.lockLease(lease.ID)
+		defer unlock()
+		// The pending row was visible before this lock was taken: its owner
+		// or a supervisor may have approved, denied or revoked it meanwhile. Only a lease that
+		// is still pending under the lock may be minted.
+		if current, err := s.db.GetLease(ctx, lease.ID); err != nil {
+			return model.Lease{}, err
+		} else if current.Status != model.LeasePending {
+			return model.Lease{}, errConflictAPI("lease " + lease.ID + " is " + string(current.Status) + "; auto-approval skipped")
+		}
 		approvedAt := now
 		lease.ApprovedAt = &approvedAt
 		lease.ApprovedBy = "auto"
 		if err := s.mintCredentialForLease(ctx, &lease, capability, selected, decision.EffectiveTTLSeconds); err != nil {
-			lease.Status = model.LeaseFailed
-			lease.FailureReason = sanitizeMessage(err.Error())
-			if uerr := s.db.UpdateLease(ctx, lease); uerr != nil {
-				s.logf("lease %s: persist failed state: %v", lease.ID, uerr)
+			if ferr := s.failLease(ctx, &lease, err); ferr != nil {
+				return model.Lease{}, ferr
 			}
 			s.agentAudit(ctx, ag, "lease.failed", "failed", "warning", "lease", lease.ID, map[string]any{
 				"reason": lease.FailureReason,
@@ -222,7 +168,8 @@ func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.Creat
 		lease.Status = model.LeaseActive
 		lease.IssuedAt = &issuedAt
 		lease.ExpiresAt = &expiresAt
-		if err := s.db.UpdateLease(ctx, lease); err != nil {
+		openRefreshWindow(&lease, now, s.refreshLimit(ctx))
+		if err := s.activateLease(ctx, lease); err != nil {
 			return model.Lease{}, err
 		}
 		s.agentAudit(ctx, ag, "lease.auto_approved", "ok", approveSeverity(lease.BreakGlass), "lease", lease.ID, map[string]any{
@@ -241,34 +188,91 @@ func (s *Server) createLease(ctx context.Context, ag model.Agent, in model.Creat
 	return lease, nil
 }
 
+// openRefreshWindow starts the refresh window of an access request when its
+// first key is issued (CONTRACT §17.12). Other leases have none. The window
+// is cut to the supervisor's current limit, which may have been lowered
+// while the request waited, but never below the key itself.
+func openRefreshWindow(lease *model.Lease, issuedAt time.Time, limitSeconds int) {
+	if lease.MaxLifetimeSeconds <= 0 {
+		return
+	}
+	if limitSeconds > 0 && lease.MaxLifetimeSeconds > limitSeconds {
+		lease.MaxLifetimeSeconds = max(limitSeconds, lease.EffectiveTTLSeconds)
+	}
+	until := issuedAt.Add(time.Duration(lease.MaxLifetimeSeconds) * time.Second)
+	lease.RefreshUntil = &until
+}
+
+// refreshLimit is the supervisor's current refresh limit, or 0 when it
+// cannot be read (the stored window then applies alone).
+func (s *Server) refreshLimit(ctx context.Context) int {
+	settings, err := s.db.GetPolicySettings(ctx)
+	if err != nil {
+		return 0
+	}
+	return settings.MaxRefreshLifetimeSeconds
+}
+
+// policyViolation returns a non-empty, human-readable violation when the
+// capability cannot render a policy that satisfies the IAM prohibition
+// (CONTRACT §16.3).
+//
+// It fails closed on every render error, not only on prohibition violations: a
+// template that cannot be rendered can never mint a credential, so letting the
+// request through only to fail at mint time would be worse than an explainable
+// deny.
+func policyViolation(capability model.Capability, params map[string]string) string {
+	if _, err := capcatalog.RenderPolicy(capability, params); err != nil {
+		return sanitizeMessage(err.Error())
+	}
+	return ""
+}
+
 // mintCredentialForLease renders the policy, mints a provider credential and
 // stores it encrypted with the lease-bound AAD. It mutates lease's credential
 // availability fields but leaves lifecycle fields to the caller.
 func (s *Server) mintCredentialForLease(ctx context.Context, lease *model.Lease, capability model.Capability, prov *model.Provider, durationSeconds int) error {
-	if prov == nil {
-		return errors.New("no provider available for capability")
+	encrypted, fingerprint, _, err := s.mintCredential(ctx, *lease, capability, prov, durationSeconds)
+	if err != nil {
+		return err
 	}
+	if err := s.db.SetLeaseCredential(ctx, lease.ID, encrypted, fingerprint); err != nil {
+		return err
+	}
+	lease.CredentialAvailable = true
+	lease.CredentialFingerprint = fingerprint
+	return nil
+}
+
+// mintCredential renders the lease's policy, mints a provider credential and
+// returns it encrypted with the lease-bound AAD, with its masked key ID. It
+// stores nothing.
+func (s *Server) mintCredential(ctx context.Context, lease model.Lease, capability model.Capability, prov *model.Provider, durationSeconds int) (encrypted, fingerprint string, credential model.Credential, err error) {
+	if prov == nil {
+		return "", "", model.Credential{}, errors.New("no provider available for capability")
+	}
+	fail := func(e error) (string, string, model.Credential, error) { return "", "", model.Credential{}, e }
 	policyJSON, err := capcatalog.RenderPolicy(capability, lease.Params)
 	if err != nil {
-		return fmt.Errorf("render policy: %w", err)
+		return fail(fmt.Errorf("render policy: %w", err))
 	}
 	encCred, err := s.db.GetProviderCredential(ctx, prov.ID)
 	if err != nil {
-		return fmt.Errorf("read provider credential: %w", err)
+		return fail(fmt.Errorf("read provider credential: %w", err))
 	}
 	plain, err := s.vault.Decrypt(encCred, providerAAD(prov.ID))
 	if err != nil {
-		return errors.New("provider credential cannot be decrypted")
+		return fail(errors.New("provider credential cannot be decrypted"))
 	}
 	var broker brokerCredential
 	if err := json.Unmarshal(plain, &broker); err != nil {
-		return errors.New("provider credential is malformed")
+		return fail(errors.New("provider credential is malformed"))
 	}
 	minter, err := s.minterFactory(*prov)
 	if err != nil {
-		return fmt.Errorf("provider %s: %w", prov.Mode, err)
+		return fail(fmt.Errorf("provider %s: %w", prov.Mode, err))
 	}
-	credential, err := minter.Mint(ctx, provider.MintRequest{
+	credential, err = minter.Mint(ctx, provider.MintRequest{
 		LeaseID:               lease.ID,
 		Provider:              *prov,
 		BrokerAccessKeyID:     broker.AccessKeyID,
@@ -279,23 +283,17 @@ func (s *Server) mintCredentialForLease(ctx context.Context, lease *model.Lease,
 		SigningKey:            s.signingKey,
 	})
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	credentialJSON, err := json.Marshal(credential)
 	if err != nil {
-		return errors.New("encode lease credential")
+		return fail(errors.New("encode lease credential"))
 	}
-	encrypted, err := s.vault.Encrypt(credentialJSON, leaseAAD(lease.ID))
+	encrypted, err = s.vault.Encrypt(credentialJSON, leaseAAD(lease.ID))
 	if err != nil {
-		return errors.New("encrypt lease credential")
+		return fail(errors.New("encrypt lease credential"))
 	}
-	fingerprint := maskAccessKeyID(credential.AccessKeyID)
-	if err := s.db.SetLeaseCredential(ctx, lease.ID, encrypted, fingerprint); err != nil {
-		return err
-	}
-	lease.CredentialAvailable = true
-	lease.CredentialFingerprint = fingerprint
-	return nil
+	return encrypted, maskAccessKeyID(credential.AccessKeyID), credential, nil
 }
 
 // handleAgentListLeases implements GET /api/v1/agent/leases.
@@ -326,6 +324,9 @@ func (s *Server) handleAgentListLeases(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
+	for i := range items {
+		items[i] = agentLeaseView(items[i])
+	}
 	writeList(s, w, http.StatusOK, items, total)
 }
 
@@ -350,7 +351,28 @@ func (s *Server) handleAgentGetLease(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
 		return
 	}
-	s.writeData(w, http.StatusOK, lease)
+	s.writeData(w, http.StatusOK, agentLeaseView(lease))
+}
+
+// agentLeaseView removes what the agent must not read from a lease: the
+// note a person wrote when approving an access request is for people.
+func agentLeaseView(lease model.Lease) model.Lease {
+	if capcatalog.IsAccessTemplateID(lease.CapabilityID) {
+		lease.ApprovalNote = ""
+	}
+	return lease
+}
+
+// revokeReason validates an optional revoke reason.
+func revokeReason(raw, fallback string) (string, error) {
+	reason := strings.TrimSpace(raw)
+	if !utf8.ValidString(reason) || utf8.RuneCountInString(reason) > maxReasonLength {
+		return "", errBadRequestAPI(fmt.Sprintf("reason must be at most %d characters", maxReasonLength))
+	}
+	if reason == "" {
+		return fallback, nil
+	}
+	return sanitizeMessage(reason), nil
 }
 
 // handleAgentFetchCredential implements POST /api/v1/agent/leases/{id}/credential.
@@ -405,9 +427,21 @@ func (s *Server) handleAgentFetchCredential(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Check again now that the credential is in hand. A revoke writes the
+	// terminal status before it erases the credential, so if the lease still
+	// reads active here, no revocation had happened when the credential was
+	// read. The same goes for the agent and its owner.
+	if problem, err := s.credentialReleaseProblem(r.Context(), ag.ID, lease.ID); err != nil {
+		s.writeHandlerError(w, err)
+		return
+	} else if problem != "" {
+		s.writeError(w, http.StatusConflict, model.ErrCodeLeaseNotActive, problem)
+		return
+	}
+
 	envelope := s.credentialEnvelope(credential, lease, r)
 	s.agentAudit(r.Context(), ag, "lease.credential_fetched", "ok", "info", "lease", lease.ID, map[string]any{
-		"remote_addr": remoteHost(r),
+		"remote_addr": s.clientAddr(r),
 	})
 	s.writeData(w, http.StatusOK, envelope)
 }
@@ -420,17 +454,32 @@ func (s *Server) credentialEnvelope(credential model.Credential, lease model.Lea
 		scheme = "https"
 	}
 	baseURL := scheme + "://" + r.Host
-	return model.CredentialEnvelope{
-		Credential: credential,
-		Env: []model.EnvVar{
-			{Name: "ALIBABA_CLOUD_ACCESS_KEY_ID", Value: credential.AccessKeyID},
-			{Name: "ALIBABA_CLOUD_ACCESS_KEY_SECRET", Value: credential.AccessKeySecret},
-			{Name: "ALIBABA_CLOUD_SECURITY_TOKEN", Value: credential.SecurityToken},
-			{Name: "CSG_LEASE_ID", Value: lease.ID},
-			{Name: "CSG_SERVER", Value: baseURL},
-			{Name: "CSG_CAPABILITY", Value: lease.CapabilityID},
-		},
+	env := []model.EnvVar{
+		{Name: "ALIBABA_CLOUD_ACCESS_KEY_ID", Value: credential.AccessKeyID},
+		{Name: "ALIBABA_CLOUD_ACCESS_KEY_SECRET", Value: credential.AccessKeySecret},
+		{Name: "ALIBABA_CLOUD_SECURITY_TOKEN", Value: credential.SecurityToken},
 	}
+	// An AWS credential uses the names the AWS CLI and SDKs read (§17.13).
+	// The cloud comes from the request's template, so a provider row that
+	// cannot be read never turns an AWS key into Alibaba variables.
+	if strings.HasPrefix(lease.CapabilityID, string(model.ProviderAWS)+".") {
+		region := provider.AWSDefaultRegion
+		if prov, err := s.db.GetProvider(r.Context(), lease.ProviderID); err == nil && model.ValidRegion(model.ProviderAWS, prov.Region) {
+			region = prov.Region
+		}
+		env = []model.EnvVar{
+			{Name: "AWS_ACCESS_KEY_ID", Value: credential.AccessKeyID},
+			{Name: "AWS_SECRET_ACCESS_KEY", Value: credential.AccessKeySecret},
+			{Name: "AWS_SESSION_TOKEN", Value: credential.SecurityToken},
+			{Name: "AWS_REGION", Value: region},
+			{Name: "AWS_DEFAULT_REGION", Value: region},
+		}
+	}
+	env = append(env,
+		model.EnvVar{Name: "CSG_LEASE_ID", Value: lease.ID},
+		model.EnvVar{Name: "CSG_SERVER", Value: baseURL},
+		model.EnvVar{Name: "CSG_CAPABILITY", Value: lease.CapabilityID})
+	return model.CredentialEnvelope{Credential: credential, Env: env}
 }
 
 // handleAgentRevokeLease implements POST /api/v1/agent/leases/{id}/revoke.
@@ -458,9 +507,10 @@ func (s *Server) handleAgentRevokeLease(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
 		return
 	}
-	reason := in.Reason
-	if reason == "" {
-		reason = "revoked by agent"
+	reason, err := revokeReason(in.Reason, "revoked by agent")
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
 	}
 	updated, err := s.revokeLease(r.Context(), lease, reason, &ag)
 	if err != nil {
@@ -470,10 +520,10 @@ func (s *Server) handleAgentRevokeLease(w http.ResponseWriter, r *http.Request) 
 	s.writeData(w, http.StatusOK, updated)
 }
 
-// ================= admin lease endpoints =================
+// ================= supervisor lease endpoints (list, get, deny, revoke) =================
 
-// handleAdminListLeases implements GET /api/v1/admin/leases.
-func (s *Server) handleAdminListLeases(w http.ResponseWriter, r *http.Request) {
+// handleListLeases implements GET /api/v1/supervisor/leases.
+func (s *Server) handleListLeases(w http.ResponseWriter, r *http.Request) {
 	filter := store.LeaseFilter{
 		AgentID:      r.URL.Query().Get("agent_id"),
 		CapabilityID: r.URL.Query().Get("capability_id"),
@@ -500,8 +550,8 @@ func (s *Server) handleAdminListLeases(w http.ResponseWriter, r *http.Request) {
 	writeList(s, w, http.StatusOK, items, total)
 }
 
-// handleAdminGetLease implements GET /api/v1/admin/leases/{id}.
-func (s *Server) handleAdminGetLease(w http.ResponseWriter, r *http.Request) {
+// handleGetLease implements GET /api/v1/supervisor/leases/{id}.
+func (s *Server) handleGetLease(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -514,141 +564,172 @@ func (s *Server) handleAdminGetLease(w http.ResponseWriter, r *http.Request) {
 	s.writeData(w, http.StatusOK, lease)
 }
 
-// handleAdminApproveLease implements POST /api/v1/admin/leases/{id}/approve.
-func (s *Server) handleAdminApproveLease(w http.ResponseWriter, r *http.Request) {
-	var in model.ApproveLeaseInput
-	if err := s.decodeJSON(w, r, &in); err != nil {
-		s.badRequest(w, "invalid request body: "+err.Error())
-		return
+// approveLease approves a pending access request and mints its credential.
+// Only the person who owns the requesting agent may approve; nobody else,
+// supervisors included (CONTRACT §17.5). A person asking about a request that
+// is not theirs gets "not found", the same as for one that does not exist.
+func (s *Server) approveLease(ctx context.Context, leaseID string, in model.ApproveLeaseInput, approver *model.Person) (model.Lease, error) {
+	notFound := errNotFoundAPI("request not found")
+	// The agent's lock first, then the lease's: the same order as a new
+	// request. It is held until the credential is active, so the count of
+	// active credentials checked below cannot change before this one is
+	// added: two approvals at once cannot both fit under the limit.
+	if first, err := s.db.GetLease(ctx, leaseID); err == nil {
+		unlockAgent := s.lockAgentRequests(first.AgentID)
+		defer unlockAgent()
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return model.Lease{}, err
 	}
-	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
+	// Serialize with any other approval of this lease; the status read below
+	// happens under the lock, so a second approval sees the first one's result.
+	unlock := s.lockLease(leaseID)
+	defer unlock()
+	lease, err := s.db.GetLease(ctx, leaseID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
-			return
+			return model.Lease{}, notFound
 		}
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
+	}
+	ag, err := s.db.GetAgent(ctx, lease.AgentID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return model.Lease{}, err
+	}
+	agentMissing := err != nil
+	// Only the owner of the requesting agent, and only an access request.
+	if approver == nil || !capcatalog.IsAccessTemplateID(lease.CapabilityID) ||
+		agentMissing || ag.OwnerID == "" || ag.OwnerID != approver.ID {
+		return model.Lease{}, notFound
 	}
 	if lease.Status != model.LeasePending {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease is "+string(lease.Status)+", only pending leases can be approved")
-		return
+		return model.Lease{}, errConflictAPI("lease is " + string(lease.Status) + ", only pending leases can be approved")
 	}
 	now := s.nowUTC()
-	settings, err := s.db.GetPolicySettings(r.Context())
+	settings, err := s.db.GetPolicySettings(ctx)
 	if err != nil {
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
 	}
 	if now.Sub(lease.CreatedAt) > time.Duration(settings.PendingTimeoutSeconds)*time.Second {
 		// The sweeper may not have run yet; expire it inline then report 409.
-		s.expireLease(r.Context(), lease, "pending request timed out")
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease approval window has expired")
-		return
+		s.expireLease(ctx, lease, "pending request timed out")
+		return model.Lease{}, errConflictAPI("lease approval window has expired")
 	}
-	capability, err := s.db.GetCapability(r.Context(), lease.CapabilityID)
+	capability, err := s.capabilityByID(ctx, lease.CapabilityID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "capability no longer exists")
-			return
+			return model.Lease{}, errConflictAPI("capability no longer exists")
 		}
-		s.writeHandlerError(w, err)
-		return
-	}
-	ag, err := s.db.GetAgent(r.Context(), lease.AgentID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "agent no longer exists")
-			return
-		}
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
 	}
 	if lease.ProviderID == "" {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease has no provider")
-		return
+		return model.Lease{}, errConflictAPI("lease has no provider")
 	}
-	prov, err := s.db.GetProvider(r.Context(), lease.ProviderID)
+	prov, err := s.db.GetProvider(ctx, lease.ProviderID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "provider no longer exists")
-			return
+			return model.Lease{}, errConflictAPI("provider no longer exists")
 		}
-		s.writeHandlerError(w, err)
-		return
+		return model.Lease{}, err
 	}
 	if !capability.Enabled {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "capability is disabled")
-		return
+		return model.Lease{}, errConflictAPI("capability is disabled")
 	}
 	if prov.Status != model.ProviderActive {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "provider is not active")
-		return
+		return model.Lease{}, errConflictAPI("provider is not active")
+	}
+	// Re-check the authorization that held when the request was made: an
+	// approval can arrive after a suspension or a lowered role, and must
+	// never mint in those cases (CONTRACT §17.5). activateLease repeats this
+	// after minting.
+	if problem, err := s.leaseAuthorityProblem(ctx, ag, capability, lease); err != nil {
+		return model.Lease{}, err
+	} else if problem != "" {
+		return model.Lease{}, errConflictAPI(problem)
+	}
+	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil {
+		return model.Lease{}, err
+	} else if problem != "" {
+		return model.Lease{}, errConflictAPI(problem)
 	}
 
+	// The limit on simultaneously active credentials holds at approval too
+	// (requests are counted when they are made, but several can be pending).
+	// It is the supervisor's current setting, not what it was when the agent
+	// signed in.
+	active, err := s.db.CountActiveLeases(ctx, ag.ID)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	if active >= settings.MaxConcurrentLeasesPerAgent {
+		return model.Lease{}, errConflictAPI(fmt.Sprintf(
+			"%d credentials of this agent are active; the limit is %d. Revoke one or wait for it to expire.", active, settings.MaxConcurrentLeasesPerAgent))
+	}
+
+	if in.TTLSeconds < 0 {
+		return model.Lease{}, errBadRequestAPI("ttl_seconds must be positive")
+	}
 	ttl := in.TTLSeconds
-	if ttl <= 0 {
+	if ttl == 0 { // omitted: keep the requested validity period
 		ttl = lease.RequestedTTLSeconds
 	}
 	if ttl <= 0 {
 		ttl = lease.EffectiveTTLSeconds
 	}
 	if ttl <= 0 {
-		s.badRequest(w, "ttl_seconds must be positive")
-		return
+		return model.Lease{}, errBadRequestAPI("ttl_seconds must be positive")
+	}
+	// The owner approves exactly what was asked for.
+	if ttl != lease.RequestedTTLSeconds {
+		return model.Lease{}, errBadRequestAPI("the validity period of an access request cannot be changed at approval")
 	}
 	maxTTL := capability.MaxTTLSeconds
-	if ag.MaxTTLSeconds < maxTTL {
-		maxTTL = ag.MaxTTLSeconds
-	}
 	if settings.MaxLeaseTTLSeconds < maxTTL {
 		maxTTL = settings.MaxLeaseTTLSeconds
 	}
 	if ttl > maxTTL {
-		s.badRequest(w, fmt.Sprintf("ttl_seconds %d exceeds the allowed maximum %d", ttl, maxTTL))
-		return
+		return model.Lease{}, errBadRequestAPI(fmt.Sprintf("ttl_seconds %d exceeds the allowed maximum %d", ttl, maxTTL))
 	}
 
+	audit := func(action, status, severity string, metadata map[string]any) {
+		metadata["agent_id"] = ag.ID
+		metadata["agent_name"] = ag.Name
+		s.personAudit(ctx, *approver, action, status, severity, "lease", lease.ID, metadata)
+	}
 	approvedAt := now
-	lease.ApprovedBy = "admin"
+	lease.ApprovedBy = "owner:" + approver.ID
 	lease.ApprovalNote = in.Note
 	lease.ApprovedAt = &approvedAt
 	lease.EffectiveTTLSeconds = ttl
-	if err := s.mintCredentialForLease(r.Context(), &lease, capability, &prov, ttl); err != nil {
-		lease.Status = model.LeaseFailed
-		lease.FailureReason = sanitizeMessage(err.Error())
-		if uerr := s.db.UpdateLease(r.Context(), lease); uerr != nil {
-			s.logf("lease %s: persist failed state: %v", lease.ID, uerr)
+	if err := s.mintCredentialForLease(ctx, &lease, capability, &prov, ttl); err != nil {
+		if ferr := s.failLease(ctx, &lease, err); ferr != nil {
+			return model.Lease{}, ferr
 		}
-		s.adminAudit(r.Context(), "lease.failed", "failed", "warning", "lease", lease.ID, map[string]any{
-			"reason": lease.FailureReason,
-		})
+		audit("lease.failed", "failed", "warning", map[string]any{"reason": lease.FailureReason})
 		// Contract: provider failure returns 200 with the failed lease.
-		s.writeData(w, http.StatusOK, lease)
-		return
+		return lease, nil
 	}
 	issuedAt := now
 	expiresAt := now.Add(time.Duration(ttl) * time.Second)
 	lease.Status = model.LeaseActive
 	lease.IssuedAt = &issuedAt
 	lease.ExpiresAt = &expiresAt
-	if err := s.db.UpdateLease(r.Context(), lease); err != nil {
-		s.writeHandlerError(w, err)
-		return
+	openRefreshWindow(&lease, now, s.refreshLimit(ctx))
+	if err := s.activateLease(ctx, lease); err != nil {
+		return model.Lease{}, err
 	}
-	s.adminAudit(r.Context(), "lease.approved", "ok", approveSeverity(lease.BreakGlass), "lease", lease.ID, map[string]any{
+	audit("lease.approved", "ok", approveSeverity(lease.BreakGlass), map[string]any{
 		"ttl_seconds": ttl,
 		"note":        in.Note,
 	})
-	s.adminAudit(r.Context(), "lease.credential_issued", "ok", "info", "lease", lease.ID, map[string]any{
+	audit("lease.credential_issued", "ok", "info", map[string]any{
 		"fingerprint": lease.CredentialFingerprint,
 		"expires_at":  expiresAt.UTC().Format(time.RFC3339Nano),
 	})
-	s.writeData(w, http.StatusOK, lease)
+	return lease, nil
 }
 
-// handleAdminDenyLease implements POST /api/v1/admin/leases/{id}/deny.
-func (s *Server) handleAdminDenyLease(w http.ResponseWriter, r *http.Request) {
+// handleDenyLease implements POST /api/v1/supervisor/leases/{id}/deny.
+func (s *Server) handleDenyLease(w http.ResponseWriter, r *http.Request) {
 	var in model.DenyLeaseInput
 	if err := s.decodeJSON(w, r, &in); err != nil {
 		s.badRequest(w, "invalid request body: "+err.Error())
@@ -674,18 +755,29 @@ func (s *Server) handleAdminDenyLease(w http.ResponseWriter, r *http.Request) {
 	}
 	lease.Status = model.LeaseDenied
 	lease.DeniedReason = reason
-	if err := s.db.UpdateLease(r.Context(), lease); err != nil {
+	lease.CredentialAvailable = false
+	lease.CredentialFingerprint = ""
+	// Compare-and-set: a lease that was approved, revoked or expired since
+	// the read above is not overwritten.
+	if err := s.db.UpdateLeaseIfStatus(r.Context(), lease, model.LeasePending); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease is no longer pending")
+			return
+		}
 		s.writeHandlerError(w, err)
 		return
 	}
-	s.adminAudit(r.Context(), "lease.denied", "denied", denySeverity(lease.BreakGlass), "lease", lease.ID, map[string]any{
-		"reason": reason,
-	})
+	// A denied lease never keeps ciphertext, even one left by a failed activation.
+	if err := s.db.ClearLeaseCredential(r.Context(), lease.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logf("lease %s: scrub credential on deny: %v", lease.ID, err)
+	}
+	s.actorAudit(r.Context(), "lease.denied", "denied", denySeverity(lease.BreakGlass), "lease", lease.ID,
+		s.leaseAgentMetadata(r.Context(), lease, map[string]any{"reason": reason}))
 	s.writeData(w, http.StatusOK, lease)
 }
 
-// handleAdminRevokeLease implements POST /api/v1/admin/leases/{id}/revoke.
-func (s *Server) handleAdminRevokeLease(w http.ResponseWriter, r *http.Request) {
+// handleRevokeLease implements POST /api/v1/supervisor/leases/{id}/revoke.
+func (s *Server) handleRevokeLease(w http.ResponseWriter, r *http.Request) {
 	var in model.RevokeLeaseInput
 	if err := s.decodeJSON(w, r, &in); err != nil {
 		s.badRequest(w, "invalid request body: "+err.Error())
@@ -700,9 +792,14 @@ func (s *Server) handleAdminRevokeLease(w http.ResponseWriter, r *http.Request) 
 		s.writeHandlerError(w, err)
 		return
 	}
-	reason := in.Reason
-	if reason == "" {
-		reason = "revoked by operator"
+	fallback := "revoked by a supervisor"
+	if sc, ok := sessionFromContext(r.Context()); ok {
+		fallback = "revoked by supervisor " + sc.person.Username
+	}
+	reason, err := revokeReason(in.Reason, fallback)
+	if err != nil {
+		s.writeHandlerError(w, err)
+		return
 	}
 	updated, err := s.revokeLease(r.Context(), lease, reason, nil)
 	if err != nil {
@@ -712,37 +809,430 @@ func (s *Server) handleAdminRevokeLease(w http.ResponseWriter, r *http.Request) 
 	s.writeData(w, http.StatusOK, updated)
 }
 
+// activateLease persists a freshly minted lease as active, but only if it is
+// still pending in the store. Approval and auto-approval read the lease, check
+// it and mint before writing; a revoke, demotion or expiry can land in between.
+// Without the compare-and-set the final write would resurrect a revoked lease
+// with a live credential. On conflict the just-stored credential is scrubbed and
+// the caller gets 409, so no credential is ever issued for that lease.
+func (s *Server) activateLease(ctx context.Context, lease model.Lease) error {
+	// Authorization is checked again AFTER minting, from fresh store reads. A
+	// lowered role, a suspension or a disabled cloud account that landed
+	// while the credential was being minted does not necessarily change the
+	// lease's status, so the compare-and-set below would not see it. Changes
+	// that land after this recheck revoke the affected leases themselves,
+	// which the compare-and-set does see.
+	if problem, err := s.recheckLeaseAuthorization(ctx, lease); err != nil {
+		s.abortActivation(ctx, lease, "authorization could not be re-checked")
+		return err
+	} else if problem != "" {
+		s.abortActivation(ctx, lease, problem)
+		if _, rerr := s.revokeLeaseAsSystem(ctx, lease, "authorization changed during issuance: "+problem); rerr != nil {
+			var he *httpError
+			if !errors.As(rerr, &he) || he.status != http.StatusConflict {
+				s.logf("lease %s: revoke after failed recheck: %v", lease.ID, rerr)
+			}
+		}
+		return errConflictAPI("lease " + lease.ID + " was not activated: " + problem)
+	}
+	if s.hookAfterLeaseRecheck != nil {
+		s.hookAfterLeaseRecheck(lease.ID)
+	}
+	err := s.db.UpdateLeaseIfStatus(ctx, lease, model.LeasePending)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+		s.abortActivation(ctx, lease, "lease left pending before activation completed")
+		return errConflictAPI("lease " + lease.ID + " changed while it was being activated (revoked, expired or its agent changed); no credential was issued")
+	}
+	// Any other failure: the lease did not become active, so its freshly
+	// stored credential must not stay behind.
+	s.abortActivation(ctx, lease, "activation write failed")
+	return err
+}
+
+// failLease records a mint failure. The lease moves to failed only if it is
+// still pending; if it changed meanwhile (or the credential write was refused
+// because it is no longer pending), the caller gets 409 and nothing is
+// overwritten.
+func (s *Server) failLease(ctx context.Context, lease *model.Lease, mintErr error) error {
+	if errors.Is(mintErr, store.ErrConflict) {
+		// The credential write itself was refused: the lease left pending while
+		// minting. Nothing was stored.
+		s.systemAudit(ctx, "lease.activation_aborted", "denied", "warning", "lease", lease.ID, map[string]any{
+			"reason": "lease left pending while its credential was minted; nothing was stored",
+		})
+		return errConflictAPI("lease " + lease.ID + " changed while its credential was being minted; no credential was issued")
+	}
+	lease.Status = model.LeaseFailed
+	lease.FailureReason = sanitizeMessage(mintErr.Error())
+	lease.CredentialAvailable = false
+	lease.CredentialFingerprint = ""
+	err := s.db.UpdateLeaseIfStatus(ctx, *lease, model.LeasePending)
+	if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+		return errConflictAPI("lease " + lease.ID + " changed while its credential was being minted; no credential was issued")
+	}
+	if err != nil {
+		s.logf("lease %s: persist failed state: %v", lease.ID, err)
+	}
+	return nil
+}
+
+// leaseLock is a reference-counted per-lease mutex.
+type leaseLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockLease serializes minting and activation for one lease and returns the
+// unlock function. Entries are dropped when the last holder releases them.
+func (s *Server) lockLease(id string) func() {
+	s.leaseLocksMu.Lock()
+	if s.leaseLocks == nil {
+		s.leaseLocks = map[string]*leaseLock{}
+	}
+	l := s.leaseLocks[id]
+	if l == nil {
+		l = &leaseLock{}
+		s.leaseLocks[id] = l
+	}
+	l.refs++
+	s.leaseLocksMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.leaseLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(s.leaseLocks, id)
+		}
+		s.leaseLocksMu.Unlock()
+	}
+}
+
+// abortActivation scrubs the credential just stored for a lease that will not
+// become active, and audits why. If another activation of the same lease won
+// meanwhile (the lease is active), the stored credential is that winner's and
+// is left alone.
+func (s *Server) abortActivation(ctx context.Context, lease model.Lease, reason string) {
+	if current, err := s.db.GetLease(ctx, lease.ID); err == nil && current.Status == model.LeaseActive {
+		s.systemAudit(ctx, "lease.activation_aborted", "denied", "warning", "lease", lease.ID, map[string]any{
+			"reason": sanitizeMessage(reason) + "; another activation already won, its credential is kept",
+		})
+		return
+	}
+	if cerr := s.db.ClearLeaseCredential(ctx, lease.ID); cerr != nil && !errors.Is(cerr, store.ErrNotFound) {
+		s.logf("lease %s: scrub credential after aborted activation: %v", lease.ID, cerr)
+	}
+	s.systemAudit(ctx, "lease.activation_aborted", "denied", "warning", "lease", lease.ID, map[string]any{
+		"reason": sanitizeMessage(reason) + "; credential scrubbed",
+	})
+}
+
+// recheckLeaseAuthorization re-reads the lease's agent and capability and
+// returns the first reason the lease may no longer be activated, or "".
+func (s *Server) recheckLeaseAuthorization(ctx context.Context, lease model.Lease) (string, error) {
+	ag, err := s.db.GetAgent(ctx, lease.AgentID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "agent no longer exists", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	capability, err := s.capabilityByID(ctx, lease.CapabilityID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "capability no longer exists", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !capability.Enabled {
+		return "capability is disabled", nil
+	}
+	if lease.ProviderID != "" {
+		prov, err := s.db.GetProvider(ctx, lease.ProviderID)
+		if errors.Is(err, store.ErrNotFound) {
+			return "provider no longer exists", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if prov.Status != model.ProviderActive {
+			return "provider is not active", nil
+		}
+	}
+	settings, err := s.db.GetPolicySettings(ctx)
+	if err != nil {
+		return "", err
+	}
+	maxTTL := capability.MaxTTLSeconds
+	if settings.MaxLeaseTTLSeconds < maxTTL {
+		maxTTL = settings.MaxLeaseTTLSeconds
+	}
+	if lease.EffectiveTTLSeconds > maxTTL {
+		return fmt.Sprintf("ttl %ds now exceeds the allowed maximum %ds", lease.EffectiveTTLSeconds, maxTTL), nil
+	}
+	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil || problem != "" {
+		return problem, err
+	}
+	return s.leaseAuthorityProblem(ctx, ag, capability, lease)
+}
+
+// capabilityByID resolves a lease's capability. Access templates from the
+// code catalog (CONTRACT §17.4) are the only capabilities; anything else,
+// such as a lease left over from the removed capability model, is unknown.
+func (s *Server) capabilityByID(_ context.Context, id string) (model.Capability, error) {
+	template, ok := capcatalog.AccessTemplateByID(id)
+	if !ok {
+		return model.Capability{}, store.ErrNotFound
+	}
+	return template.Capability, nil
+}
+
+// leaseAuthorityProblem is the single definition of "may this agent hold
+// this lease now". It returns "" when the lease is still authorized: the
+// agent has an owner, and the owner's current role on the lease's cloud
+// account permits the template's level. The role is read here, at every
+// check; it is never copied onto the agent or the lease.
+func (s *Server) leaseAuthorityProblem(ctx context.Context, ag model.Agent, capability model.Capability, lease model.Lease) (string, error) {
+	if ag.Status != model.AgentActive {
+		return "agent is " + string(ag.Status), nil
+	}
+	if ag.OwnerID == "" {
+		return "agent has no owner", nil
+	}
+	if lease.ProviderID == "" {
+		return "request has no cloud account", nil
+	}
+	role, err := s.personRole(ctx, ag.OwnerID, lease.ProviderID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "the agent's owner has no role on this cloud account", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !role.Permits(capability.Access) {
+		template, _ := capcatalog.AccessTemplateByID(capability.ID)
+		return "the owner's role " + string(role) + " does not permit " + string(template.Permission) + " access", nil
+	}
+	if violation := policyViolation(capability, lease.Params); violation != "" {
+		return "access template " + capability.ID + " renders a prohibited policy: " + violation, nil
+	}
+	return "", nil
+}
+
+// credentialReleaseProblem re-reads the lease, the agent and the agent's
+// owner and reports why a credential must not be handed out, or "".
+func (s *Server) credentialReleaseProblem(ctx context.Context, agentID, leaseID string) (string, error) {
+	lease, err := s.db.GetLease(ctx, leaseID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "lease no longer exists", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if lease.Status != model.LeaseActive {
+		return "lease is " + string(lease.Status) + "; credentials are only available for active leases", nil
+	}
+	if lease.ExpiresAt == nil || !lease.ExpiresAt.After(s.nowUTC()) {
+		return "lease credential has expired", nil
+	}
+	ag, err := s.db.GetAgent(ctx, agentID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "agent no longer exists", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if ag.Status != model.AgentActive {
+		return "agent is " + string(ag.Status), nil
+	}
+	if problem, err := s.agentOwnerProblem(ctx, ag); err != nil || problem != "" {
+		return problem, err
+	}
+	// What an agent may hold depends on its owner's role, which can change
+	// at any time: read it again now (CONTRACT §17.2). This also refuses
+	// anything that is not an access request.
+	return s.recheckLeaseAuthorization(ctx, lease)
+}
+
+// revalidateLeases re-runs the full activation check (recheckLeaseAuthorization)
+// against every pending and active lease matching filter, and revokes each one
+// that no longer passes. Every authority-reducing change calls it after its own
+// write commits. Together with the post-mint recheck and the compare-and-set
+// activation this leaves no window: a lease activated before this scan is seen
+// as active and revoked; one still pending is revoked and its activation then
+// fails; one whose recheck runs after the change's commit fails the recheck.
+func (s *Server) revalidateLeases(ctx context.Context, filter store.LeaseFilter, reason string) ([]string, error) {
+	return s.revalidateLeasesAs(ctx, filter, reason, nil)
+}
+
+// revalidateLeasesAs is revalidateLeases with audit attribution. With a nil
+// cause the revocations are recorded as the signed-in person's (a
+// supervisor changing settings or a cloud account). Otherwise they are
+// recorded as the control plane's, and cause (for
+// example caused_by, owner_id) is added to each event, so the audit log
+// names who triggered the revocation (§17.6).
+func (s *Server) revalidateLeasesAs(ctx context.Context, filter store.LeaseFilter, reason string, cause map[string]any) ([]string, error) {
+	// One consistent snapshot: paging over a set that shrinks as leases
+	// expire or are revoked would skip rows.
+	filter.Statuses = []model.LeaseStatus{model.LeasePending, model.LeaseActive}
+	leases, err := s.db.ListAllLeases(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	revoked := make([]string, 0, len(leases))
+	for _, lease := range leases {
+		problem, err := s.recheckLeaseAuthorization(ctx, lease)
+		if err != nil {
+			return nil, err
+		}
+		if problem == "" {
+			continue
+		}
+		// The caller's reason is recorded exactly (the contract fixes some, e.g.
+		// "role changed to guest"); the specific failed check is logged.
+		s.logf("lease %s revoked on revalidation: %s", lease.ID, problem)
+		if cause == nil {
+			_, err = s.revokeLease(ctx, lease, reason, nil)
+		} else {
+			_, err = s.revokeLeaseWithCause(ctx, lease, reason, cause)
+		}
+		if err != nil {
+			var he *httpError
+			if errors.As(err, &he) && he.status == http.StatusConflict {
+				continue
+			}
+			return nil, err
+		}
+		revoked = append(revoked, lease.ID)
+	}
+	return revoked, nil
+}
+
+// revokeLeaseWithCause revokes a lease on behalf of the control plane and
+// records what triggered it.
+func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, reason string, cause map[string]any) (model.Lease, error) {
+	updated, previousStatus, err := s.markLeaseRevoked(ctx, lease, reason)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	metadata := s.leaseAgentMetadata(ctx, lease, map[string]any{
+		"actor":           "system",
+		"reason":          reason,
+		"previous_status": string(previousStatus),
+	})
+	for k, v := range cause {
+		metadata[k] = v
+	}
+	s.systemAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
+	return updated, nil
+}
+
 // revokeLease kills a pending or active lease, scrubbing its credential.
-// actor is the agent for agent-initiated revocations, nil for admin ones.
+// actor is the agent for agent-initiated revocations; nil means the person
+// whose session the request runs in (a supervisor), or the control plane
+// when there is no session.
 func (s *Server) revokeLease(ctx context.Context, lease model.Lease, reason string, actor *model.Agent) (model.Lease, error) {
+	updated, previousStatus, err := s.markLeaseRevoked(ctx, lease, reason)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	metadata := s.leaseAgentMetadata(ctx, updated, map[string]any{
+		"reason":          reason,
+		"previous_status": string(previousStatus),
+	})
+	if actor != nil {
+		metadata["actor"] = "agent:" + actor.ID
+		s.agentAudit(ctx, *actor, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
+	} else {
+		metadata["actor"] = "system"
+		if sc, ok := sessionFromContext(ctx); ok {
+			metadata["actor"] = "person:" + sc.person.ID
+		}
+		s.actorAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
+	}
+	return updated, nil
+}
+
+// revokeLeaseAsSystem revokes a lease as a control-plane maintenance action
+// (startup cleanup), attributing the audit event to the system actor.
+func (s *Server) revokeLeaseAsSystem(ctx context.Context, lease model.Lease, reason string) (model.Lease, error) {
+	updated, previousStatus, err := s.markLeaseRevoked(ctx, lease, reason)
+	if err != nil {
+		return model.Lease{}, err
+	}
+	s.systemAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, s.leaseAgentMetadata(ctx, lease, map[string]any{
+		"actor":           "system",
+		"reason":          reason,
+		"previous_status": string(previousStatus),
+	}))
+	return updated, nil
+}
+
+// markLeaseRevoked moves a pending or active lease to revoked and scrubs its
+// credential, returning the updated lease and the status it had before.
+func (s *Server) markLeaseRevoked(ctx context.Context, lease model.Lease, reason string) (model.Lease, model.LeaseStatus, error) {
 	if lease.Status != model.LeasePending && lease.Status != model.LeaseActive {
-		return model.Lease{}, errConflictAPI("lease is " + string(lease.Status) + "; only pending or active leases can be revoked")
+		return model.Lease{}, "", errConflictAPI("lease is " + string(lease.Status) + "; only pending or active leases can be revoked")
 	}
 	previousStatus := lease.Status
 	now := s.nowUTC()
-	if err := s.db.ClearLeaseCredential(ctx, lease.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
-		return model.Lease{}, err
-	}
+	// Terminal status first, then scrub: once the row is revoked no activation
+	// can store a credential (SetLeaseCredential needs pending), so the scrub
+	// below cannot miss a blob written concurrently.
 	lease.Status = model.LeaseRevoked
 	lease.RevokedAt = &now
 	lease.RevokeReason = reason
 	lease.CredentialAvailable = false
 	lease.CredentialFingerprint = ""
 	if err := s.db.UpdateLease(ctx, lease); err != nil {
-		return model.Lease{}, err
+		return model.Lease{}, "", err
 	}
-	metadata := map[string]any{
-		"reason":          reason,
-		"previous_status": string(previousStatus),
+	if err := s.db.ClearLeaseCredential(ctx, lease.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return model.Lease{}, "", err
 	}
-	if actor != nil {
-		metadata["actor"] = "agent:" + actor.ID
-		s.agentAudit(ctx, *actor, "lease.revoked", "denied", denySeverity(lease.BreakGlass), "lease", lease.ID, metadata)
-	} else {
-		metadata["actor"] = "admin"
-		s.adminAudit(ctx, "lease.revoked", "denied", denySeverity(lease.BreakGlass), "lease", lease.ID, metadata)
+	return lease, previousStatus, nil
+}
+
+// revokeUnsupportedLeases revokes every pending or active lease that is not
+// an access request, or whose access template now renders a policy that
+// fails the IAM prohibition. It runs on every startup: leases left over from
+// the removed capability model (CONTRACT §17.7a) must never stay live, and
+// each revocation is recorded in the audit log.
+//
+// It fails closed: an error stops the server from starting.
+func (s *Server) revokeUnsupportedLeases(ctx context.Context) error {
+	leases, err := s.db.ListAllLeases(ctx, store.LeaseFilter{
+		Statuses: []model.LeaseStatus{model.LeasePending, model.LeaseActive},
+	})
+	if err != nil {
+		return fmt.Errorf("list pending and active leases: %w", err)
 	}
-	return lease, nil
+	for _, lease := range leases {
+		reason := ""
+		capability, err := s.capabilityByID(ctx, lease.CapabilityID)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			reason = "capability leases were removed; ask for access with an access request"
+		case err != nil:
+			return fmt.Errorf("read capability %s: %w", lease.CapabilityID, err)
+		case policyViolation(capability, lease.Params) != "":
+			reason = "policy violates the IAM prohibition"
+		}
+		if reason == "" {
+			continue
+		}
+		if _, err := s.revokeLeaseAsSystem(ctx, lease, reason); err != nil {
+			var he *httpError
+			if errors.As(err, &he) && he.status == http.StatusConflict {
+				continue // already terminal
+			}
+			return fmt.Errorf("revoke lease %s: %w", lease.ID, err)
+		}
+	}
+	return nil
 }
 
 // ================= sweeper =================
@@ -751,6 +1241,31 @@ func (s *Server) revokeLease(ctx context.Context, lease model.Lease, reason stri
 // exported to the package only so tests can drive it directly.
 func (s *Server) sweepOnce(ctx context.Context) {
 	now := s.nowUTC()
+	if err := s.db.DeleteStaleSessions(ctx, now, sessionIdleTimeout); err != nil {
+		s.logf("sweeper: delete stale sessions: %v", err)
+	}
+	if err := s.db.DeleteOldCLISignIns(ctx, now.Add(-signInRetention)); err != nil {
+		s.logf("sweeper: delete old command-line sign-ins: %v", err)
+	}
+	if err := s.db.DeleteOldSignIns(ctx, now.Add(-signInRetention)); err != nil {
+		s.logf("sweeper: delete old sign-ins: %v", err)
+	}
+	if err := s.db.DeleteOldOAuthRequests(ctx, now.Add(-signInRetention)); err != nil {
+		s.logf("sweeper: delete old MCP sign-ins: %v", err)
+	}
+	if err := s.db.DeleteUnusedOAuthClients(ctx, now.Add(-oauthClientWindow), now.Add(-oauthClientRetention)); err != nil {
+		s.logf("sweeper: delete unused OAuth clients: %v", err)
+	}
+	if err := s.db.ExpireLongLivedRequests(ctx, now); err != nil {
+		s.logf("sweeper: expire long-lived requests: %v", err)
+	}
+	// Changes made outside the server (local recovery, a database edit)
+	// reach long-lived keys here: active ones whose owner lost the right are
+	// deleted. revoke_failed ones are retried by a supervisor, not every sweep.
+	s.revokeLongLivedIn(ctx, "", "", map[string]any{"cause": "sweep", "caused_by": "sweeper"}, model.LongLivedActive)
+	if err := s.db.DeleteOldCredentialLinks(ctx, now); err != nil {
+		s.logf("sweeper: delete old credential links: %v", err)
+	}
 	settings, err := s.db.GetPolicySettings(ctx)
 	if err != nil {
 		s.logf("sweeper: read policy settings: %v", err)
@@ -785,18 +1300,55 @@ func (s *Server) expireLease(ctx context.Context, lease model.Lease, reason stri
 	if err != nil || current.Status != lease.Status {
 		return
 	}
-	if err := s.db.ClearLeaseCredential(ctx, current.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.logf("sweeper: clear credential for %s: %v", current.ID, err)
+	// A refresh may have moved the deadline since the sweep listed the
+	// lease: an active lease whose current deadline is still ahead stays.
+	if current.Status == model.LeaseActive && current.ExpiresAt != nil && current.ExpiresAt.After(s.nowUTC()) {
+		return
 	}
+	// Terminal status first, then scrub (see markLeaseRevoked).
 	current.Status = model.LeaseExpired
 	current.CredentialAvailable = false
 	current.CredentialFingerprint = ""
-	if err := s.db.UpdateLease(ctx, current); err != nil {
-		s.logf("sweeper: expire lease %s: %v", current.ID, err)
+	if err := s.db.UpdateLeaseIfStatus(ctx, current, lease.Status); err != nil {
+		if !errors.Is(err, store.ErrConflict) {
+			s.logf("sweeper: expire lease %s: %v", current.ID, err)
+		}
 		return
 	}
-	s.systemAudit(ctx, "lease.expired", "ok", "warning", "lease", current.ID, map[string]any{
+	if err := s.db.ClearLeaseCredential(ctx, current.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logf("sweeper: clear credential for %s: %v", current.ID, err)
+	}
+	s.systemAudit(ctx, "lease.expired", "ok", "warning", "lease", current.ID, s.leaseAgentMetadata(ctx, current, map[string]any{
 		"previous_status": string(lease.Status),
 		"reason":          reason,
-	})
+	}))
+}
+
+// lockAgentRequests serializes the requests of one agent, so the rate and
+// concurrency limits are checked against a count that cannot change before
+// the request is stored. Single process per data dir (ADR-002).
+func (s *Server) lockAgentRequests(agentID string) func() {
+	s.agentLocksMu.Lock()
+	if s.agentLocks == nil {
+		s.agentLocks = map[string]*sync.Mutex{}
+	}
+	lock, ok := s.agentLocks[agentID]
+	if !ok {
+		lock = &sync.Mutex{}
+		s.agentLocks[agentID] = lock
+	}
+	s.agentLocksMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+// leaseAgentMetadata adds the lease's agent, and the person who owns it, to
+// audit metadata, so every event names both (CONTRACT §17.6).
+func (s *Server) leaseAgentMetadata(ctx context.Context, lease model.Lease, metadata map[string]any) map[string]any {
+	metadata["agent_id"] = lease.AgentID
+	metadata["agent_name"] = lease.AgentName
+	if ag, err := s.db.GetAgent(ctx, lease.AgentID); err == nil && ag.OwnerID != "" {
+		metadata["owner_id"] = ag.OwnerID
+	}
+	return metadata
 }

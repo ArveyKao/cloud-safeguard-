@@ -1,5 +1,7 @@
 # Cloud Safeguard 产品说明（v0.1）
 
+> **自 2026-11-15 起已过时。** 本文描述 v0.1。管理员令牌与旧的 agent 授权模型已移除；现在由人登录控制台，agent 通过 `csg login` 登录并按云账号申请访问。当前行为以 [CONTRACT.md](CONTRACT.md) §17 为准，本文待重写。
+
 > **给 AI agent 能力，而不是长期凭据。**
 > Capabilities, not credentials.
 

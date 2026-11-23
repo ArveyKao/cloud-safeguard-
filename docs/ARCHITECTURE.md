@@ -1,5 +1,12 @@
 # Cloud Safeguard — Architecture (v0.1)
 
+> **Out of date since 2026-11-15.** This page describes v0.1. The admin token, the admin API,
+> agent grants, stored capabilities, break-glass and the risk-tier policy engine were removed;
+> people now sign in to the console, agents sign in with `csg login` and ask for access per
+> cloud account. The running behaviour is [CONTRACT.md](CONTRACT.md) §17. The vault, the audit
+> hash chain, the lease states and the mock cloud described here still apply. A rewrite of
+> this page is pending.
+
 Status: describes the v0.1 implementation architecture. Normative behavior is frozen in
 [CONTRACT.md](CONTRACT.md) (§3–§13); product scope and acceptance in [SPEC.md](SPEC.md).
 Shared Go types are `internal/model/model.go`, whose JSON tags are the wire contract.
@@ -55,7 +62,7 @@ flowchart TB
         STS["Alibaba Cloud STS<br/>AssumeRole"]
         ALIYUN["Alibaba Cloud resources<br/>ECS / DNS / RAM"]
     end
-    CONSOLE -->|"admin token"| MW
+    CONSOLE -->|"person session"| MW
     AGENTCLI -->|"agent token"| MW
     ADMINCLI -->|"admin token"| MW
     MW --> AGENTAPI
@@ -569,12 +576,13 @@ requests a lease, waits, fetches the credential, runs the child command with the
 unless `--keep`. `csg mock request` is a demo helper that calls `/mock-cloud/...` using
 `ALIBABA_CLOUD_SECURITY_TOKEN` from the environment.
 
-Web console (`web/`, CONTRACT §12): Vite + React + TypeScript, plain CSS, build output in
-`web/dist` embedded by `web/embed.go`. Same-origin API calls; admin token validated via
-`POST /admin/login` and kept in `localStorage` (`csg.adminToken`); 401 → clear + login.
-Pages: Login, Overview (poll every 4 s), Approvals/Leases, Agents, Capabilities, Providers
-& Vault, Audit, Settings. No external CDN/fonts (offline-capable). Secrets are never
-rendered after login; agent tokens appear only in the one-time create/rotate modal.
+Web console (`web/`, CONTRACT §12 and §17): Vite + React + TypeScript, plain CSS, build output
+in `web/dist` embedded by `web/embed.go`. People sign in with password and authenticator code;
+the session is an HttpOnly cookie and the CSRF token is kept in memory and sent on every
+change. Pages: Setup, Sign in, Inbox, agent sign-in approval, Agents, Cloud accounts (with the
+add wizard), Activity, People, Settings. Authority-changing actions ask for confirmation. No
+external CDN/fonts; every response forbids framing (`X-Frame-Options: DENY`, CSP
+`frame-ancestors 'none'`). Console tests: `cd web && npm test`.
 
 ---
 

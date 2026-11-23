@@ -29,6 +29,177 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
   revision a509c1c). Evidence lives in `changes/cloud-safeguard-v0.1/evidence/`
   (report, screenshots, raw logs, repro scripts, deployment receipt); it is intentionally
   outside the product source identity (delivery-tooling evidence dir).
+- **Agent roles + IAM prohibition (2026-11-09, branch `feat/agent-roles`, CONTRACT §16,
+  ADR-014):** integrated in the main checkout, not committed. Five cross-family (dsh) security
+  reviews; every finding fixed with a regression test proven to fail without its fix. Combined
+  checks on the merged tree: gofmt, vet, `go test ./...`, `go test -race ./internal/...` (8/8),
+  web typecheck + build (web/dist regenerated), demo S1-S9 9/9, live console check against the
+  real backend (roles, role-limited grants, access labels; no console errors). Known/deferred:
+  D4 access-raise vs concurrent grant (low; role check still blocks any credential); console
+  L1 retired-capability checkbox in the detail drawer (low; superseded by the redesign). Docs
+  outside CONTRACT/DECISIONS not yet updated.
+- **Role change (owner's instruction, 2026-11-09):** the owner asked Claude (Lead) to implement
+  the security-critical code itself: IAM prohibition/policy rendering, role enforcement and
+  approval rechecks, migrations, and §17 authentication, request verification and approval.
+  Workers keep console, CLI, MCP client, demo and docs. Every change, including Lead's, gets a
+  cross-family review. This overrides the "owner does not edit product code" rule for those areas.
+- **Accepted next:** supervisors bind people to cloud accounts with a role; agents inherit
+  their owner's role; requests carry read/write/full plus a required validity period; read is
+  automatic, write and full wait for the owner's approval; agent-first sign-in and MCP server
+  (CONTRACT §17, ADR-015). Accepted 2026-11-09, revised by the owner 2026-11-10; starts after
+  §16 merges. This removes the §16 agent role, grants and `aliyun.account.admin`.
+- **§17 progress (2026-11-10):** identity foundation built by Lead and verified locally:
+  `internal/authn` (Argon2id, TOTP), schema v3 (persons, role_bindings, sessions), session
+  login with CSRF, supervisor API for people and bindings, first supervisor in `csg init`,
+  `csg supervisor recover`. Adds `golang.org/x/crypto`. Not yet cross-family reviewed, and
+  bindings are not yet enforced on agent requests. Status table: CONTRACT §17.8.
+- **§17 progress (2026-11-11):** review of the identity foundation done (dsh; 1 high, 1 medium,
+  6 low, all fixed in 372d21f). Qoder QA run on 372d21f (sections A and B of
+  `docs/QA_BRIEF.md`): 2 real bugs fixed (empty `Statement` accepted at capability create;
+  negative approve TTL accepted), 4 points clarified in CONTRACT. Agent ownership and
+  agent-first sign-in built by Lead (schema v4, `internal/server/agentsignin.go`), verified
+  locally, not yet reviewed. GitHub issues cannot be filed or read from this machine (no `gh`,
+  connector failing), so QA findings arrive in task reports.
+- **§17 access requests (2026-11-11):** built by Lead: code-defined access templates with an
+  action classification table (`internal/capcatalog/access.go`), cloud account IDs on providers
+  (schema v5), `POST /agent/access-requests` with the owner's role read live, owner
+  approve/deny/revoke under `/me/requests`, and revocation when a binding is lowered or
+  removed. Verified locally (tests, race, demo, live run against the mock cloud); not yet
+  cross-family reviewed. Templates are untested on real Alibaba Cloud. Remaining: CLI,
+  MCP server, console redesign, removal of the §16 agent role and the admin token.
+- **§17 approval modes (2026-11-12, plan confirmed by the owner with the explainer video):**
+  each person chooses one mode for all their agents (read default, write, full; optional
+  expiry); a supervisor sets each cloud account's highest automatic level (default read);
+  automatic = the lower of the two, after the role check. Schema v6. (Superseded on
+  2026-11-17 by modes per account, see Piece 4 below.) Built by Lead, verified
+  locally (tests, race, demo, live run); not yet committed or cross-family reviewed.
+- **Supervisor API (2026-11-12):** cloud accounts, settings, audit and the emergency stop
+  under `/api/v1/supervisor/`, reusing the operator handlers with actions attributed to the
+  signed-in supervisor; `GET /api/v1/me/accounts` for everyone. Verified locally; not yet
+  committed or cross-family reviewed. Step 1 of the four-step plan below is done.
+- **Decided (review of 7d486a5, F2, owner 2026-11-12): accept and trace.** Supervisors are
+  trusted to hand over setup codes; every setup records who issued the code (schema v7) and the
+  setup-completed audit event names the issuer.
+- **Agent CLI and MCP server (2026-11-12):** `csg login` agent sign-in, `csg accounts`,
+  `csg access request|status`, `csg exec --account`, and `csg mcp` (five tools; credentials go
+  to a 0600 file, never to the model). End-to-end tests against a real server. Verified
+  locally; not yet committed or cross-family reviewed. Step 2 of the four-step plan is done.
+- **Console redesign (2026-11-14):** new React console in `web/src/app/` on the person login
+  (setup with QR, sign-in, Inbox, agent sign-in approval, Agents, Cloud accounts with the add
+  wizard, Activity, People, Settings); the old admin-token console and `web/devmock` are
+  removed. Checked in a browser against a real server. Step 3 of the four-step plan is done;
+  step 4 (remove the admin token and the §16 agent model) remains.
+- **Admin token and the §16 agent model removed (2026-11-15):** step 4 of the four-step plan.
+  No admin token, admin API or admin CLI; no agent roles, grants, stored capabilities,
+  break-glass or risk-tier policy engine. `csg init` prints only the first supervisor's setup
+  code and never touches an existing directory. Schema version 8 deletes the admin token and
+  revokes agents without an owner; leases that are not access requests are revoked at start.
+  Supervisors are Administrator on every cloud account (owner's decision, 2026-11-14).
+  `scripts/demo.sh` now runs nine scenarios through `scripts/demo/` (people over HTTP, the
+  agent through the real `csg`). Verified locally; awaiting commit and independent review.
+- **Review of a936962 (2026-11-16):** one blocker and eight majors, all fixed. The server now
+  refuses to start without a supervisor (an upgraded v0.1 install has none) and says to run
+  `csg supervisor recover`; `csg init` validates first and removes what it created when it
+  fails; limits are the supervisor's current settings, not a copy made at agent sign-in; an
+  agent without an owner is refused everywhere; every role write re-checks the person's
+  agents; the connection test also assumes the role; the console wizard, QUICKSTART and the
+  access templates share one role policy (tested). Found on the way: the STS client read the AssumeRole credential from the top
+  level of the response, but Alibaba Cloud nests it under `Credentials`, so real mode could
+  never have issued anything. Fixed; still unverified against a live account.
+- **Second review round, of dfb2b7a (2026-11-16):** rejected with two blockers and five
+  majors, all fixed: recovery now works on a v0.1 directory that never stored a secret, and
+  the upgrade is recorded whichever command runs first; the demo script deletes a directory
+  only when it really is inside `.demo/` (symlinks and ".." resolved); cloud-account edits
+  are serialized and a connection test or key replacement writes only its own fields;
+  giving an account its ID and removing its old roles is one transaction; approvals hold
+  the agent's lock, so parallel approvals cannot exceed the limit; startup and recovery
+  revocations name the agent and owner. Awaiting the third round.
+- **Third review round, of 478e3c0 (2026-11-16):** round two confirmed fixed except one new
+  blocker from my own fix: `csg serve` with a wrong `$CSG_MASTER_KEY` on an old directory
+  wrote the key check with that key and locked the right one out. Fixed: a supplied key
+  must equal `master.key` when the file exists, and a key that exists only in the
+  environment is written into the key check only when the server is about to serve. The
+  upgrade report is now kept in the database until it is audited. Minor items fixed too
+  (deterministic parallel-approval test, demo delete race, `-wal`/`-shm` remnants, owner
+  revocation attribution). Awaiting the fourth round.
+- **Fourth review round, of c6a744a (2026-11-16):** the stricter key rule had its own traps
+  (a whitespace-only `$CSG_MASTER_KEY` made `csg serve` create a random `master.key`; a
+  correct key was refused next to a stale key file; an environment-only key could still be
+  adopted from a typo once a supervisor existed). Replaced by one rule: `serve` and
+  `recover` only read the key and prove it against the data; a supplied key the data proves
+  right wins over the file; a directory with nothing encrypted takes its own `master.key`;
+  with no `master.key` either, the operator must pass `--trust-master-key` once (audited).
+  The upgrade record is written in the upgrade's own transaction and audited atomically.
+  Awaiting the fifth round.
+- **Fifth review round, of 9a2bba9 (2026-11-16): fit as the base for the next piece**, no
+  blocker or major. Its two "require first" items are done: a test for an environment-only
+  old directory that already has a supervisor, and the upgrade is recorded once even when
+  two commands open the same old database at once. Minor items done too (trust decision and
+  key check written together; key check written once the data proves the key; clearer
+  messages for a missing key and a stale key file). These last changes have not been
+  reviewed. Left for later: a `csg init` killed half-way leaves a directory no command can
+  repair; whether every stored secret should be checked against the key at start; the
+  audit-action table in CONTRACT §10.
+- **Piece 2, people on the command line (2026-11-17):** owner chose sign-in by approving a
+  code in the console, and guarded sessions. `csg person login|logout|whoami`, `csg me …`,
+  `csg supervisor people|roles|accounts|settings|audit|requests`. Schema 9: sessions have a
+  kind (console or cli); `cli_signins`. A command-line session cannot approve anything or add
+  a cloud account; raising access needs `X-CSG-Authenticator-Code`. Console: approval page
+  and Settings → Command-line sign-ins. Demo S9 covers it. First review (2026-11-17): a race
+  let a limit be raised without a code (decision and write now under one lock, same for
+  roles); approvals not yet collected survived a suspend or reset (now ended, and the
+  approver can withdraw one); lowering administrator → member asked for a code (fixed).
+  Second round (2026-11-17): fixed except a narrow race between adopting a provider and a
+  role change; the reviewer judged the branch fit as the base for remote MCP once that was
+  closed. Closed (account edits that change the role ARN take the role lock), plus the
+  small items. Not reviewed again.
+- **Piece 3, remote MCP over HTTPS (2026-11-17):** owner chose a one-time link for the
+  credential (the secret goes to a shell, never to the model). `/mcp` (POST, JSON, no SSE),
+  OAuth 2.1 discovery, dynamic registration, PKCE S256, the person approves in the console
+  (`/mcp-connect`), the access token is a new owned agent's token. `get_credential` returns
+  `eval "$(curl -fsS -X POST LINK)"`; the link works once within 60 s. Schema 10:
+  `oauth_clients`, `oauth_requests`, `credential_links`. The MCP tool layer moved to
+  `internal/mcp`, shared with `csg mcp`. Demo S10 covers it; checked live with a scripted
+  OAuth client and the console in a browser. Review: no blocker or major; 12 minor items
+  fixed in 9e17b44. Tried with Claude Code 2.1.221: sign-in, tools, credential link work.
+- **Piece 4, approval mode per account and refresh (2026-11-17):** owner asked that signing
+  in once be enough and that each person control access per cloud account with
+  read/write/full. The mode is now per (person, account); the supervisor's per-account
+  automatic level is removed (upgrade lowers each mode to the old level, so nothing gets
+  more automatic). Refresh: a new key under the same request within a window the agent may
+  declare (default 8 h, supervisor max default 24 h); `csg access refresh`,
+  `csg credential --process aws|aliyun`, MCP `refresh_credential`. Schema 11. Demo S11.
+  Next pieces decided (CONTRACT §17.13, §17.14): AWS via STS + session policy, then
+  long-lived cloud users and keys for supervisors and people they allow (no expiry, shown
+  once in the console, never given to the agent). Review: no blocker, 3 major and 9 minor
+  fixed in 1aef024.
+- **Piece 5, AWS (2026-11-17):** provider type `aws`; STS AssumeRole with a per-request
+  session policy, Signature Version 4 written in-house (verified against the AWS
+  documentation's example), no SDK dependency. S3 templates; AWS deny statement; the IAM
+  guard refuses IAM, Organizations and Identity Center for every cloud. Connection test
+  warns when the role allows IAM. `AWS_*` variables. Mock S3 and IAM routes; console wizard
+  AWS choice; demo S12. Not run against live AWS. Review: no blocker; 3 major and the
+  minor items fixed in 80bb0a1.
+- **Piece 6, long-lived credentials (2026-11-17):** owner chose a separate second key per
+  account and automatic deletion when the owner loses the right. Person flag, second key
+  (AWS with a fixed permissions boundary; RAM has none), request → console link → owner
+  confirms → cloud user, policy and key, secret shown once; revoke and automatic deletion;
+  `revoke_failed` with retry. Schema 12. Mock cloud accepts active long-lived mock keys.
+  MCP `request_long_lived_credential`, `csg access long-lived`, `csg me/supervisor
+  long-lived`. Demo S13. Review of 2c0ce85: 3 blockers (local
+  recovery, create racing a lost right, crash cleanup), 3 majors (AWS boundary step, RAM key
+  wording, managed-identity key) and minors, all fixed in the follow-up commit: full
+  list-and-delete cleanup, recheck after create, startup recovery and a recheck every sweep.
+  Live AWS test (2026-11-18), agent signed in with csg login: STS read (auto) and write
+  (approved in the Inbox) worked on the granted bucket only; another bucket, bucket
+  create/delete and IAM were refused. A revoked STS key kept working until expiry (known,
+  SECURITY.md §6.3); the console's revoke dialogs now say so. Long-lived: create, boundary, policy and revoke all work with a second key
+  that lacks `iam:PutUserPermissionsBoundary`, so it was dropped; the policy simulator denies
+  CreateUser without the boundary or with another one. Still open: how RAM evaluates the
+  two-resource attach statement (real Alibaba Cloud untested).
+- **Known gaps:** the console has no button for the supervisor's emergency stop (API only);
+  README and QUICKSTART are rewritten, the other v0.1 pages carry an out-of-date banner; real
+  Alibaba Cloud is untested.
 - **Blocked:** none. Future work (not v0.1): credential-free proxy mode, per-parameter
   grant constraints, chat approvals, multi-cloud, SSO/multi-tenant (see README roadmap).
 
@@ -44,8 +215,8 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 - **Target kind / environment / surface:** local dev artifact on this macOS machine
   (`/Users/arveykao/code/cloud-safeguard`); surface = CLI + HTTP API + embedded web console (target surface = api; browser E2E covers the console).
   No production deployment requested.
-- **Address / artifact:** `bin/csg` (single binary), demo on `http://127.0.0.1:18787`.
-- **Final demo:** `make demo` → S1–S8 pass; console screenshots captured by verifier.
+- **Address / artifact:** `build/csg` (single binary), demo on `http://127.0.0.1:18787`.
+- **Final demo:** `make demo` → S1–S14 pass; console screenshots captured by verifier.
 - **Evidence / review:** `scripts/demo.sh` transcript, `go test ./...`, `npm run build`,
   verifier report `changes/cloud-safeguard-v0.1/evidence/report/VERIFICATION.md`, canonical
   `arvey-develop delivery check --phase complete` PASS.
@@ -58,7 +229,7 @@ Canonical instructions: `../AGENTS.md` (agentic-delivery block). Product/deliver
 | Dependency setup / build | `make build` (`go` 1.24+, `npm`/Node ≥20) |
 | Automated checks | `go test ./...`; `go vet ./...`; `cd web && npm run typecheck && npm run build` |
 | Demo / E2E | `make demo` (`./scripts/demo.sh --port 18787 --data-dir .demo/data`) |
-| Run console | `./bin/csg init --demo --data-dir .demo/data && ./bin/csg serve --data-dir .demo/data` |
+| Run console | `./build/csg init --demo --data-dir .demo/data && ./build/csg serve --data-dir .demo/data` |
 | Server/API contract checks | Go httptest suites in `internal/server`, `internal/mockcloud`; verifier probes |
 | Performance budget | not triggered (no hot-path optimization target) |
 

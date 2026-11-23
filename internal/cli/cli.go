@@ -1,5 +1,5 @@
-// Package cli implements the csg command-line interface: the operator/admin
-// commands, the agent-side lease workflow and the local init/serve commands.
+// Package cli implements the csg command-line interface: the agent-side
+// access workflow, the MCP server and the local init/serve commands.
 //
 // The CLI is a thin client of the HTTP control plane for everything except
 // `init` and `serve`; this keeps the server authoritative for policy, limits,
@@ -78,6 +78,13 @@ type App struct {
 	Getenv     func(string) string
 	HomeDir    func() (string, error)
 	HTTPClient HTTPDoer // optional; nil uses the default client
+
+	// afterSignInStart runs once an agent sign-in has started (tests use it
+	// to approve the sign-in as a person).
+	afterSignInStart func(model.AgentSignInStart)
+	// afterChildStart runs once csg exec has started the command (tests use
+	// it to interrupt the run).
+	afterChildStart func()
 }
 
 // NewApp returns an App wired to the real process environment.
@@ -133,30 +140,30 @@ func (a *App) Run(args []string) int {
 		err = a.runInit(rest)
 	case "serve":
 		err = a.runServe(rest)
+	case "supervisor":
+		err = a.runSupervisor(rest)
+	case "person":
+		err = a.runPerson(rest)
+	case "me":
+		err = a.runMe(rest)
 	case "login":
 		err = a.runLogin(rest)
 	case "whoami":
 		err = a.runWhoami(rest)
-	case "caps":
-		err = a.runCaps(rest)
-	case "agents":
-		err = a.runAgents(rest)
-	case "providers":
-		err = a.runProviders(rest)
 	case "leases":
 		err = a.runLeases(rest)
-	case "audit":
-		err = a.runAudit(rest)
-	case "policy":
-		err = a.runPolicy(rest)
-	case "request":
-		err = a.runRequest(rest)
 	case "credential":
 		err = a.runCredential(rest)
 	case "exec":
 		err = a.runExec(rest)
 	case "revoke":
 		err = a.runRevoke(rest)
+	case "accounts":
+		err = a.runAccounts(rest)
+	case "access":
+		err = a.runAccess(rest)
+	case "mcp":
+		err = a.runMCP(rest)
 	case "mock":
 		err = a.runMock(rest)
 	default:
@@ -203,29 +210,31 @@ func (a *App) printUsage(w io.Writer) {
 
 Usage: csg <command> [flags]
 
-Local:
-  init       Bootstrap a data directory (admin token shown once)
-  serve      Run the control plane and embedded console
+Local (run on the server host):
+  init       Bootstrap a data directory (the first supervisor's setup code is shown once)
+  serve      Run the control plane and the console
+  supervisor recover  Restore a locked-out supervisor
   version    Print the version
 
-Authentication:
-  login      Validate and save an admin or agent token
-  whoami     Show the current identity
-
-Admin:
-  caps       list | show ID
-  agents     list | get ID | create | suspend ID | activate ID | rotate-token ID
-  providers  list | get ID | add | update ID | rotate ID | test ID
-  leases     list | get ID | approve ID | deny ID | revoke ID
-  audit      list | verify
-  policy     show | set
-
 Agent:
-  request    Request a capability lease
-  credential Fetch the credential for a lease
-  exec       Request a lease and run a command with the credential env
-  leases mine  List my leases
-  revoke     Revoke a lease you own
+  login      Sign this agent in: a person approves a short code in the console
+  whoami     Show the signed-in agent
+  accounts   Cloud accounts you may ask for, with your owner's role
+  access     request | status: ask for read, write or full access
+  exec       Ask for access and run a command with the credential env
+  credential Fetch the credential of an approved request
+  revoke     Give a credential back before it expires
+  leases     mine | get ID: this agent's requests
+  mcp        Run the MCP server for Claude, Cursor and other agents
+
+People (signed in with csg person login):
+  person     login | logout | whoami
+  me         requests | deny | revoke | agents | revoke-agent | accounts | mode | sessions | end-session
+  supervisor people | roles | accounts | settings | audit | requests   (supervisors)
+
+From the command line a person can read everything and lower access. Raising
+access asks for a code from the authenticator app. Approving requests and
+sign-ins, and adding a cloud account, are done in the console only.
 
 Demo:
   mock request METHOD /v1/PATH [JSON_BODY]

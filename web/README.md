@@ -1,68 +1,40 @@
-# Cloud Safeguard — operator console
+# Cloud Safeguard console
 
-React 18 + TypeScript + Vite single-page console for the Cloud Safeguard control
-plane. It is built into `dist/` and embedded in the `csg` binary via `web.FS()`
-(`web/embed.go`); `make build` rebuilds it automatically.
-
-Normative sources: [`docs/CONTRACT.md`](../docs/CONTRACT.md) §3–§5 (API) and §12
-(console requirements); wire types mirror [`internal/model/model.go`](../internal/model/model.go).
+React 18 + TypeScript + Vite single-page console. It is built into `dist/` and embedded in the
+`csg` binary (`web/embed.go`). Normative source: [`docs/CONTRACT.md`](../docs/CONTRACT.md)
+§12 and §17.
 
 ## Commands
 
 ```sh
 npm install            # Node >= 20
-npm run dev            # http://127.0.0.1:18803, proxies /api + /mock-cloud + /healthz to 127.0.0.1:8787
-npm run typecheck      # tsc --noEmit
-npm run build          # typecheck + production bundle into dist/ (base "./")
-npm run preview        # serve the built bundle on 18803 (needs a live API)
-npm run mock           # local devmock API on 127.0.0.1:8787 (see below)
+npm run dev            # http://127.0.0.1:18803, proxies /api, /mock-cloud and /healthz to a running csg serve
+npm run typecheck
+npm run build          # into dist/ (absolute asset paths: routes are nested)
 ```
 
-The shipped app always talks to the same origin (`/api/v1`, `/mock-cloud`,
-`/healthz`); there are no absolute API URLs, external CDNs or webfonts, so it
-works fully offline.
-
-## Local development without the Go backend
-
-`devmock/server.mjs` implements the contract subset the console consumes with
-realistic fixtures (5 capabilities, a mock provider, 2 agents, 10 leases and a
-real hash-chained audit log). It prints a freshly generated admin token on
-startup — nothing is persisted to disk.
-
-```sh
-npm run mock                          # another terminal; port 8787
-npm run dev                           # console on 18803, proxied to the devmock
-# If 8787 is occupied: MOCK_PORT=18804 npm run mock
-# and CSG_API_PROXY=http://127.0.0.1:18804 npm run dev
-```
-
-Use the printed token on the login screen. `MOCK_ADMIN_TOKEN` can pin the token
-for scripted browser tests. The devmock is development tooling only — it is not
-imported by `src/` and therefore never bundled into `dist/`.
+For local development run `csg init --demo` and `csg serve` (port 8787, or set
+`CSG_API_PROXY`), then set up the first supervisor with the code `csg init` printed.
 
 ## Structure
 
 ```
-src/
-  api/types.ts       1:1 TypeScript mirror of internal/model/model.go
-  api/client.ts      typed fetch client, envelopes, 401 -> login, error mapping
-  api/hooks.ts       visibility-aware polling, resources, mutations, server clock
-  auth.ts            admin token storage (localStorage key csg.adminToken)
-  router.tsx         small History-API router (Go server serves index.html fallback)
-  components/        design-system primitives, overlays, toasts, lease decision UI
-  pages/             Login, Overview, Agents, Capabilities, Leases, Providers, Audit, Settings
-  styles/            plain-CSS design tokens + layout/pages (no UI kit)
-devmock/server.mjs   local fixture API (optional, dev only)
+src/main.tsx            entry
+src/app/App.tsx         session gate and page routing
+src/app/api.ts          session client: cookie + in-memory CSRF token, no localStorage
+src/app/types.ts        wire types of the person-facing API
+src/app/ui.tsx          buttons, cards, fields, modal, toasts, QR code, formatting
+src/app/Shell.tsx       sidebar layout
+src/app/pages/          Login, Setup, Inbox, SignInApproval, Agents, Accounts, AddAccount,
+                        Activity, People, Settings
+src/app/app.css         all styles
 ```
 
-## Security properties the UI must preserve
+## Security properties the UI keeps
 
-- The admin token is only read from `localStorage` and sent as a Bearer header; it
-  is never rendered, logged or put in a URL after login.
-- Provider AccessKeys/STS secrets are never rendered, stored client-side or echoed
-  by the rotate form. Only masked AccessKey IDs from the API are shown.
-- The agent bearer token is displayed exactly once, in the create/rotate reveal
-  dialog, and cannot be reopened.
-- Destructive actions (suspend, revoke, deny, disable capability, rotate) use
-  confirm dialogs and required reasons where the contract requires them.
-- `grep -rE 'csg_adm_[A-Za-z0-9]|LTAI[0-9A-Za-z]{8,}' dist/` must stay empty.
+- Sign-in uses the HttpOnly session cookie; the CSRF token lives in memory only and is sent
+  on every change. Nothing secret is written to `localStorage`.
+- Setup codes are shown once, in a dialog that cannot be dismissed by clicking outside.
+- AccessKey secrets are typed into password fields, sent once and never displayed.
+- Text from the server is rendered as text; the only HTML injected is the QR code SVG the
+  console generates itself.

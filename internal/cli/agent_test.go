@@ -12,10 +12,15 @@ import (
 	"github.com/arveykao/cloud-safeguard/internal/model"
 )
 
-// leaseServer wires a fake agent API for lease/credential/revoke flows.
+// accessView is a lease as the access-request endpoints return it.
+func accessView(l model.Lease) model.AccessRequest {
+	return model.AccessRequest{ID: l.ID, Status: l.Status, DeniedReason: l.DeniedReason}
+}
+
+// leaseServer wires a fake agent API for request/credential/revoke flows.
 type leaseServer struct {
 	mu          sync.Mutex
-	createInput model.CreateLeaseInput
+	createInput model.AccessRequestInput
 	revokeInput model.RevokeLeaseInput
 	getCalls    int
 	revokeCalls int
@@ -29,9 +34,14 @@ func (ls *leaseServer) handler(t *testing.T, token string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requireAuth(t, r, token)
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agent/leases":
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agent/access-requests":
 			decodeBody(t, r, &ls.createInput)
-			writeEnvelope(w, http.StatusCreated, ls.createLease)
+			writeEnvelope(w, http.StatusCreated, accessView(ls.createLease))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/agent/access-requests/"):
+			ls.mu.Lock()
+			ls.getCalls++
+			ls.mu.Unlock()
+			writeEnvelope(w, http.StatusOK, accessView(ls.getLease))
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/agent/leases/"):
 			ls.mu.Lock()
 			ls.getCalls++
@@ -71,103 +81,6 @@ func testCredentialEnvelope() model.CredentialEnvelope {
 			{Name: "CSG_SERVER", Value: "http://127.0.0.1:8787"},
 			{Name: "CSG_CAPABILITY", Value: "aliyun.cloud.read"},
 		},
-	}
-}
-
-func TestRequestAutoApproved(t *testing.T) {
-	ls := &leaseServer{createLease: testLease(model.LeaseActive)}
-	srv := httptest.NewServer(ls.handler(t, agentTokenA))
-	defer srv.Close()
-
-	ta := newTestApp(t)
-	ta.useServer(srv.URL, agentTokenA)
-
-	if code := ta.run("request", "--capability", "aliyun.cloud.read", "--ttl", "10m", "--reason", "demo", "--json"); code != ExitOK {
-		t.Fatalf("request exit = %d, stderr = %s", code, ta.errOut())
-	}
-	var lease model.Lease
-	if err := json.Unmarshal(ta.stdout.Bytes(), &lease); err != nil {
-		t.Fatalf("request --json output = %q: %v", ta.out(), err)
-	}
-	if lease.Status != model.LeaseActive {
-		t.Fatalf("lease status = %s", lease.Status)
-	}
-	if ls.createInput.CapabilityID != "aliyun.cloud.read" || ls.createInput.TTLSeconds != 600 || ls.createInput.Reason != "demo" {
-		t.Fatalf("create input = %+v", ls.createInput)
-	}
-
-	// Human output includes the next step.
-	ta.stdout.Reset()
-	ta.stderr.Reset()
-	if code := ta.run("request", "--capability", "aliyun.cloud.read", "--reason", "demo"); code != ExitOK {
-		t.Fatalf("request human exit = %d", code)
-	}
-	if !strings.Contains(ta.out(), "status:    active") || !strings.Contains(ta.out(), "csg credential --lease lea_test01") {
-		t.Fatalf("request human output = %q", ta.out())
-	}
-}
-
-func TestRequestDeniedExitsOne(t *testing.T) {
-	denied := testLease(model.LeaseDenied)
-	ls := &leaseServer{createLease: denied}
-	srv := httptest.NewServer(ls.handler(t, agentTokenA))
-	defer srv.Close()
-
-	ta := newTestApp(t)
-	ta.useServer(srv.URL, agentTokenA)
-	code := ta.run("request", "--capability", "aliyun.dns.manage", "--param", "domain=arveykao.com", "--reason", "x", "--json")
-	if code != ExitOperationErr {
-		t.Fatalf("exit = %d, want %d", code, ExitOperationErr)
-	}
-	// The lease payload is still printed, and the denial reason goes to stderr.
-	if !strings.Contains(ta.out(), `"status": "denied"`) {
-		t.Fatalf("stdout = %q", ta.out())
-	}
-	if !strings.Contains(ta.errOut(), "denied") || !strings.Contains(ta.errOut(), "risk_above_auto") {
-		t.Fatalf("stderr = %q", ta.errOut())
-	}
-	if params := ls.createInput.Params; params["domain"] != "arveykao.com" {
-		t.Fatalf("params = %v", params)
-	}
-}
-
-func TestRequestWaitBecomesActive(t *testing.T) {
-	pending := testLease(model.LeasePending)
-	ls := &leaseServer{createLease: pending, getLease: testLease(model.LeaseActive)}
-	srv := httptest.NewServer(ls.handler(t, agentTokenA))
-	defer srv.Close()
-
-	ta := newTestApp(t)
-	ta.useServer(srv.URL, agentTokenA)
-	if code := ta.run("request", "--capability", "aliyun.dns.manage", "--wait", "5s", "--json"); code != ExitOK {
-		t.Fatalf("exit = %d, stderr = %s", code, ta.errOut())
-	}
-	var lease model.Lease
-	if err := json.Unmarshal(ta.stdout.Bytes(), &lease); err != nil {
-		t.Fatalf("output: %v", err)
-	}
-	if lease.Status != model.LeaseActive {
-		t.Fatalf("leased status = %s, want active", lease.Status)
-	}
-	if ls.getCalls == 0 {
-		t.Fatal("wait did not poll GET /agent/leases/{id}")
-	}
-}
-
-func TestRequestWaitTimeout(t *testing.T) {
-	pending := testLease(model.LeasePending)
-	ls := &leaseServer{createLease: pending, getLease: pending}
-	srv := httptest.NewServer(ls.handler(t, agentTokenA))
-	defer srv.Close()
-
-	ta := newTestApp(t)
-	ta.useServer(srv.URL, agentTokenA)
-	code := ta.run("request", "--capability", "aliyun.dns.manage", "--wait", "1s")
-	if code != ExitWaitTimeout {
-		t.Fatalf("exit = %d, want %d; stderr = %s", code, ExitWaitTimeout, ta.errOut())
-	}
-	if !strings.Contains(ta.errOut(), "timed out") {
-		t.Fatalf("stderr = %q", ta.errOut())
 	}
 }
 
@@ -232,7 +145,7 @@ func TestExecInjectsEnvAndRevokes(t *testing.T) {
 
 	ta := newTestApp(t)
 	ta.useServer(srv.URL, agentTokenA)
-	code := ta.run("exec", "--capability", "aliyun.cloud.read", "--reason", "exec demo", "--",
+	code := ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--reason", "exec demo", "--",
 		"sh", "-c", `printf '%s|%s|%s' "$ALIBABA_CLOUD_ACCESS_KEY_ID" "$ALIBABA_CLOUD_SECURITY_TOKEN" "$CSG_LEASE_ID"; exit 3`)
 	if code != 3 {
 		t.Fatalf("exit = %d, want child exit 3; stderr = %s", code, ta.errOut())
@@ -243,11 +156,15 @@ func TestExecInjectsEnvAndRevokes(t *testing.T) {
 	if strings.Contains(ta.errOut(), "cgk1.mock-token-value") || strings.Contains(ta.errOut(), "c2VjcmV0") {
 		t.Fatalf("secret leaked to stderr summary: %q", ta.errOut())
 	}
-	if !strings.Contains(ta.errOut(), "csg exec: lease lea_test01") || !strings.Contains(ta.errOut(), "exit 3") {
+	if !strings.Contains(ta.errOut(), "csg exec: lea_test01") || !strings.Contains(ta.errOut(), "exit 3") {
 		t.Fatalf("summary stderr = %q", ta.errOut())
 	}
 	if ls.revokeCalls != 1 {
 		t.Fatalf("revoke calls = %d, want 1", ls.revokeCalls)
+	}
+	if in := ls.createInput; in.CloudAccountID != "1234567890123456" || in.Resource != "ecs" || in.Permission != "read" ||
+		in.TTLSeconds != 600 || in.Reason != "exec demo" {
+		t.Fatalf("request input = %+v", in)
 	}
 	if ls.revokeInput.Reason != "csg exec completed" {
 		t.Fatalf("revoke reason = %q", ls.revokeInput.Reason)
@@ -261,7 +178,7 @@ func TestExecKeepLeavesLeaseActive(t *testing.T) {
 
 	ta := newTestApp(t)
 	ta.useServer(srv.URL, agentTokenA)
-	if code := ta.run("exec", "--capability", "aliyun.cloud.read", "--keep", "--", "true"); code != ExitOK {
+	if code := ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--keep", "--", "true"); code != ExitOK {
 		t.Fatalf("exec --keep exit = %d, stderr = %s", code, ta.errOut())
 	}
 	if ls.revokeCalls != 0 {
@@ -280,7 +197,7 @@ func TestExecPendingTimesOut(t *testing.T) {
 
 	ta := newTestApp(t)
 	ta.useServer(srv.URL, agentTokenA)
-	if code := ta.run("exec", "--capability", "aliyun.dns.manage", "--wait", "1s", "--", "true"); code != ExitWaitTimeout {
+	if code := ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--wait", "1s", "--", "true"); code != ExitWaitTimeout {
 		t.Fatalf("exit = %d, want %d; stderr = %s", code, ExitWaitTimeout, ta.errOut())
 	}
 }
@@ -293,7 +210,7 @@ func TestExecMissingCommandIsError(t *testing.T) {
 	ta := newTestApp(t)
 	ta.useServer(srv.URL, agentTokenA)
 	// A command that cannot be started: revoke the unused credential and exit 1.
-	if code := ta.run("exec", "--capability", "aliyun.cloud.read", "--", "/definitely/not/a/command"); code != ExitOperationErr {
+	if code := ta.run("exec", "--account", "1234567890123456", "--resource", "ecs", "--permission", "read", "--ttl", "10m", "--", "/definitely/not/a/command"); code != ExitOperationErr {
 		t.Fatalf("exit = %d, want %d; stderr = %s", code, ExitOperationErr, ta.errOut())
 	}
 	if ls.revokeCalls != 1 {

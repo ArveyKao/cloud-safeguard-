@@ -1,5 +1,9 @@
 # Cloud Safeguard — Product & Delivery Specification (MVP v0.1)
 
+> **Out of date since 2026-11-15.** This page describes v0.1. The admin token, agent grants and capability leases were removed; people now
+> sign in to the console, agents sign in with `csg login` and ask for access per cloud account.
+> The running behaviour is [CONTRACT.md](CONTRACT.md) §17. A rewrite of this page is pending.
+
 Status: frozen for the v0.1 build. Owner: Lead. Date: 2026-11-08.
 Canonical implementation contract: [`docs/CONTRACT.md`](CONTRACT.md). Shared Go types:
 `internal/model/model.go`. Owners map: §8.

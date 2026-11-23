@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -16,7 +17,8 @@ const leaseColumns = `id, agent_id, agent_name, capability_id, capability_name,
 	requested_ttl_seconds, effective_ttl_seconds, status, decision_json, break_glass,
 	approved_by, approval_note, denied_reason, revoke_reason, failure_reason,
 	session_name, credential_available, credential_fingerprint, created_at,
-	approved_at, issued_at, expires_at, revoked_at`
+	approved_at, issued_at, expires_at, revoked_at,
+	max_lifetime_seconds, refresh_until, refresh_count, last_refreshed_at`
 
 // scanLease scans one lease row (credential blob excluded).
 func scanLease(row rowScanner) (model.Lease, error) {
@@ -31,6 +33,8 @@ func scanLease(row rowScanner) (model.Lease, error) {
 		issuedAt      *int64
 		expiresAt     *int64
 		revokedAt     *int64
+		refreshUntil  *int64
+		lastRefreshed *int64
 	)
 	err := row.Scan(
 		&l.ID, &l.AgentID, &l.AgentName, &l.CapabilityID, &l.CapabilityName,
@@ -39,6 +43,7 @@ func scanLease(row rowScanner) (model.Lease, error) {
 		&l.ApprovedBy, &l.ApprovalNote, &l.DeniedReason, &l.RevokeReason, &l.FailureReason,
 		&l.SessionName, &credAvailable, &l.CredentialFingerprint, &createdAt,
 		&approvedAt, &issuedAt, &expiresAt, &revokedAt,
+		&l.MaxLifetimeSeconds, &refreshUntil, &l.RefreshCount, &lastRefreshed,
 	)
 	if err != nil {
 		return model.Lease{}, mapErr(err)
@@ -50,6 +55,8 @@ func scanLease(row rowScanner) (model.Lease, error) {
 	l.IssuedAt = timePtr(issuedAt)
 	l.ExpiresAt = timePtr(expiresAt)
 	l.RevokedAt = timePtr(revokedAt)
+	l.RefreshUntil = timePtr(refreshUntil)
+	l.LastRefreshedAt = timePtr(lastRefreshed)
 	if paramsJSON != "" && paramsJSON != "null" {
 		if err := json.Unmarshal([]byte(paramsJSON), &l.Params); err != nil {
 			return model.Lease{}, fmt.Errorf("store: corrupt lease params for %s: %w", l.ID, err)
@@ -78,13 +85,14 @@ func (db *DB) CreateLease(ctx context.Context, l model.Lease) error {
 	}
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO leases(`+leaseColumns+`, encrypted_credential)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
 		l.ID, l.AgentID, l.AgentName, l.CapabilityID, l.CapabilityName,
 		l.ProviderID, l.ProviderName, string(l.ProviderMode), string(l.Risk), paramsJSON, l.Reason,
 		l.RequestedTTLSeconds, l.EffectiveTTLSeconds, string(l.Status), decisionJSON, boolInt(l.BreakGlass),
 		l.ApprovedBy, l.ApprovalNote, l.DeniedReason, l.RevokeReason, l.FailureReason,
 		l.SessionName, boolInt(l.CredentialAvailable), l.CredentialFingerprint, toMillis(l.CreatedAt),
 		millisPtr(l.ApprovedAt), millisPtr(l.IssuedAt), millisPtr(l.ExpiresAt), millisPtr(l.RevokedAt),
+		l.MaxLifetimeSeconds, millisPtr(l.RefreshUntil), l.RefreshCount, millisPtr(l.LastRefreshedAt),
 	)
 	return mapErr(err)
 }
@@ -99,31 +107,7 @@ func (db *DB) GetLease(ctx context.Context, id string) (model.Lease, error) {
 // number of matching records.
 func (db *DB) ListLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, int, error) {
 	limit, offset := pageParams(f.Limit, f.Offset)
-
-	var (
-		where []string
-		args  []any
-	)
-	if len(f.Statuses) > 0 {
-		placeholders := make([]string, 0, len(f.Statuses))
-		for _, s := range f.Statuses {
-			placeholders = append(placeholders, "?")
-			args = append(args, string(s))
-		}
-		where = append(where, "status IN ("+strings.Join(placeholders, ", ")+")")
-	}
-	if f.AgentID != "" {
-		where = append(where, "agent_id = ?")
-		args = append(args, f.AgentID)
-	}
-	if f.CapabilityID != "" {
-		where = append(where, "capability_id = ?")
-		args = append(args, f.CapabilityID)
-	}
-	whereSQL := ""
-	if len(where) > 0 {
-		whereSQL = " WHERE " + strings.Join(where, " AND ")
-	}
+	whereSQL, args := leaseWhere(f)
 
 	var total int
 	if err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases`+whereSQL, args...).Scan(&total); err != nil {
@@ -153,10 +137,87 @@ func (db *DB) ListLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, int
 	return items, total, nil
 }
 
+// ListAllLeases returns every lease matching f (Limit and Offset are ignored)
+// from one query, i.e. one consistent snapshot. Security sweeps use it: paging
+// with LIMIT/OFFSET over a set that changes between pages can skip rows.
+func (db *DB) ListAllLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, error) {
+	whereSQL, args := leaseWhere(f)
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+leaseColumns+` FROM leases`+whereSQL+` ORDER BY created_at DESC, id DESC`, args...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	var items []model.Lease
+	for rows.Next() {
+		l, err := scanLease(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+	return items, nil
+}
+
+// leaseWhere builds the WHERE clause and arguments for a lease filter.
+func leaseWhere(f LeaseFilter) (string, []any) {
+	var (
+		where []string
+		args  []any
+	)
+	if len(f.Statuses) > 0 {
+		placeholders := make([]string, 0, len(f.Statuses))
+		for _, s := range f.Statuses {
+			placeholders = append(placeholders, "?")
+			args = append(args, string(s))
+		}
+		where = append(where, "status IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if f.AgentID != "" {
+		where = append(where, "agent_id = ?")
+		args = append(args, f.AgentID)
+	}
+	if f.CapabilityID != "" {
+		where = append(where, "capability_id = ?")
+		args = append(args, f.CapabilityID)
+	}
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " WHERE " + strings.Join(where, " AND ")
+	}
+	return whereSQL, args
+}
+
 // UpdateLease persists all mutable lifecycle fields of a lease. The encrypted
 // credential blob is managed separately by SetLeaseCredential /
 // ClearLeaseCredential.
 func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
+	return db.updateLease(ctx, l, "")
+}
+
+// UpdateLeaseIfStatus implements Store.UpdateLeaseIfStatus as a single
+// compare-and-set UPDATE, so the status check and the write are atomic.
+func (db *DB) UpdateLeaseIfStatus(ctx context.Context, l model.Lease, expected model.LeaseStatus) error {
+	if expected == "" {
+		return fmt.Errorf("store: UpdateLeaseIfStatus needs an expected status")
+	}
+	err := db.updateLease(ctx, l, expected)
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	// Zero rows: tell a missing lease apart from one that changed status.
+	if _, gerr := db.GetLease(ctx, l.ID); gerr == nil {
+		return ErrConflict
+	}
+	return ErrNotFound
+}
+
+// updateLease writes every mutable lease field. A non-empty expected status
+// adds "AND status = expected" to the WHERE clause.
+func (db *DB) updateLease(ctx context.Context, l model.Lease, expected model.LeaseStatus) error {
 	paramsJSON, err := marshalJSON(l.Params, "{}")
 	if err != nil {
 		return err
@@ -172,8 +233,8 @@ func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
 			decision_json = ?, break_glass = ?, approved_by = ?, approval_note = ?,
 			denied_reason = ?, revoke_reason = ?, failure_reason = ?, session_name = ?,
 			credential_available = ?, credential_fingerprint = ?, approved_at = ?, issued_at = ?,
-			expires_at = ?, revoked_at = ?
-		 WHERE id = ?`,
+			expires_at = ?, revoked_at = ?, max_lifetime_seconds = ?, refresh_until = ?
+		 WHERE id = ? AND (? = '' OR status = ?)`,
 		l.AgentID, l.AgentName, l.CapabilityID, l.CapabilityName,
 		l.ProviderID, l.ProviderName, string(l.ProviderMode), string(l.Risk), paramsJSON,
 		l.Reason, l.RequestedTTLSeconds, l.EffectiveTTLSeconds, string(l.Status),
@@ -181,7 +242,8 @@ func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
 		l.DeniedReason, l.RevokeReason, l.FailureReason, l.SessionName,
 		boolInt(l.CredentialAvailable), l.CredentialFingerprint,
 		millisPtr(l.ApprovedAt), millisPtr(l.IssuedAt), millisPtr(l.ExpiresAt), millisPtr(l.RevokedAt),
-		l.ID,
+		l.MaxLifetimeSeconds, millisPtr(l.RefreshUntil),
+		l.ID, string(expected), string(expected),
 	)
 	if err != nil {
 		return mapErr(err)
@@ -191,16 +253,67 @@ func (db *DB) UpdateLease(ctx context.Context, l model.Lease) error {
 
 // SetLeaseCredential stores the encrypted credential blob and its non-secret
 // display fingerprint, marking the credential as available.
+//
+// It writes only while the lease is still pending, so a minting attempt that
+// lost a race can never overwrite the credential of a lease another attempt
+// already activated (or one that was revoked or expired). It returns
+// ErrConflict when the lease exists but is no longer pending.
 func (db *DB) SetLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string) error {
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE leases SET encrypted_credential = ?, credential_fingerprint = ?,
 			credential_available = 1
-		 WHERE id = ?`,
-		encryptedCredential, fingerprint, leaseID)
+		 WHERE id = ? AND status = ?`,
+		encryptedCredential, fingerprint, leaseID, string(model.LeasePending))
 	if err != nil {
 		return mapErr(err)
 	}
-	return affectedOrNotFound(res)
+	if err := affectedOrNotFound(res); !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if _, gerr := db.GetLease(ctx, leaseID); gerr == nil {
+		return ErrConflict
+	}
+	return ErrNotFound
+}
+
+// RefreshLeaseCredential stores a refreshed credential (CONTRACT §17.12): the
+// new blob, fingerprint and deadline, counting the refresh. It is a
+// compare-and-set on the lease being active with the deadline the caller
+// read, so two refreshes cannot both win and a revoke or expiry in between
+// is never undone; ErrConflict otherwise.
+func (db *DB) RefreshLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string, previousExpiry, newExpiry, windowEnd, now time.Time) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE leases SET encrypted_credential = ?, credential_fingerprint = ?, credential_available = 1,
+			expires_at = ?, refresh_count = refresh_count + 1
+		 WHERE id = ? AND status = ? AND expires_at = ? AND expires_at > ?
+		   AND refresh_until IS NOT NULL AND ? <= refresh_until AND ? <= ?`,
+		encryptedCredential, fingerprint, toMillis(newExpiry),
+		leaseID, string(model.LeaseActive), toMillis(previousExpiry), toMillis(now), toMillis(newExpiry),
+		toMillis(newExpiry), toMillis(windowEnd))
+	if err != nil {
+		return mapErr(err)
+	}
+	if err := affectedOrNotFound(res); !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if _, gerr := db.GetLease(ctx, leaseID); gerr == nil {
+		return ErrConflict
+	}
+	return ErrNotFound
+}
+
+// ReserveRefreshAttempt records a refresh attempt of an active lease at now,
+// unless one was recorded less than interval ago (ErrConflict). It runs
+// before the cloud is asked, so failed attempts count too (CONTRACT §17.12).
+func (db *DB) ReserveRefreshAttempt(ctx context.Context, leaseID string, now time.Time, interval time.Duration) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE leases SET last_refreshed_at = ?
+		 WHERE id = ? AND status = ? AND (last_refreshed_at IS NULL OR last_refreshed_at <= ?)`,
+		toMillis(now), leaseID, string(model.LeaseActive), toMillis(now.Add(-interval)))
+	if err != nil {
+		return mapErr(err)
+	}
+	return affectedOrConflict(res)
 }
 
 // GetLeaseCredential returns the encrypted credential blob.
@@ -285,65 +398,6 @@ func (db *DB) listLeasesByStatus(ctx context.Context, status model.LeaseStatus) 
 		return nil, mapErr(err)
 	}
 	return out, nil
-}
-
-// CountLeasesByRisk counts leases in the given statuses grouped by risk tier.
-// It backs the dashboard risk breakdown (not part of the frozen Store interface).
-func (db *DB) CountLeasesByRisk(ctx context.Context, statuses []model.LeaseStatus) (model.RiskBreakdown, error) {
-	var out model.RiskBreakdown
-	if len(statuses) == 0 {
-		return out, nil
-	}
-	placeholders := make([]string, 0, len(statuses))
-	args := make([]any, 0, len(statuses))
-	for _, s := range statuses {
-		placeholders = append(placeholders, "?")
-		args = append(args, string(s))
-	}
-	rows, err := db.sql.QueryContext(ctx,
-		`SELECT risk, COUNT(*) FROM leases WHERE status IN (`+strings.Join(placeholders, ", ")+`) GROUP BY risk`,
-		args...)
-	if err != nil {
-		return out, mapErr(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			risk string
-			n    int
-		)
-		if err := rows.Scan(&risk, &n); err != nil {
-			return out, mapErr(err)
-		}
-		switch model.RiskTier(risk) {
-		case model.RiskLow:
-			out.Low += n
-		case model.RiskMedium:
-			out.Medium += n
-		case model.RiskHigh:
-			out.High += n
-		case model.RiskCritical:
-			out.Critical += n
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return out, mapErr(err)
-	}
-	return out, nil
-}
-
-// CountLeasesCreatedSinceByStatus counts leases with one status created since
-// the given time (dashboard "denied in last 24h" counter). It is a concrete-DB
-// extension, not part of the frozen Store interface.
-func (db *DB) CountLeasesCreatedSinceByStatus(ctx context.Context, status model.LeaseStatus, since time.Time) (int, error) {
-	var n int
-	err := db.sql.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM leases WHERE status = ? AND created_at >= ?`,
-		string(status), toMillis(since)).Scan(&n)
-	if err != nil {
-		return 0, mapErr(err)
-	}
-	return n, nil
 }
 
 // pageParams normalizes pagination: default limit 50, cap 200, offset >= 0.

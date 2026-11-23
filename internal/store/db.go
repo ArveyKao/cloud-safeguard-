@@ -16,24 +16,36 @@ import (
 // Meta keys stored in the meta table. These are part of the bootstrap contract
 // (docs/CONTRACT.md §11) and are read by the CLI/serve startup checks.
 const (
-	MetaSchemaVersion    = "schema_version"
-	MetaInstanceID       = "instance_id"
-	MetaAdminTokenHash   = "admin_token_hash"
-	MetaAdminTokenPrefix = "admin_token_prefix"
-	MetaBootstrapTime    = "bootstrap_time"
-	MetaDemoMode         = "demo_mode"
-	MetaPolicySettings   = "policy_settings"
+	MetaSchemaVersion  = "schema_version"
+	MetaInstanceID     = "instance_id"
+	MetaBootstrapTime  = "bootstrap_time"
+	MetaDemoMode       = "demo_mode"
+	MetaPolicySettings = "policy_settings"
+	// MetaVaultKeyCheck holds a known plaintext encrypted with the master
+	// key, so a wrong key is detected even when nothing else is encrypted.
+	MetaVaultKeyCheck = "vault_key_check"
 )
 
-// currentSchemaVersion is the schema version this binary writes and expects.
-const currentSchemaVersion = 1
+// CurrentSchemaVersion is the schema version this binary writes and expects.
+// It is exported because the bootstrap path records it in the meta table.
+const CurrentSchemaVersion = 12
 
-// migrations is the ordered list of schema migrations. Migration index i moves
-// the schema from version i to i+1. Statements are executed one at a time
-// inside a transaction, then the schema_version meta key is bumped.
-var migrations = [][][]string{
+// migration is one ordered schema step. Migration index i moves the schema
+// from version i to i+1.
+type migration struct {
+	// statements are DDL/DML statements executed one at a time.
+	statements []string
+	// transform is an optional data migration that needs Go logic. It runs in
+	// the same transaction, after statements.
+	transform func(ctx context.Context, tx *sql.Tx, report *MigrationReport) error
+}
+
+// migrations is the ordered list of schema migrations. Each runs inside a
+// transaction, after which the schema_version meta key is bumped. Migrations
+// are append-only: never edit a released one.
+var migrations = []migration{
 	{ // version 0 -> 1
-		{
+		statements: []string{
 			`CREATE TABLE IF NOT EXISTS meta (
 				key   TEXT PRIMARY KEY,
 				value TEXT NOT NULL
@@ -139,25 +151,495 @@ var migrations = [][][]string{
 			`CREATE INDEX IF NOT EXISTS idx_audit_severity ON audit(severity)`,
 		},
 	},
+	{ // version 1 -> 2: agent roles and capability access levels (CONTRACT §16.6)
+		statements: []string{
+			`ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE capabilities ADD COLUMN access TEXT NOT NULL DEFAULT ''`,
+		},
+		transform: migrateRolesAndAccess,
+	},
+	{ // version 2 -> 3: people, supervisors, role bindings, sessions (CONTRACT §17)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS persons (
+				id               TEXT PRIMARY KEY,
+				username         TEXT NOT NULL UNIQUE,
+				display_name     TEXT NOT NULL DEFAULT '',
+				status           TEXT NOT NULL,
+				supervisor       INTEGER NOT NULL DEFAULT 0,
+				password_hash    TEXT NOT NULL DEFAULT '',
+				totp_secret_enc  TEXT NOT NULL DEFAULT '',
+				totp_last_step   INTEGER NOT NULL DEFAULT -1,
+				setup_code_hash  TEXT NOT NULL DEFAULT '',
+				setup_expires_at INTEGER,
+				failed_logins    INTEGER NOT NULL DEFAULT 0,
+				locked_until     INTEGER,
+				last_login_at    INTEGER,
+				created_at       INTEGER NOT NULL,
+				updated_at       INTEGER NOT NULL
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_persons_setup ON persons(setup_code_hash) WHERE setup_code_hash <> ''`,
+			`CREATE TABLE IF NOT EXISTS role_bindings (
+				person_id   TEXT NOT NULL,
+				provider_id TEXT NOT NULL,
+				role        TEXT NOT NULL,
+				created_by  TEXT NOT NULL DEFAULT '',
+				created_at  INTEGER NOT NULL,
+				updated_at  INTEGER NOT NULL,
+				PRIMARY KEY (person_id, provider_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_bindings_provider ON role_bindings(provider_id)`,
+			`CREATE TABLE IF NOT EXISTS sessions (
+				token_hash   TEXT PRIMARY KEY,
+				person_id    TEXT NOT NULL,
+				csrf_token   TEXT NOT NULL,
+				created_at   INTEGER NOT NULL,
+				last_seen_at INTEGER NOT NULL,
+				expires_at   INTEGER NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_sessions_person ON sessions(person_id)`,
+		},
+	},
+	{ // version 3 -> 4: agent ownership and agent-first sign-in (CONTRACT §17.3)
+		statements: []string{
+			`ALTER TABLE agents ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_id)`,
+			`CREATE TABLE IF NOT EXISTS agent_signins (
+				id               TEXT PRIMARY KEY,
+				device_code_hash TEXT NOT NULL UNIQUE,
+				user_code        TEXT NOT NULL UNIQUE,
+				agent_name       TEXT NOT NULL,
+				description      TEXT NOT NULL DEFAULT '',
+				status           TEXT NOT NULL,
+				person_id        TEXT NOT NULL DEFAULT '',
+				agent_id         TEXT NOT NULL DEFAULT '',
+				remote_addr      TEXT NOT NULL DEFAULT '',
+				created_at       INTEGER NOT NULL,
+				expires_at       INTEGER NOT NULL,
+				decided_at       INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_signins_status ON agent_signins(status, expires_at)`,
+		},
+	},
+	{ // version 4 -> 5: cloud account IDs on providers (CONTRACT §17.2)
+		statements: []string{
+			`ALTER TABLE providers ADD COLUMN cloud_account_id TEXT NOT NULL DEFAULT ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_cloud_account
+				ON providers(cloud_account_id) WHERE cloud_account_id <> ''`,
+		},
+		transform: migrateCloudAccountIDs,
+	},
+	{ // version 5 -> 6: approval modes (CONTRACT §17.5)
+		statements: []string{
+			`ALTER TABLE persons ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'read'`,
+			`ALTER TABLE persons ADD COLUMN approval_mode_expires_at INTEGER`,
+			`ALTER TABLE providers ADD COLUMN max_auto_level TEXT NOT NULL DEFAULT 'read'`,
+		},
+	},
+	{ // version 6 -> 7: who issued each setup code (CONTRACT §17.3)
+		statements: []string{
+			`ALTER TABLE persons ADD COLUMN setup_issued_by TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE persons ADD COLUMN setup_issued_by_name TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE persons ADD COLUMN setup_issued_kind TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE persons ADD COLUMN setup_issued_at INTEGER`,
+		},
+	},
+	{ // version 7 -> 8: no admin token, no agents without an owner (CONTRACT §17.7a)
+		transform: removeAdminTokenAndOldAgentModel,
+	},
+	{ // version 8 -> 9: people on the command line (CONTRACT §17.9)
+		// The session columns are added by the transform, only when missing.
+		transform: addSessionKindColumns,
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS cli_signins (
+				id               TEXT PRIMARY KEY,
+				device_code_hash TEXT NOT NULL UNIQUE,
+				user_code        TEXT NOT NULL UNIQUE,
+				client_name      TEXT NOT NULL,
+				status           TEXT NOT NULL,
+				person_id        TEXT NOT NULL DEFAULT '',
+				session_id       TEXT NOT NULL DEFAULT '',
+				remote_addr      TEXT NOT NULL DEFAULT '',
+				created_at       INTEGER NOT NULL,
+				expires_at       INTEGER NOT NULL,
+				decided_at       INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_cli_signins_status ON cli_signins(status, expires_at)`,
+		},
+	},
+	{ // version 9 -> 10: remote MCP with OAuth sign-in (CONTRACT §17.10)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS oauth_clients (
+				id            TEXT PRIMARY KEY,
+				client_name   TEXT NOT NULL,
+				redirect_uris TEXT NOT NULL,
+				remote_addr   TEXT NOT NULL DEFAULT '',
+				created_at    INTEGER NOT NULL,
+				last_used_at  INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_oauth_clients_created ON oauth_clients(created_at)`,
+			`CREATE TABLE IF NOT EXISTS oauth_requests (
+				id             TEXT PRIMARY KEY,
+				connect_hash   TEXT NOT NULL UNIQUE,
+				client_id      TEXT NOT NULL,
+				redirect_uri   TEXT NOT NULL,
+				code_challenge TEXT NOT NULL,
+				state          TEXT NOT NULL DEFAULT '',
+				status         TEXT NOT NULL,
+				person_id      TEXT NOT NULL DEFAULT '',
+				agent_name     TEXT NOT NULL DEFAULT '',
+				code_hash      TEXT NOT NULL DEFAULT '',
+				agent_id       TEXT NOT NULL DEFAULT '',
+				remote_addr    TEXT NOT NULL DEFAULT '',
+				issuer         TEXT NOT NULL DEFAULT '',
+				created_at     INTEGER NOT NULL,
+				expires_at     INTEGER NOT NULL,
+				decided_at     INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_oauth_requests_status ON oauth_requests(status, expires_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_oauth_requests_code ON oauth_requests(code_hash) WHERE code_hash <> ''`,
+			`CREATE TABLE IF NOT EXISTS credential_links (
+				token_hash TEXT PRIMARY KEY,
+				lease_id   TEXT NOT NULL,
+				agent_id   TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				expires_at INTEGER NOT NULL,
+				used_at    INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_credential_links_expires ON credential_links(expires_at)`,
+		},
+	},
+	{ // version 10 -> 11: approval mode per cloud account, refresh (CONTRACT §17.11, §17.12)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS account_modes (
+				person_id   TEXT NOT NULL,
+				provider_id TEXT NOT NULL,
+				mode        TEXT NOT NULL,
+				expires_at  INTEGER,
+				updated_at  INTEGER NOT NULL,
+				PRIMARY KEY (person_id, provider_id)
+			)`,
+		},
+		transform: migrateAccountModes,
+	},
+	{ // version 11 -> 12: long-lived credentials (CONTRACT §17.14)
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS long_lived_credentials (
+				id             TEXT PRIMARY KEY,
+				link_hash      TEXT NOT NULL UNIQUE,
+				provider_id    TEXT NOT NULL,
+				owner_id       TEXT NOT NULL,
+				agent_id       TEXT NOT NULL DEFAULT '',
+				agent_name     TEXT NOT NULL DEFAULT '',
+				capability_id  TEXT NOT NULL,
+				resource_name  TEXT NOT NULL,
+				reason         TEXT NOT NULL DEFAULT '',
+				status         TEXT NOT NULL,
+				cloud_user     TEXT NOT NULL DEFAULT '',
+				cloud_policy   TEXT NOT NULL DEFAULT '',
+				access_key_id  TEXT NOT NULL DEFAULT '',
+				failure_reason TEXT NOT NULL DEFAULT '',
+				revoke_reason  TEXT NOT NULL DEFAULT '',
+				created_at     INTEGER NOT NULL,
+				expires_at     INTEGER NOT NULL,
+				decided_at     INTEGER,
+				revoked_at     INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_long_lived_owner ON long_lived_credentials(owner_id, status)`,
+			`CREATE INDEX IF NOT EXISTS idx_long_lived_provider ON long_lived_credentials(provider_id, status)`,
+		},
+		transform: addLongLivedColumns,
+	},
 }
 
-// applyMigrations brings the database schema up to currentSchemaVersion. It is
+// tableColumns returns the names of a table's columns.
+func tableColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		have[name] = true
+	}
+	return have, rows.Err()
+}
+
+// addLongLivedColumns adds the person flag and the second provider key of
+// schema 12 where they are missing.
+func addLongLivedColumns(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	for _, t := range []struct {
+		table string
+		cols  []struct{ name, ddl string }
+	}{
+		{"persons", []struct{ name, ddl string }{
+			{"long_lived", `ALTER TABLE persons ADD COLUMN long_lived INTEGER NOT NULL DEFAULT 0`},
+		}},
+		{"providers", []struct{ name, ddl string }{
+			{"user_admin_credential", `ALTER TABLE providers ADD COLUMN user_admin_credential TEXT NOT NULL DEFAULT ''`},
+			{"user_admin_key_masked", `ALTER TABLE providers ADD COLUMN user_admin_key_masked TEXT NOT NULL DEFAULT ''`},
+		}},
+	} {
+		have, err := tableColumns(ctx, tx, t.table)
+		if err != nil {
+			return err
+		}
+		for _, c := range t.cols {
+			if have[c.name] {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, c.ddl); err != nil {
+				return fmt.Errorf("store: add %s.%s: %w", t.table, c.name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// migrateAccountModes adds the refresh columns of leases and turns each
+// person's single approval mode into a mode on each cloud account where they
+// hold a role, lowered to that account's former highest automatic level, so
+// nothing becomes more automatic than it was (CONTRACT §17.11). An expired
+// mode, or one that was read on either side, is not carried over.
+func migrateAccountModes(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	have, err := tableColumns(ctx, tx, "leases")
+	if err != nil {
+		return err
+	}
+	for _, c := range []struct{ name, ddl string }{
+		{"max_lifetime_seconds", `ALTER TABLE leases ADD COLUMN max_lifetime_seconds INTEGER NOT NULL DEFAULT 0`},
+		{"refresh_until", `ALTER TABLE leases ADD COLUMN refresh_until INTEGER`},
+		{"refresh_count", `ALTER TABLE leases ADD COLUMN refresh_count INTEGER NOT NULL DEFAULT 0`},
+		{"last_refreshed_at", `ALTER TABLE leases ADD COLUMN last_refreshed_at INTEGER`},
+	} {
+		if have[c.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, c.ddl); err != nil {
+			return fmt.Errorf("store: add leases.%s: %w", c.name, err)
+		}
+	}
+	now := time.Now().UTC().UnixMilli()
+	rank := func(col string) string {
+		return `(CASE ` + col + ` WHEN 'full' THEN 3 WHEN 'write' THEN 2 ELSE 1 END)`
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO account_modes(person_id, provider_id, mode, expires_at, updated_at)
+		 SELECT p.id, pr.id,
+		        CASE WHEN `+rank("p.approval_mode")+` <= `+rank("pr.max_auto_level")+` THEN p.approval_mode ELSE pr.max_auto_level END,
+		        p.approval_mode_expires_at, ?
+		 FROM persons p JOIN providers pr
+		 WHERE p.status = 'active' AND `+rank("p.approval_mode")+` > 1 AND `+rank("pr.max_auto_level")+` > 1
+		   AND (p.approval_mode_expires_at IS NULL OR p.approval_mode_expires_at > ?)
+		   AND (p.supervisor = 1 OR EXISTS (SELECT 1 FROM role_bindings b WHERE b.person_id = p.id AND b.provider_id = pr.id))`,
+		now, now)
+	if err != nil {
+		return fmt.Errorf("store: migrate approval modes: %w", err)
+	}
+	return nil
+}
+
+// addSessionKindColumns adds the session columns of schema 9 that are not
+// there yet, and their index.
+func addSessionKindColumns(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info('sessions')`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range []struct{ name, ddl string }{
+		{"kind", `ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'console'`},
+		{"id", `ALTER TABLE sessions ADD COLUMN id TEXT NOT NULL DEFAULT ''`},
+		{"client_name", `ALTER TABLE sessions ADD COLUMN client_name TEXT NOT NULL DEFAULT ''`},
+		{"remote_addr", `ALTER TABLE sessions ADD COLUMN remote_addr TEXT NOT NULL DEFAULT ''`},
+	} {
+		if have[col.name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_sessions_person_kind ON sessions(person_id, kind)`)
+	return err
+}
+
+// removeAdminTokenAndOldAgentModel deletes the admin token, revokes every
+// agent that belongs to no person and clears the role and grants stored on
+// every agent. Agents without an owner were created by the removed admin
+// token or the v0.1 demo seed, and nothing can manage them any more. An
+// agent's own role and grants mean nothing now (it inherits its owner's role),
+// so they must not be shown as if they did. Leases of the removed model are
+// revoked by the startup sweep, which records each one in the audit log.
+func removeAdminTokenAndOldAgentModel(ctx context.Context, tx *sql.Tx, report *MigrationReport) error {
+	res, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE key IN ('admin_token_hash', 'admin_token_prefix')`)
+	if err != nil {
+		return err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE agents SET role = 'guest', grants_json = '[]'`); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM agents WHERE owner_id = '' AND status <> ? ORDER BY id ASC`, string(model.AgentRevoked))
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	now := time.Now().UTC().UnixMilli()
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE agents SET status = ?, updated_at = ? WHERE id = ?`,
+			string(model.AgentRevoked), now, id); err != nil {
+			return err
+		}
+	}
+	if report != nil {
+		report.DeletedAdminToken = deleted > 0
+		report.RevokedAgents = append(report.RevokedAgents, ids...)
+	}
+	return nil
+}
+
+// migrateCloudAccountIDs fills providers.cloud_account_id from each role
+// ARN. When several providers point at the same cloud account, only the
+// oldest gets the ID; the others keep "" and cannot serve access requests.
+// A supervisor disables such a duplicate, or points it at a role in an
+// account that is not connected yet, which gives it that account's ID.
+func migrateCloudAccountIDs(ctx context.Context, tx *sql.Tx, _ *MigrationReport) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, type, role_arn FROM providers ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return err
+	}
+	type row struct{ id, typ, arn string }
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.typ, &r.arn); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	taken := map[string]bool{}
+	for _, r := range all {
+		account := model.CloudAccountIDFromRoleARN(model.ProviderType(r.typ), r.arn)
+		if account == "" || taken[account] {
+			continue
+		}
+		taken[account] = true
+		if _, err := tx.ExecContext(ctx, `UPDATE providers SET cloud_account_id = ? WHERE id = ?`, account, r.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyMigrations brings the database schema up to CurrentSchemaVersion. It is
 // idempotent: running it on an up-to-date database is a no-op.
 func (db *DB) applyMigrations(ctx context.Context) error {
 	version, err := db.schemaVersion(ctx)
 	if err != nil {
 		return err
 	}
-	if version > currentSchemaVersion {
-		return fmt.Errorf("store: database schema version %d is newer than supported version %d", version, currentSchemaVersion)
+	if version > CurrentSchemaVersion {
+		return fmt.Errorf("store: database schema version %d is newer than supported version %d", version, CurrentSchemaVersion)
 	}
-	for v := version; v < currentSchemaVersion; v++ {
+	// A report an earlier upgrade left behind because it was never written
+	// to the audit log (a fresh database has no meta table yet).
+	var pending *MigrationReport
+	if version > 0 {
+		if pending, err = db.pendingMigrationReport(ctx); err != nil {
+			return err
+		}
+	}
+	var report *MigrationReport
+	if version > 0 && version < CurrentSchemaVersion {
+		// Only an upgrade of an existing database is reported; a fresh
+		// database (version 0) has no rows to change.
+		report = &MigrationReport{FromVersion: version, ToVersion: CurrentSchemaVersion}
+	}
+	for v := version; v < CurrentSchemaVersion; v++ {
 		tx, err := db.sql.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("store: begin migration %d: %w", v+1, err)
 		}
-		for _, stmt := range migrations[v][0] {
+		// Another process may be upgrading the same database. Take the write
+		// lock first, then read the version again: if the step was done
+		// meanwhile, it is not done twice and not reported by this process.
+		if v > 0 {
+			var raw string
+			if _, err := tx.ExecContext(ctx, `UPDATE meta SET value = value WHERE key = ?`, MetaSchemaVersion); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: lock for migration %d: %w", v+1, err)
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, MetaSchemaVersion).Scan(&raw); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: re-read schema version: %w", err)
+			}
+			if current, err := strconv.Atoi(raw); err != nil || current != v {
+				tx.Rollback()
+				if err != nil {
+					return fmt.Errorf("store: corrupt schema version %q: %w", raw, err)
+				}
+				if current > CurrentSchemaVersion {
+					return fmt.Errorf("store: database schema version %d is newer than supported version %d", current, CurrentSchemaVersion)
+				}
+				// Done by someone else: continue from where the database is.
+				// What they did is in the report they kept.
+				if pending, err = db.pendingMigrationReport(ctx); err != nil {
+					return err
+				}
+				report = nil
+				if current < CurrentSchemaVersion {
+					report = &MigrationReport{FromVersion: current, ToVersion: CurrentSchemaVersion}
+				}
+				v = current - 1
+				continue
+			}
+		}
+		for _, stmt := range migrations[v].statements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: migration %d: %w", v+1, err)
+			}
+		}
+		if migrations[v].transform != nil {
+			if err := migrations[v].transform(ctx, tx, report); err != nil {
 				tx.Rollback()
 				return fmt.Errorf("store: migration %d: %w", v+1, err)
 			}
@@ -170,11 +652,73 @@ func (db *DB) applyMigrations(ctx context.Context) error {
 			tx.Rollback()
 			return fmt.Errorf("store: record schema version: %w", err)
 		}
+		// The report so far is stored in the same transaction as the step it
+		// describes. It must outlive this process: the command that runs the
+		// upgrade may stop, or be killed, before it can write the audit event.
+		if report != nil {
+			raw, err := json.Marshal(mergeMigrationReports(pending, report))
+			if err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: encode migration report: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO meta(key, value) VALUES(?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaPendingMigrationReport, string(raw)); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: keep migration report: %w", err)
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("store: commit migration %d: %w", v+1, err)
 		}
 	}
+	db.migration = mergeMigrationReports(pending, report)
 	return nil
+}
+
+// mergeMigrationReports is one report for an earlier upgrade that was never
+// recorded (pending) followed by the one that just ran (report). Either may
+// be nil.
+func mergeMigrationReports(pending, report *MigrationReport) *MigrationReport {
+	switch {
+	case pending == nil && report == nil:
+		return nil
+	case pending == nil:
+		merged := *report
+		return &merged
+	case report == nil:
+		merged := *pending
+		return &merged
+	}
+	merged := *report
+	merged.FromVersion = pending.FromVersion
+	merged.DisabledCapabilities = append(append([]string(nil), pending.DisabledCapabilities...), report.DisabledCapabilities...)
+	merged.Agents = append(append([]AgentMigration(nil), pending.Agents...), report.Agents...)
+	merged.RevokedAgents = append(append([]string(nil), pending.RevokedAgents...), report.RevokedAgents...)
+	merged.DeletedAdminToken = pending.DeletedAdminToken || report.DeletedAdminToken
+	return &merged
+}
+
+// metaPendingMigrationReport holds the report of an upgrade that has not
+// been written to the audit log yet.
+const metaPendingMigrationReport = "pending_migration_report"
+
+// pendingMigrationReport reads a kept report; nil when there is none or the
+// database is fresh.
+func (db *DB) pendingMigrationReport(ctx context.Context) (*MigrationReport, error) {
+	var raw string
+	err := db.sql.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, metaPendingMigrationReport).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read migration report: %w", err)
+	}
+	var report MigrationReport
+	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		return nil, fmt.Errorf("store: corrupt migration report: %w", err)
+	}
+	return &report, nil
 }
 
 // schemaVersion reads the current schema version; 0 when the database is fresh.
@@ -341,6 +885,11 @@ func (db *DB) GetPolicySettings(ctx context.Context) (model.PolicySettings, erro
 	var s model.PolicySettings
 	if err := json.Unmarshal([]byte(raw), &s); err != nil {
 		return model.PolicySettings{}, fmt.Errorf("store: corrupt policy settings: %w", err)
+	}
+	// Settings stored before the refresh limit existed get its default.
+	if s.MaxRefreshLifetimeSeconds == 0 {
+		s.MaxRefreshLifetimeSeconds = min(max(model.DefaultPolicySettings().MaxRefreshLifetimeSeconds, s.MaxLeaseTTLSeconds),
+			model.MaxRefreshLifetimeLimit)
 	}
 	return s, nil
 }

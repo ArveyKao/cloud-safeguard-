@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -26,37 +27,15 @@ func (s *Server) handleAgentMe(w http.ResponseWriter, r *http.Request) {
 		s.writeHandlerError(w, err)
 		return
 	}
+	if ag, err = s.withLiveLimits(r.Context(), ag); err != nil {
+		s.writeHandlerError(w, err)
+		return
+	}
 	s.writeData(w, http.StatusOK, agentMeResponse{
 		Agent:        ag,
 		ActiveLeases: active,
 		ServerTime:   s.nowUTC(),
 	})
-}
-
-// handleAgentCapabilities implements GET /api/v1/agent/capabilities. Only
-// enabled capabilities granted to the authenticated agent are returned.
-func (s *Server) handleAgentCapabilities(w http.ResponseWriter, r *http.Request) {
-	ag, ok := agentFromContext(r.Context())
-	if !ok {
-		s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "agent token required")
-		return
-	}
-	granted := make(map[string]bool, len(ag.Grants))
-	for _, id := range ag.Grants {
-		granted[id] = true
-	}
-	all, err := s.db.ListCapabilities(r.Context())
-	if err != nil {
-		s.writeHandlerError(w, err)
-		return
-	}
-	items := make([]model.Capability, 0, len(all))
-	for _, c := range all {
-		if c.Enabled && granted[c.ID] {
-			items = append(items, c)
-		}
-	}
-	writeList(s, w, http.StatusOK, items, len(items))
 }
 
 // heartbeatResponse is the payload of POST /api/v1/agent/heartbeat.
@@ -79,4 +58,17 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.logf("heartbeat: touch agent %s: %v", ag.ID, err)
 	}
 	s.writeData(w, http.StatusOK, heartbeatResponse{OK: true, ServerTime: now})
+}
+
+// withLiveLimits replaces the limits stored on an agent, which are a record
+// of the settings when it signed in, with the supervisor's current settings:
+// those are what is enforced, so those are what is shown.
+func (s *Server) withLiveLimits(ctx context.Context, ag model.Agent) (model.Agent, error) {
+	settings, err := s.db.GetPolicySettings(ctx)
+	if err != nil {
+		return ag, err
+	}
+	ag.MaxTTLSeconds = settings.MaxLeaseTTLSeconds
+	ag.MaxConcurrentLeases = settings.MaxConcurrentLeasesPerAgent
+	return ag, nil
 }

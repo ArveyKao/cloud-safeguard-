@@ -168,17 +168,17 @@ func TestUsageExitCodes(t *testing.T) {
 	}{
 		{"no args", nil},
 		{"unknown command", []string{"frobnicate"}},
-		{"caps without subcommand", []string{"caps"}},
-		{"agents unknown sub", []string{"agents", "explode"}},
+		{"removed admin command", []string{"providers", "list"}},
+		{"removed capability request", []string{"request", "--capability", "aliyun.cloud.read"}},
 		{"leases without sub", []string{"leases"}},
-		{"audit without sub", []string{"audit"}},
-		{"policy without sub", []string{"policy"}},
+		{"leases unknown sub", []string{"leases", "approve", "lea_1"}},
 		{"mock without sub", []string{"mock"}},
-		{"request without capability", []string{"request"}},
 		{"credential without lease", []string{"credential"}},
 		{"revoke without lease", []string{"revoke"}},
-		{"exec without separator", []string{"exec", "--capability", "aliyun.cloud.read"}},
-		{"exec without command", []string{"exec", "--capability", "aliyun.cloud.read", "--"}},
+		{"exec without separator", []string{"exec", "--account", "1234567890123456"}},
+		{"exec without command", []string{"exec", "--account", "1234567890123456", "--"}},
+		{"exec without account", []string{"exec", "--", "true"}},
+		{"exec with the removed capability flag", []string{"exec", "--capability", "aliyun.cloud.read", "--", "true"}},
 		{"login without flags", []string{"login"}},
 		{"version with args", []string{"version", "extra"}},
 	}
@@ -201,7 +201,7 @@ func TestHelpSucceeds(t *testing.T) {
 	if code := ta.run("help"); code != ExitOK {
 		t.Fatalf("help exit = %d", code)
 	}
-	for _, want := range []string{"init", "serve", "request", "credential", "exec", "audit"} {
+	for _, want := range []string{"init", "serve", "login", "accounts", "access", "credential", "exec", "mcp"} {
 		if !strings.Contains(ta.out(), want) {
 			t.Fatalf("help output missing %q", want)
 		}
@@ -254,55 +254,6 @@ func TestParseOptionalDurationSeconds(t *testing.T) {
 	}
 }
 
-func TestParseRiskTier(t *testing.T) {
-	for _, want := range []model.RiskTier{model.RiskLow, model.RiskMedium, model.RiskHigh, model.RiskCritical} {
-		got, err := parseRiskTier(strings.ToUpper(string(want)))
-		if err != nil || got != want {
-			t.Fatalf("parseRiskTier(%q) = (%v, %v)", want, got, err)
-		}
-	}
-	if _, err := parseRiskTier("extreme"); err == nil {
-		t.Fatal("parseRiskTier(extreme) = nil error")
-	}
-}
-
-func TestParamValues(t *testing.T) {
-	var params paramValues
-	for _, input := range []string{"domain=arveykao.com", "instance_id=i-2ze0demo001"} {
-		if err := params.Set(input); err != nil {
-			t.Fatalf("Set(%q) error = %v", input, err)
-		}
-	}
-	got := params.mapValue()
-	if got["domain"] != "arveykao.com" || got["instance_id"] != "i-2ze0demo001" {
-		t.Fatalf("params = %v", got)
-	}
-	var bad paramValues
-	if err := bad.Set("noequals"); err == nil {
-		t.Fatal("Set(noequals) = nil error")
-	}
-	if err := bad.Set("=value"); err == nil {
-		t.Fatal("Set(=value) = nil error")
-	}
-	if empty := (paramValues{}).mapValue(); empty != nil {
-		t.Fatalf("empty params map = %v, want nil", empty)
-	}
-}
-
-func TestStringSliceFlag(t *testing.T) {
-	var grants stringSliceFlag
-	if err := grants.Set("aliyun.cloud.read, aliyun.dns.manage"); err != nil {
-		t.Fatalf("Set error = %v", err)
-	}
-	if err := grants.Set("aliyun.cert.dns01"); err != nil {
-		t.Fatalf("Set error = %v", err)
-	}
-	want := []string{"aliyun.cloud.read", "aliyun.dns.manage", "aliyun.cert.dns01"}
-	if strings.Join(grants.values(), ",") != strings.Join(want, ",") {
-		t.Fatalf("grants = %v, want %v", grants.values(), want)
-	}
-}
-
 func TestShellSingleQuote(t *testing.T) {
 	if got := shellSingleQuote("abc"); got != "abc" {
 		t.Fatalf("shellSingleQuote(abc) = %q", got)
@@ -312,60 +263,53 @@ func TestShellSingleQuote(t *testing.T) {
 	}
 }
 
-func TestBuildCredentialEnv(t *testing.T) {
+func TestSafeCredentialEnv(t *testing.T) {
 	envelope := model.CredentialEnvelope{
-		Credential: model.Credential{
-			AccessKeyID:     "LTAI1234",
-			AccessKeySecret: "secret",
-			SecurityToken:   "token",
-			LeaseID:         "lea_test01",
-		},
+		Credential: model.Credential{AccessKeyID: "LTAI1234", AccessKeySecret: "secret", SecurityToken: "token"},
 		Env: []model.EnvVar{
 			{Name: "ALIBABA_CLOUD_ACCESS_KEY_ID", Value: "LTAI1234"},
 			{Name: "ALIBABA_CLOUD_SECURITY_TOKEN", Value: "token"},
+			{Name: "AWS_SESSION_TOKEN", Value: "aws"},
 			{Name: "CSG_LEASE_ID", Value: "lea_test01"},
+			// A compromised server must not be able to set any of these.
+			{Name: "X; touch /tmp/pwned; Y", Value: "v"},
+			{Name: "LD_PRELOAD", Value: "/tmp/evil.so"},
+			{Name: "PATH", Value: "/tmp"},
+			{Name: "BASH_ENV", Value: "/tmp/x"},
+			{Name: "alibaba_cloud_lower", Value: "v"},
+			{Name: "ALIBABA_CLOUD_$(id)", Value: "v"},
+			{Name: "ALIBABA_CLOUD_A\nB", Value: "v"},
 		},
 	}
-	pairs := buildCredentialEnv(&envelope, "http://127.0.0.1:8787", "aliyun.cloud.read")
-	joined := strings.Join(pairs, "\n")
-	for _, want := range []string{
-		"ALIBABA_CLOUD_ACCESS_KEY_ID=LTAI1234",
-		"ALIBABA_CLOUD_SECURITY_TOKEN=token",
-		"CSG_LEASE_ID=lea_test01",
-		"CSG_SERVER=http://127.0.0.1:8787",
-		"CSG_CAPABILITY=aliyun.cloud.read",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("env missing %q: %v", want, pairs)
-		}
+	got := map[string]string{}
+	for _, kv := range safeCredentialEnv(&envelope) {
+		got[kv.Name] = kv.Value
 	}
-	// No duplicate names.
-	seen := map[string]bool{}
-	for _, pair := range pairs {
-		name, _, _ := strings.Cut(pair, "=")
-		if seen[name] {
-			t.Fatalf("duplicate env var %q in %v", name, pairs)
+	want := map[string]string{"ALIBABA_CLOUD_ACCESS_KEY_ID": "LTAI1234", "ALIBABA_CLOUD_SECURITY_TOKEN": "token",
+		"AWS_SESSION_TOKEN": "aws", "CSG_LEASE_ID": "lea_test01"}
+	if len(got) != len(want) {
+		t.Fatalf("env = %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("env[%s] = %q", k, got[k])
 		}
-		seen[name] = true
 	}
 
 	// Fallback when the server sends no env list.
-	fallback := buildCredentialEnv(&model.CredentialEnvelope{Credential: model.Credential{
-		AccessKeyID: "AK", AccessKeySecret: "SK", SecurityToken: "ST", LeaseID: "lea_x",
-	}}, "http://s", "cap")
-	fallbackJoined := strings.Join(fallback, "\n")
-	for _, want := range []string{"ALIBABA_CLOUD_ACCESS_KEY_ID=AK", "ALIBABA_CLOUD_ACCESS_KEY_SECRET=SK", "ALIBABA_CLOUD_SECURITY_TOKEN=ST"} {
-		if !strings.Contains(fallbackJoined, want) {
-			t.Fatalf("fallback env missing %q: %v", want, fallback)
-		}
+	fallback := safeCredentialEnv(&model.CredentialEnvelope{Credential: model.Credential{
+		AccessKeyID: "AK", AccessKeySecret: "SK", SecurityToken: "ST",
+	}})
+	if len(fallback) != 3 || fallback[1].Name != "ALIBABA_CLOUD_ACCESS_KEY_SECRET" || fallback[1].Value != "SK" {
+		t.Fatalf("fallback = %v", fallback)
 	}
 }
 
 // TestUnreachableServerIsOperationError proves network failures exit 1, not 2/3.
 func TestUnreachableServerIsOperationError(t *testing.T) {
 	ta := newTestApp(t)
-	ta.useServer("http://127.0.0.1:1", "csg_adm_test")
-	code := ta.run("caps", "list")
+	ta.useServer("http://127.0.0.1:1", "csg_agt_test")
+	code := ta.run("accounts")
 	if code != ExitOperationErr {
 		t.Fatalf("exit = %d, want %d; stderr = %q", code, ExitOperationErr, ta.errOut())
 	}
@@ -383,8 +327,8 @@ func TestResponseMissingEnvelopeIsError(t *testing.T) {
 	defer srv.Close()
 
 	ta := newTestApp(t)
-	ta.useServer(srv.URL, "csg_adm_test")
-	if code := ta.run("caps", "list"); code != ExitOperationErr {
+	ta.useServer(srv.URL, "csg_agt_test")
+	if code := ta.run("accounts"); code != ExitOperationErr {
 		t.Fatalf("exit = %d, want %d; stderr = %q", code, ExitOperationErr, ta.errOut())
 	}
 	if !strings.Contains(ta.errOut(), "data envelope") {

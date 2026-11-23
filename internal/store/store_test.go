@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -57,6 +58,7 @@ func testCapability() model.Capability {
 		Description:       "unit test capability",
 		ProviderType:      model.ProviderAliyun,
 		Risk:              model.RiskLow,
+		Access:            model.AccessRead,
 		PolicyTemplate:    `{"Version":"1","Statement":[]}`,
 		Params:            []model.CapabilityParam{{Name: "domain", Required: true, Pattern: `^[a-z]+\.com$`}},
 		DefaultTTLSeconds: 900,
@@ -74,6 +76,7 @@ func testAgent() model.Agent {
 		Name:                "test-agent",
 		Description:         "unit test agent",
 		Status:              model.AgentActive,
+		Role:                model.RoleGuest,
 		Grants:              []string{"cap_test1"},
 		MaxTTLSeconds:       1800,
 		MaxConcurrentLeases: 3,
@@ -133,8 +136,9 @@ func TestOpenMigratesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMeta(schema_version): %v", err)
 	}
-	if version != "1" {
-		t.Fatalf("schema_version = %q, want \"1\"", version)
+	wantVersion := strconv.Itoa(CurrentSchemaVersion)
+	if version != wantVersion {
+		t.Fatalf("schema_version = %q, want %q", version, wantVersion)
 	}
 	if err := db.SetMeta(ctx, "keepme", "value1"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
@@ -169,8 +173,17 @@ func TestOpenMigratesAndIsIdempotent(t *testing.T) {
 		t.Fatalf("meta value after reopen = %q, want value1", got)
 	}
 	version2, err := db2.GetMeta(ctx, MetaSchemaVersion)
-	if err != nil || version2 != "1" {
+	if err != nil || version2 != wantVersion {
 		t.Fatalf("schema_version after reopen = %q, %v", version2, err)
+	}
+	// A fresh database is seeded by `csg init`, not by the migration: the v2
+	// transform must not invent catalog rows (CONTRACT §16.6).
+	caps, err := db2.ListCapabilities(ctx)
+	if err != nil {
+		t.Fatalf("ListCapabilities: %v", err)
+	}
+	if len(caps) != 0 {
+		t.Fatalf("migrations seeded %d capabilities into a fresh database, want 0: %+v", len(caps), caps)
 	}
 }
 
@@ -229,10 +242,6 @@ func TestProviderCRUD(t *testing.T) {
 	p.Name = "renamed"
 	p.Status = model.ProviderDisabled
 	p.UpdatedAt = testTime.Add(time.Minute)
-	ok := true
-	p.LastTestOK = &ok
-	tested := testTime.Add(2 * time.Minute)
-	p.LastTestedAt = &tested
 	if err := db.UpdateProvider(ctx, p); err != nil {
 		t.Fatalf("UpdateProvider: %v", err)
 	}
@@ -243,8 +252,43 @@ func TestProviderCRUD(t *testing.T) {
 	if got.Name != "renamed" || got.Status != model.ProviderDisabled {
 		t.Fatalf("provider not updated: %+v", got)
 	}
+
+	// A connection test writes its result and nothing else: here the caller
+	// still believes the provider is active and has its old name.
+	tested := testTime.Add(2 * time.Minute)
+	if err := db.SetProviderTestResult(ctx, p.ID, tested, true); err != nil {
+		t.Fatalf("SetProviderTestResult: %v", err)
+	}
+	got, _ = db.GetProvider(ctx, p.ID)
 	if got.LastTestOK == nil || !*got.LastTestOK || got.LastTestedAt == nil || !got.LastTestedAt.Equal(tested) {
 		t.Fatalf("last test fields not persisted: %+v", got)
+	}
+	if got.Name != "renamed" || got.Status != model.ProviderDisabled {
+		t.Fatalf("a test result changed other fields: %+v", got)
+	}
+	if err := db.SetProviderTestResult(ctx, "prv_missing", tested, true); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetProviderTestResult(missing) = %v", err)
+	}
+
+	// An update never writes the test result or the masked key, and is
+	// refused when the provider's cloud account ID is not the one the
+	// caller read.
+	stale := got
+	stale.LastTestOK, stale.LastTestedAt, stale.AccessKeyIDMasked = nil, nil, "LTAI****stale"
+	if err := db.UpdateProvider(ctx, stale); err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	got, _ = db.GetProvider(ctx, p.ID)
+	if got.LastTestOK == nil || got.AccessKeyIDMasked != "LTAI****oker" {
+		t.Fatalf("an update overwrote the test result or the masked key: %+v", got)
+	}
+	stale.CloudAccountID = "9999999999999999"
+	stale.RoleARN = "acs:ram::9999999999999999:role/other"
+	if err := db.UpdateProvider(ctx, stale); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdateProvider with another cloud account ID = %v, want ErrConflict", err)
+	}
+	if after, _ := db.GetProvider(ctx, p.ID); after.RoleARN != got.RoleARN {
+		t.Fatalf("a refused update changed the role ARN to %q", after.RoleARN)
 	}
 
 	if err := db.UpdateProvider(ctx, model.Provider{ID: "prv_missing"}); !errors.Is(err, ErrNotFound) {
@@ -262,12 +306,79 @@ func TestProviderCRUD(t *testing.T) {
 		t.Fatalf("CountProviderCredentials = %d, %v", n, err)
 	}
 
-	if err := db.UpdateProviderCredential(ctx, p.ID, "v1:rotated"); err != nil {
-		t.Fatalf("UpdateProviderCredential: %v", err)
+	if err := db.RotateProviderCredential(ctx, p.ID, "v1:rotated", "LTAI****new1", testTime.Add(3*time.Minute)); err != nil {
+		t.Fatalf("RotateProviderCredential: %v", err)
 	}
 	cred, _ = db.GetProviderCredential(ctx, p.ID)
-	if cred != "v1:rotated" {
-		t.Fatalf("credential after rotate = %q", cred)
+	after, _ := db.GetProvider(ctx, p.ID)
+	if cred != "v1:rotated" || after.AccessKeyIDMasked != "LTAI****new1" {
+		t.Fatalf("after rotate: credential %q, masked %q", cred, after.AccessKeyIDMasked)
+	}
+	if after.Status != model.ProviderDisabled || after.Name != "renamed" || after.RoleARN != got.RoleARN {
+		t.Fatalf("a rotation changed other fields: %+v", after)
+	}
+	if err := db.RotateProviderCredential(ctx, "prv_missing", "x", "y", testTime); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RotateProviderCredential(missing) = %v", err)
+	}
+}
+
+// Adopting a cloud account ID and removing the provider's role bindings is
+// one step: both happen, or neither.
+func TestAdoptProviderCloudAccountID(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	first := testProvider()
+	first.CloudAccountID = "1234567890123456"
+	orphan := testProvider()
+	orphan.ID, orphan.Name, orphan.RoleARN = "prv_orphan", "orphan", "not-a-role"
+	for _, p := range []model.Provider{first, orphan} {
+		if err := db.CreateProvider(ctx, p, "v1:x"); err != nil {
+			t.Fatalf("CreateProvider(%s): %v", p.ID, err)
+		}
+	}
+	bind := func(provider, person string) {
+		t.Helper()
+		if err := db.PutBinding(ctx, model.RoleBinding{PersonID: person, ProviderID: provider, Role: model.RoleAdministrator, CreatedAt: testTime, UpdatedAt: testTime}); err != nil {
+			t.Fatalf("PutBinding: %v", err)
+		}
+	}
+	bind(orphan.ID, "per_a")
+	bind(orphan.ID, "per_b")
+	bind(first.ID, "per_a")
+	count := func(provider string) int {
+		list, err := db.ListBindings(ctx, "", provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(list)
+	}
+
+	// The account of another provider: refused, and the bindings stay.
+	if _, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "acs:ram::1234567890123456:role/x", "1234567890123456", testTime); !errors.Is(err, ErrConflict) {
+		t.Fatalf("adopting a connected account = %v, want ErrConflict", err)
+	}
+	if got, _ := db.GetProvider(ctx, orphan.ID); got.CloudAccountID != "" || got.RoleARN != "not-a-role" || count(orphan.ID) != 2 {
+		t.Fatalf("a refused adoption changed something: %+v, %d bindings", got, count(orphan.ID))
+	}
+	if _, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "x", "", testTime); err == nil {
+		t.Fatal("adopting an empty account ID succeeded")
+	}
+
+	removed, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "acs:ram::7777777777777777:role/x", "7777777777777777", testTime.Add(time.Minute))
+	if err != nil || len(removed) != 2 || removed[0].PersonID != "per_a" || removed[1].PersonID != "per_b" || removed[0].Role != model.RoleAdministrator {
+		t.Fatalf("adoption = %+v, %v", removed, err)
+	}
+	got, _ := db.GetProvider(ctx, orphan.ID)
+	if got.CloudAccountID != "7777777777777777" || got.RoleARN != "acs:ram::7777777777777777:role/x" || count(orphan.ID) != 0 {
+		t.Fatalf("after adoption: %+v, %d bindings", got, count(orphan.ID))
+	}
+	if count(first.ID) != 1 {
+		t.Fatal("adoption removed another provider's bindings")
+	}
+	// It has an account now: a second adoption is refused.
+	bind(orphan.ID, "per_c")
+	if _, err := db.AdoptProviderCloudAccountID(ctx, orphan.ID, "acs:ram::8888888888888888:role/x", "8888888888888888", testTime); !errors.Is(err, ErrConflict) || count(orphan.ID) != 1 {
+		t.Fatalf("second adoption = %v, %d bindings", err, count(orphan.ID))
 	}
 }
 
@@ -288,6 +399,9 @@ func TestCapabilityCRUD(t *testing.T) {
 	}
 	if len(got.Params) != 1 || got.Params[0].Name != "domain" || !got.Builtin || !got.Enabled {
 		t.Fatalf("GetCapability = %+v", got)
+	}
+	if got.Access != model.AccessRead {
+		t.Fatalf("GetCapability access = %q, want read", got.Access)
 	}
 	got.Enabled = false
 	got.Description = "updated"
@@ -323,6 +437,9 @@ func TestAgentCRUD(t *testing.T) {
 	}
 	if got.Name != a.Name || len(got.Grants) != 1 || got.Grants[0] != "cap_test1" {
 		t.Fatalf("GetAgent = %+v", got)
+	}
+	if got.Role != model.RoleGuest {
+		t.Fatalf("GetAgent role = %q, want guest", got.Role)
 	}
 	// Token hash resolution.
 	byToken, err := db.GetAgentByTokenHash(ctx, hash)
@@ -411,10 +528,29 @@ func TestLeaseCRUDAndQueries(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, want %v", got.ExpiresAt, active.ExpiresAt)
 	}
 
-	// Credential blob lifecycle.
+	// Credential blob lifecycle. A credential is stored while the lease is
+	// still pending (the server activates it right after), never on a lease
+	// that is already active.
 	encCred := "v1:lease-credential-blob"
+	if err := db.SetLeaseCredential(ctx, active.ID, encCred, "LTAI****ABCD"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("SetLeaseCredential on an active lease = %v, want ErrConflict", err)
+	}
+	if err := db.SetLeaseCredential(ctx, "lea_missing", encCred, "LTAI****ABCD"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetLeaseCredential on a missing lease = %v, want ErrNotFound", err)
+	}
+	pendingForCred := active
+	pendingForCred.Status = model.LeasePending
+	if err := db.UpdateLease(ctx, pendingForCred); err != nil {
+		t.Fatalf("UpdateLease(pending): %v", err)
+	}
 	if err := db.SetLeaseCredential(ctx, active.ID, encCred, "LTAI****ABCD"); err != nil {
 		t.Fatalf("SetLeaseCredential: %v", err)
+	}
+	// Activation writes the lease back as active with the stored fingerprint.
+	active.CredentialAvailable = true
+	active.CredentialFingerprint = "LTAI****ABCD"
+	if err := db.UpdateLease(ctx, active); err != nil {
+		t.Fatalf("UpdateLease(active): %v", err)
 	}
 	blob, err := db.GetLeaseCredential(ctx, active.ID)
 	if err != nil || blob != encCred {
@@ -492,16 +628,6 @@ func TestLeaseCRUDAndQueries(t *testing.T) {
 	if n, err := db.CountLeasesSince(ctx, "agt_test1", testTime.Add(15*time.Second)); err != nil || n != 2 {
 		t.Fatalf("CountLeasesSince = %d, %v", n, err)
 	}
-	risk, err := db.CountLeasesByRisk(ctx, []model.LeaseStatus{model.LeasePending, model.LeaseActive})
-	if err != nil {
-		t.Fatalf("CountLeasesByRisk: %v", err)
-	}
-	if risk.Low != 3 { // two pending + one still-active lease
-		t.Fatalf("risk breakdown low = %d, want 3", risk.Low)
-	}
-	if n, err := db.CountLeasesCreatedSinceByStatus(ctx, model.LeaseDenied, testTime); err != nil || n != 1 {
-		t.Fatalf("CountLeasesCreatedSinceByStatus = %d, %v", n, err)
-	}
 }
 
 func TestPolicySettings(t *testing.T) {
@@ -517,18 +643,18 @@ func TestPolicySettings(t *testing.T) {
 	}
 
 	s := model.DefaultPolicySettings()
-	s.AutoApproveMaxRisk = model.RiskMedium
+	s.PendingTimeoutSeconds = 300
 	s.MaxLeaseTTLSeconds = 7200
 	if err := db.SetPolicySettings(ctx, s); err != nil {
 		t.Fatalf("SetPolicySettings: %v", err)
 	}
 	got, _ = db.GetPolicySettings(ctx)
-	if got.AutoApproveMaxRisk != model.RiskMedium || got.MaxLeaseTTLSeconds != 7200 {
+	if got.PendingTimeoutSeconds != 300 || got.MaxLeaseTTLSeconds != 7200 {
 		t.Fatalf("settings not persisted: %+v", got)
 	}
 
 	bad := model.DefaultPolicySettings()
-	bad.AutoApproveMaxRisk = "nonsense"
+	bad.PendingTimeoutSeconds = 0
 	if err := db.SetPolicySettings(ctx, bad); err == nil {
 		t.Fatal("SetPolicySettings accepted invalid settings")
 	}
@@ -825,7 +951,7 @@ func TestNoPlaintextSecretsInDatabaseFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encrypt lease: %v", err)
 	}
-	lease := testLease("lea_test", model.LeaseActive, testTime)
+	lease := testLease("lea_test", model.LeasePending, testTime)
 	if err := db.CreateLease(ctx, lease); err != nil {
 		t.Fatalf("CreateLease: %v", err)
 	}
@@ -885,5 +1011,237 @@ func TestNoPlaintextSecretsInDatabaseFiles(t *testing.T) {
 	}
 	if stored["access_key_secret"] != brokerSecret {
 		t.Fatalf("decrypted secret = %q", stored["access_key_secret"])
+	}
+}
+
+func TestUpdateLeaseIfStatus(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	pending := testLease("lea_cas", model.LeasePending, testTime)
+	if err := db.CreateLease(ctx, pending); err != nil {
+		t.Fatalf("CreateLease: %v", err)
+	}
+
+	// Matching status: the write lands.
+	active := pending
+	active.Status = model.LeaseActive
+	if err := db.UpdateLeaseIfStatus(ctx, active, model.LeasePending); err != nil {
+		t.Fatalf("UpdateLeaseIfStatus(pending→active) = %v, want nil", err)
+	}
+	if got, _ := db.GetLease(ctx, "lea_cas"); got.Status != model.LeaseActive {
+		t.Fatalf("status = %q, want active", got.Status)
+	}
+
+	// Stale expectation: conflict, and the stored row is untouched.
+	revoked := active
+	revoked.Status = model.LeaseRevoked
+	revoked.RevokeReason = "should not land"
+	if err := db.UpdateLeaseIfStatus(ctx, revoked, model.LeasePending); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdateLeaseIfStatus with stale status = %v, want ErrConflict", err)
+	}
+	got, _ := db.GetLease(ctx, "lea_cas")
+	if got.Status != model.LeaseActive || got.RevokeReason != "" {
+		t.Fatalf("conflicting write changed the row: status=%q reason=%q", got.Status, got.RevokeReason)
+	}
+
+	// Missing lease: not found.
+	ghost := testLease("lea_missing", model.LeaseActive, testTime)
+	if err := db.UpdateLeaseIfStatus(ctx, ghost, model.LeasePending); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("UpdateLeaseIfStatus(missing) = %v, want ErrNotFound", err)
+	}
+
+	// An empty expected status is a programming error, never an unconditional write.
+	if err := db.UpdateLeaseIfStatus(ctx, active, ""); err == nil {
+		t.Fatal("UpdateLeaseIfStatus with empty expected status = nil, want error")
+	}
+}
+
+// A report that was never written to the audit log is kept across opens,
+// and a later upgrade is merged into it instead of replacing it.
+func TestMigrationReportIsKeptAndMerged(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.MigrationReport() != nil {
+		t.Fatal("a fresh database has a migration report")
+	}
+	setVersion := func(v string) {
+		t.Helper()
+		if _, err := db.SQL().Exec(`UPDATE meta SET value = ? WHERE key = 'schema_version'`, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An upgrade from 7 that is not recorded...
+	if _, err := db.SQL().Exec(`INSERT INTO meta(key, value) VALUES('admin_token_hash', 'abc')`); err != nil {
+		t.Fatal(err)
+	}
+	setVersion("7")
+	db.Close()
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	first := db.MigrationReport()
+	if first == nil || first.FromVersion != 7 || first.ToVersion != CurrentSchemaVersion || !first.DeletedAdminToken {
+		t.Fatalf("report = %+v", first)
+	}
+	db.Close()
+	// ...survives a plain reopen...
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	if again := db.MigrationReport(); again == nil || again.FromVersion != 7 || !again.DeletedAdminToken {
+		t.Fatalf("report after a reopen = %+v", again)
+	}
+	// ...and a second upgrade before it is recorded keeps what it said.
+	setVersion("7")
+	db.Close()
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	merged := db.MigrationReport()
+	if merged == nil || merged.FromVersion != 7 || merged.ToVersion != CurrentSchemaVersion || !merged.DeletedAdminToken {
+		t.Fatalf("merged report = %+v (the second upgrade deleted no admin token; the first did)", merged)
+	}
+	// Recording it forgets it, in the database too.
+	ev := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "schema.migrated", Status: "ok", Severity: "warning"}
+	if recorded, err := db.RecordMigrationAudit(ctx, &ev); err != nil || !recorded {
+		t.Fatalf("RecordMigrationAudit = %v, %v", recorded, err)
+	}
+	// A second call (another process that also had the report in memory)
+	// writes nothing.
+	again := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "schema.migrated", Status: "ok", Severity: "warning"}
+	if recorded, err := db.RecordMigrationAudit(ctx, &again); err != nil || recorded {
+		t.Fatalf("second RecordMigrationAudit = %v, %v; want false, nil", recorded, err)
+	}
+	if db.MigrationReport() != nil {
+		t.Fatal("the report is still there after it was recorded")
+	}
+	db.Close()
+	if db, err = Open(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.MigrationReport() != nil {
+		t.Fatal("the report came back after a reopen")
+	}
+	if events, _, err := db.ListAudit(ctx, AuditFilter{Action: "schema.migrated", Limit: 10}); err != nil || len(events) != 1 {
+		t.Fatalf("schema.migrated events = %d, %v", len(events), err)
+	}
+}
+
+// Two processes open the same old database at once: each step runs once,
+// and only one of them records the upgrade.
+func TestConcurrentOpensUpgradeAndRecordOnce(t *testing.T) {
+	ctx := context.Background()
+	for round := 0; round < 5; round++ {
+		dir := t.TempDir()
+		db, err := Open(ctx, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().Exec(`INSERT INTO meta(key, value) VALUES('admin_token_hash', 'abc')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().Exec(`UPDATE meta SET value = '7' WHERE key = 'schema_version'`); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+
+		const openers = 4
+		start := make(chan struct{})
+		recorded := make(chan bool, openers)
+		errs := make(chan error, openers)
+		for i := 0; i < openers; i++ {
+			go func() {
+				<-start
+				db, err := Open(ctx, dir)
+				if err != nil {
+					errs <- err
+					recorded <- false
+					return
+				}
+				defer db.Close()
+				if db.MigrationReport() == nil {
+					errs <- nil
+					recorded <- false
+					return
+				}
+				ev := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "schema.migrated", Status: "ok", Severity: "warning"}
+				ok, err := db.RecordMigrationAudit(ctx, &ev)
+				errs <- err
+				recorded <- ok
+			}()
+		}
+		close(start)
+		count := 0
+		for i := 0; i < openers; i++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+			if <-recorded {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("round %d: %d of %d processes recorded the upgrade, want 1", round, count, openers)
+		}
+		check, err := Open(ctx, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, _, err := check.ListAudit(ctx, AuditFilter{Action: "schema.migrated", Limit: 10})
+		if err != nil || len(events) != 1 {
+			t.Fatalf("round %d: %d schema.migrated events, %v", round, len(events), err)
+		}
+		if res, err := check.VerifyAudit(ctx); err != nil || !res.OK {
+			t.Fatalf("round %d: audit chain = %+v, %v", round, res, err)
+		}
+		if _, err := check.GetMeta(ctx, "admin_token_hash"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("round %d: the admin token survived: %v", round, err)
+		}
+		check.Close()
+	}
+}
+
+// Two processes appending to the audit log at once (the server and a local
+// csg supervisor recover) keep one unbroken chain.
+func TestAuditAppendsFromTwoProcessesKeepOneChain(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	first, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	const each = 60
+	errs := make(chan error, 2*each)
+	start := make(chan struct{})
+	for _, db := range []*DB{first, second} {
+		go func() {
+			<-start
+			for i := 0; i < each; i++ {
+				ev := model.AuditEvent{ActorType: "system", ActorID: "system", ActorName: "test", Action: "test.concurrent", Status: "ok", Severity: "info"}
+				errs <- db.AppendAudit(ctx, &ev)
+			}
+		}()
+	}
+	close(start)
+	for i := 0; i < 2*each; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	res, err := first.VerifyAudit(ctx)
+	if err != nil || !res.OK || res.Events != 2*each {
+		t.Fatalf("audit chain = %+v, %v; want %d events in one valid chain", res, err, 2*each)
 	}
 }

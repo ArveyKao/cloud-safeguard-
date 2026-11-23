@@ -1,0 +1,335 @@
+package capcatalog
+
+import (
+	"encoding/json"
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/arveykao/cloud-safeguard/internal/model"
+)
+
+func TestClassifyAction(t *testing.T) {
+	for action, want := range map[string]Permission{
+		"ecs:DescribeInstances":     PermissionRead,
+		"ecs:Describe*":             PermissionRead,
+		"oss:List*":                 PermissionRead,
+		"oss:GetObject":             PermissionRead,
+		"alidns:QueryThing":         PermissionRead,
+		"sts:GetCallerIdentity":     PermissionRead,
+		"ecs:StartInstance":         PermissionWrite,
+		"alidns:AddDomainRecord":    PermissionWrite,
+		"alidns:DeleteDomainRecord": PermissionWrite, // an item inside a domain
+		"oss:PutObject":             PermissionWrite,
+		"oss:DeleteObject":          PermissionWrite,
+		"ecs:RunInstances":          PermissionFull,
+		"ecs:DeleteInstance":        PermissionFull,
+		"alidns:AddDomain":          PermissionFull,
+		"alidns:DeleteDomain":       PermissionFull,
+		"oss:DeleteBucket":          PermissionFull,
+		// Fail towards full: unknown, wildcard and odd actions.
+		"ecs:SomethingNew":      PermissionFull,
+		"ecs:*":                 PermissionFull,
+		"ecs:Start*":            PermissionFull,
+		"ecs:Delete*":           PermissionFull,
+		"*":                     PermissionFull,
+		"ecs:Describe*Instance": PermissionFull,
+		"ecs:describeInstances": PermissionFull,
+		"":                      PermissionFull,
+	} {
+		if got := classifyAction(action); got != want {
+			t.Errorf("classifyAction(%q) = %s, want %s", action, got, want)
+		}
+	}
+}
+
+// templateActions returns the Allow actions of a rendered template.
+func templateActions(t *testing.T, raw []byte) []string {
+	t.Helper()
+	var doc struct {
+		Statement []struct {
+			Effect string
+			Action json.RawMessage
+		}
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, st := range doc.Statement {
+		if st.Effect != "Allow" {
+			continue
+		}
+		var actions []string
+		if err := json.Unmarshal(st.Action, &actions); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, actions...)
+	}
+	return out
+}
+
+func TestEveryAccessTemplateRendersWithinItsLevel(t *testing.T) {
+	if len(accessTemplates) != len(resourceSpecs)*3 {
+		t.Fatalf("%d templates for %d resource types", len(accessTemplates), len(resourceSpecs))
+	}
+	for id, tpl := range accessTemplates {
+		for _, name := range []string{AllResources, SampleParams(tpl.Capability)[ResourceNameParam]} {
+			raw, err := RenderPolicy(tpl.Capability, map[string]string{ResourceNameParam: name})
+			if err != nil {
+				t.Errorf("%s with %q: %v", id, name, err)
+				continue
+			}
+			if !strings.Contains(string(raw), DenyStatementFor(tpl.Capability.ProviderType)) {
+				t.Errorf("%s: no IAM deny statement", id)
+			}
+			for _, action := range templateActions(t, raw) {
+				if need := classifyAction(action); need.Rank() > tpl.Permission.Rank() {
+					t.Errorf("%s allows %s, which needs %s", id, action, need)
+				}
+			}
+		}
+		if tpl.Capability.Access != tpl.Permission.Access() {
+			t.Errorf("%s: access %s for permission %s", id, tpl.Capability.Access, tpl.Permission)
+		}
+	}
+	// Each level adds something, and never drops what the lower level had.
+	for _, spec := range resourceSpecs {
+		prev := 0
+		for _, p := range Permissions() {
+			tpl, ok := LookupAccessTemplate(spec.provider, spec.resource, p)
+			if !ok {
+				t.Fatalf("no template for %s %s", spec.resource, p)
+			}
+			raw, _ := RenderPolicy(tpl.Capability, map[string]string{ResourceNameParam: AllResources})
+			n := len(templateActions(t, raw))
+			if n <= prev {
+				t.Errorf("%s %s has %d actions, lower level had %d", spec.resource, p, n, prev)
+			}
+			prev = n
+		}
+	}
+}
+
+func TestRolePermissionLadder(t *testing.T) {
+	want := map[model.Role]Permission{
+		model.RoleGuest: PermissionRead, model.RoleMember: PermissionWrite, model.RoleAdministrator: PermissionFull,
+	}
+	for role, highest := range want {
+		for _, p := range Permissions() {
+			if got := role.Permits(p.Access()); got != (p.Rank() <= highest.Rank()) {
+				t.Errorf("%s permits %s = %v", role, p, got)
+			}
+		}
+	}
+	if Permission("admin").Valid() || Permission("").Access() != "" {
+		t.Error("unknown permission accepted")
+	}
+}
+
+func TestResourceNameValidation(t *testing.T) {
+	tpl, _ := LookupAccessTemplate(model.ProviderAliyun, "dns", PermissionWrite)
+	for name, ok := range map[string]bool{
+		"*": true, "example.com": true, "a.b.example.com": true,
+		"": false, "**": false, "*.example.com": false, "example.com/*": false,
+		`x","Action":"*`: false, "EXAMPLE.com": false,
+	} {
+		err := ValidateParams(tpl.Capability, map[string]string{ResourceNameParam: name})
+		if (err == nil) != ok {
+			t.Errorf("resource name %q: err=%v, want ok=%v", name, err, ok)
+		}
+	}
+}
+
+// A capability that borrows a reserved ID, or a template edited above its
+// level, never renders.
+func TestAccessTemplateIDsAreReserved(t *testing.T) {
+	tpl, _ := LookupAccessTemplate(model.ProviderAliyun, "ecs", PermissionWrite)
+	params := map[string]string{ResourceNameParam: AllResources}
+
+	forged := tpl.Capability
+	forged.PolicyTemplate = strings.Replace(forged.PolicyTemplate, `"ecs:StartInstance"`, `"ecs:DeleteInstance"`, 1)
+	if _, err := RenderPolicy(forged, params); err == nil {
+		t.Error("an edited access template rendered")
+	}
+	raised := tpl.Capability
+	raised.Access = model.AccessAdmin
+	if _, err := RenderPolicy(raised, params); err == nil {
+		t.Error("an access template with a raised access level rendered")
+	}
+	unknown := tpl.Capability
+	unknown.ID = "aliyun.access.ecs.everything"
+	if _, err := RenderPolicy(unknown, params); err == nil {
+		t.Error("an unknown reserved ID rendered")
+	}
+	if !IsAccessTemplateID(tpl.Capability.ID) || IsAccessTemplateID(IDDNSManage) || IsAccessTemplateID(IDECSOps) {
+		t.Error("reserved ID detection is wrong")
+	}
+	for _, c := range Builtin() {
+		if IsAccessTemplateID(c.ID) {
+			t.Errorf("built-in capability %s uses a reserved ID", c.ID)
+		}
+	}
+
+	// The level check itself: a write template that allows a full action, or
+	// an action of another service, is refused.
+	for _, action := range []string{"ecs:DeleteInstance", "ecs:*", "oss:PutObject"} {
+		doc := `{"Version":"1","Statement":[{"Effect":"Allow","Action":["` + action + `"],"Resource":["*"]}]}`
+		if err := CheckAccessTemplateLevel(tpl, []byte(doc)); err == nil {
+			t.Errorf("level check accepted %s in an ecs write template", action)
+		}
+	}
+}
+
+// The exact actions of every template, written out independently of the
+// classification code. Changing a template means changing this list, which
+// is the point: a reviewer sees the action that was added.
+func TestAccessTemplateActionsAreExactlyAsReviewed(t *testing.T) {
+	want := map[string][]string{
+		"aliyun.access.ecs.read":  {"ecs:Describe*"},
+		"aliyun.access.ecs.write": {"ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance"},
+		"aliyun.access.ecs.full": {"ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance",
+			"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance"},
+		"aliyun.access.dns.read": {"alidns:Describe*"},
+		"aliyun.access.dns.write": {"alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
+			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus"},
+		"aliyun.access.dns.full": {"alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
+			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus", "alidns:AddDomain", "alidns:DeleteDomain"},
+		"aliyun.access.oss.read":  {"oss:Get*", "oss:List*"},
+		"aliyun.access.oss.write": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
+		"aliyun.access.oss.full": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload",
+			"oss:PutBucket", "oss:DeleteBucket"},
+		"aws.access.s3.read":  {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts"},
+		"aws.access.s3.write": {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
+		"aws.access.s3.full": {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+			"s3:CreateBucket", "s3:DeleteBucket"},
+	}
+	if len(want) != len(accessTemplates) {
+		t.Fatalf("%d templates reviewed, %d defined", len(want), len(accessTemplates))
+	}
+	for id, actions := range want {
+		tpl, ok := AccessTemplateByID(id)
+		if !ok {
+			t.Errorf("no template %s", id)
+			continue
+		}
+		raw, err := RenderPolicy(tpl.Capability, map[string]string{ResourceNameParam: AllResources})
+		if err != nil {
+			t.Errorf("%s: %v", id, err)
+			continue
+		}
+		if got := strings.Join(templateActions(t, raw), " "); got != strings.Join(actions, " ") {
+			t.Errorf("%s allows\n  %s\nreviewed\n  %s", id, got, strings.Join(actions, " "))
+		}
+	}
+	// Never in any template: it can set an instance's login password.
+	for id, tpl := range accessTemplates {
+		if strings.Contains(tpl.Capability.PolicyTemplate, "ModifyInstanceAttribute") {
+			t.Errorf("%s allows ecs:ModifyInstanceAttribute", id)
+		}
+	}
+}
+
+// A stored row that borrows a reserved ID and the exact template text, but
+// loosens the parameter rule, does not render.
+func TestReservedIDWithLooserParamsIsRefused(t *testing.T) {
+	tpl, _ := LookupAccessTemplate(model.ProviderAliyun, "ecs", PermissionRead)
+	loose := tpl.Capability
+	loose.Params = []model.CapabilityParam{{Name: ResourceNameParam, Required: true, Pattern: ".*"}}
+	if _, err := RenderPolicy(loose, map[string]string{ResourceNameParam: "*/*"}); err == nil {
+		t.Error("a reserved ID with a looser parameter pattern rendered")
+	}
+	noParams := tpl.Capability
+	noParams.Params = nil
+	if _, err := RenderPolicy(noParams, nil); err == nil {
+		t.Error("a reserved ID without parameters rendered")
+	}
+	for name, ok := range map[string]bool{"i-" + strings.Repeat("a", 62): true, "i-" + strings.Repeat("a", 63): false} {
+		err := ValidateParams(tpl.Capability, map[string]string{ResourceNameParam: name})
+		if (err == nil) != ok {
+			t.Errorf("instance id of %d characters: %v", len(name), err)
+		}
+	}
+}
+
+// The role policy the console and the quickstart tell a supervisor to attach
+// must allow exactly what the access templates can ask for: an action missing
+// there fails in the cloud, and an extra one widens what a leaked broker key
+// could reach.
+func TestDocumentedRolePolicyMatchesTheTemplates(t *testing.T) {
+	for _, cloud := range []struct {
+		provider model.ProviderType
+		// first is the first action of the role's Allow list in the files.
+		first  string
+		quoted *regexp.Regexp
+		deny   *regexp.Regexp
+	}{
+		{model.ProviderAliyun, "ecs:Describe*", regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram|s3|iam):[A-Za-z*]+)["']`),
+			regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']ram:\*["'],\s*["']sts:AssumeRole["']\]`)},
+		{model.ProviderAWS, "s3:GetObject", regexp.MustCompile(`["']((?:ecs|alidns|oss|sts|ram|s3|iam):[A-Za-z*]+)["']`),
+			regexp.MustCompile(`Deny['"]?,\s*["']?Action["']?:\s*\[["']iam:\*["'],\s*["']organizations:\*["'],\s*["']sts:AssumeRole["']\]`)},
+	} {
+		want := map[string]bool{"sts:GetCallerIdentity": true} // the connection test
+		for _, spec := range resourceSpecs {
+			if spec.provider != cloud.provider {
+				continue
+			}
+			for _, list := range [][]string{spec.read, spec.write, spec.full} {
+				for _, action := range list {
+					want[action] = true
+				}
+			}
+		}
+		for _, file := range []string{"../../web/src/app/rolePolicy.ts", "../../docs/QUICKSTART.md"} {
+			raw, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(raw)
+			// Only the role's Allow list: it starts with the cloud's first
+			// action and ends with the connection test's action.
+			start := strings.Index(text, cloud.first)
+			if start < 0 {
+				t.Fatalf("%s: cannot find the %s role's permission policy", file, cloud.provider)
+			}
+			end := strings.Index(text[start:], "sts:GetCallerIdentity")
+			if end < 0 {
+				t.Fatalf("%s: the %s role's permission policy has no end", file, cloud.provider)
+			}
+			end += start + len("sts:GetCallerIdentity") + 1
+			got := map[string]bool{}
+			for _, m := range cloud.quoted.FindAllStringSubmatch(text[start-1:end], -1) {
+				got[m[1]] = true
+			}
+			for action := range want {
+				if !got[action] {
+					t.Errorf("%s: the %s role policy does not allow %s, which a template can ask for", file, cloud.provider, action)
+				}
+			}
+			for action := range got {
+				if !want[action] {
+					t.Errorf("%s: the %s role policy allows %s, which no template asks for", file, cloud.provider, action)
+				}
+				if strings.HasSuffix(action, ":*") {
+					t.Errorf("%s: the %s role policy has the wildcard %s", file, cloud.provider, action)
+				}
+			}
+			if !cloud.deny.MatchString(text) {
+				t.Errorf("%s: the %s role policy does not carry its deny", file, cloud.provider)
+			}
+		}
+	}
+}
+
+// The level check accepts only the actions a resource type declares: a
+// bucket policy or ACL action is refused even where its level would pass.
+func TestLevelCheckAcceptsOnlyDeclaredActions(t *testing.T) {
+	tpl, _ := LookupAccessTemplate(model.ProviderAWS, "s3", PermissionFull)
+	for _, action := range []string{"s3:GetBucketPolicy", "s3:GetBucketAcl", "s3:GetObjectAcl", "s3:PutBucketPolicy", "s3:Get*", "s3:PutBucketAcl"} {
+		doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["` + action + `"],"Resource":["*"]}]}`
+		if err := CheckAccessTemplateLevel(tpl, []byte(doc)); err == nil {
+			t.Errorf("level check accepted %s in the s3 full template", action)
+		}
+	}
+}

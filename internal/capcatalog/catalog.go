@@ -18,10 +18,16 @@ import (
 // Built-in capability IDs. They are part of the demo/acceptance contract and
 // must never change between releases within v0.1.
 const (
-	IDCloudRead  = "aliyun.cloud.read"
-	IDDNSManage  = "aliyun.dns.manage"
-	IDCertDNS01  = "aliyun.cert.dns01"
-	IDECSOps     = "aliyun.ecs.instance.ops"
+	IDCloudRead    = "aliyun.cloud.read"
+	IDDNSManage    = "aliyun.dns.manage"
+	IDCertDNS01    = "aliyun.cert.dns01"
+	IDECSOps       = "aliyun.ecs.instance.ops"
+	IDAccountAdmin = "aliyun.account.admin"
+
+	// IDBreakGlass is retired (CONTRACT §16.2): it is no longer seeded and is
+	// replaced by IDAccountAdmin. The ID is kept because historic leases
+	// reference it, the schema-2 migration disables the row instead of deleting
+	// it, and every startup revokes leases that still point at it.
 	IDBreakGlass = "aliyun.iam.break_glass"
 )
 
@@ -52,6 +58,7 @@ var builtinSpecs = []model.Capability{
 		Description:  "Read-only inventory across ECS, DNS, OSS and the caller identity; use for discovery, inspection and safe diagnostics.",
 		ProviderType: model.ProviderAliyun,
 		Risk:         model.RiskLow,
+		Access:       model.AccessRead,
 		PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow",` +
 			`"Action":["ecs:Describe*","alidns:Describe*","oss:List*","sts:GetCallerIdentity"],` +
 			`"Resource":["*"]}]}`,
@@ -66,6 +73,7 @@ var builtinSpecs = []model.Capability{
 		Description:  "Create, update, enable/disable and delete DNS records for a single domain; use for approved DNS changes.",
 		ProviderType: model.ProviderAliyun,
 		Risk:         model.RiskMedium,
+		Access:       model.AccessWrite,
 		PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow",` +
 			`"Action":["alidns:DescribeDomainRecords","alidns:AddDomainRecord","alidns:UpdateDomainRecord","alidns:DeleteDomainRecord","alidns:SetDomainRecordStatus"],` +
 			`"Resource":["acs:alidns:*:*:domain/{{domain}}"]}]}`,
@@ -88,6 +96,7 @@ var builtinSpecs = []model.Capability{
 		Description:  "Publish and clean up ACME DNS-01 challenge records for a single domain; use for certificate issuance and renewal.",
 		ProviderType: model.ProviderAliyun,
 		Risk:         model.RiskMedium,
+		Access:       model.AccessWrite,
 		PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow",` +
 			`"Action":["alidns:DescribeDomainRecords","alidns:AddDomainRecord","alidns:DeleteDomainRecord"],` +
 			`"Resource":["acs:alidns:*:*:domain/{{domain}}"]}]}`,
@@ -110,6 +119,7 @@ var builtinSpecs = []model.Capability{
 		Description:  "Start, stop or reboot a single ECS instance; use for runbook-driven instance maintenance.",
 		ProviderType: model.ProviderAliyun,
 		Risk:         model.RiskHigh,
+		Access:       model.AccessWrite,
 		PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow",` +
 			`"Action":["ecs:StartInstance","ecs:StopInstance","ecs:RebootInstance","ecs:DescribeInstances"],` +
 			`"Resource":["acs:ecs:*:*:instance/{{instance_id}}"]}]}`,
@@ -127,11 +137,12 @@ var builtinSpecs = []model.Capability{
 		Builtin:           true,
 	},
 	{
-		ID:           IDBreakGlass,
-		Name:         "Emergency account-wide access (break-glass)",
-		Description:  "Emergency account-wide access for incident response; requires break_glass=true and explicit human approval, and every action is audited at critical severity.",
+		ID:           IDAccountAdmin,
+		Name:         "Emergency account-wide access, IAM excluded",
+		Description:  "Emergency account-wide access for incident response, with RAM/IAM and sts:AssumeRole always denied; requires break_glass=true and explicit human approval, and every action is audited at critical severity.",
 		ProviderType: model.ProviderAliyun,
 		Risk:         model.RiskCritical,
+		Access:       model.AccessAdmin,
 		PolicyTemplate: `{"Version":"1","Statement":[{"Effect":"Allow",` +
 			`"Action":"*","Resource":"*"}]}`,
 		DefaultTTLSeconds: 900,
@@ -141,10 +152,10 @@ var builtinSpecs = []model.Capability{
 	},
 }
 
-// Builtin returns the capability catalog shipped with Cloud Safeguard. IDs are
-// stable and documented in docs/CONTRACT.md. The returned slice is a defensive
-// copy: callers may mutate it (the server stamps timestamps on seed) without
-// corrupting the catalog.
+// Builtin returns the capability catalog of v0.1. The running server does
+// not use it: credentials come from the access templates in access.go. It is
+// kept because the schema-2 migration, which an upgrade from v0.1 still runs,
+// needs it. The returned slice is a defensive copy.
 func Builtin() []model.Capability {
 	out := make([]model.Capability, 0, len(builtinSpecs))
 	for _, spec := range builtinSpecs {
@@ -212,11 +223,55 @@ func ValidateParams(cap model.Capability, params map[string]string) error {
 }
 
 // RenderPolicy substitutes {{param}} placeholders in the capability's policy
-// template, validates that the result is well-formed JSON and returns the
-// compact document. Only declared placeholders are substituted; values are
-// JSON-string-escaped before insertion so a hostile parameter can never alter
-// the structure of the rendered policy document.
+// template, appends the mandatory IAM deny statement (CONTRACT §16.3),
+// validates the result with CheckPolicy and returns the compact document. Only
+// declared placeholders are substituted; values are JSON-string-escaped before
+// insertion so a hostile parameter can never alter the structure of the
+// rendered policy document.
+//
+// It fails closed: when the rendered document violates the IAM prohibition the
+// error is returned and no document is produced, so no credential can be
+// minted from it.
 func RenderPolicy(cap model.Capability, params map[string]string) ([]byte, error) {
+	rendered, err := renderTemplate(cap, params)
+	if err != nil {
+		return nil, err
+	}
+	// Check the template's own document before re-encoding it: appending the
+	// deny statement rebuilds the top level and would silently drop duplicate
+	// top-level keys instead of rejecting them.
+	if err := RejectDuplicateKeys(rendered); err != nil {
+		return nil, fmt.Errorf("policy template of capability %s: %v", cap.ID, err)
+	}
+	// The template itself must be a valid policy with at least one
+	// statement: once the deny statement is appended, an empty or null
+	// Statement would no longer look empty (CONTRACT §16.3 rule 0).
+	if err := CheckPolicy(cap.Access, rendered); err != nil {
+		return nil, err
+	}
+	withDeny, err := appendDenyStatement(rendered, DenyStatementFor(cap.ProviderType))
+	if err != nil {
+		return nil, fmt.Errorf("policy template of capability %s cannot carry the mandatory deny statement: %v", cap.ID, err)
+	}
+	if err := CheckPolicy(cap.Access, withDeny); err != nil {
+		return nil, err
+	}
+	// IDs reserved for access templates render only the template defined in
+	// code, and only while it stays within its permission level (§17.4).
+	if IsAccessTemplateID(cap.ID) {
+		template, ok := AccessTemplateByID(cap.ID)
+		if !ok || !sameAccessTemplate(template.Capability, cap) {
+			return nil, fmt.Errorf("capability %s uses an ID reserved for access templates", cap.ID)
+		}
+		if err := CheckAccessTemplateLevel(template, withDeny); err != nil {
+			return nil, err
+		}
+	}
+	return withDeny, nil
+}
+
+// renderTemplate performs the placeholder substitution half of RenderPolicy.
+func renderTemplate(cap model.Capability, params map[string]string) ([]byte, error) {
 	template := strings.TrimSpace(cap.PolicyTemplate)
 	if template == "" {
 		return nil, fmt.Errorf("capability %s has an empty policy template", cap.ID)
@@ -264,6 +319,46 @@ func RenderPolicy(cap model.Capability, params map[string]string) ([]byte, error
 	return compact.Bytes(), nil
 }
 
+// SampleParams returns a safe, pattern-conforming value for every declared
+// parameter of a capability. It exists so a capability's policy template can be
+// rendered (and therefore IAM-checked) without a real request: the schema-2
+// migration uses it to decide which stored capabilities must be disabled.
+func SampleParams(cap model.Capability) map[string]string {
+	samples := make(map[string]string, len(cap.Params))
+	for _, p := range cap.Params {
+		samples[p.Name] = sampleParamValue(p)
+	}
+	return samples
+}
+
+// RenderSample renders a capability's policy template with SampleParams. A
+// non-nil error means the capability cannot mint a credential at all: either
+// the template is malformed or it violates the IAM prohibition.
+func RenderSample(cap model.Capability) ([]byte, error) {
+	return RenderPolicy(cap, SampleParams(cap))
+}
+
+// sampleParamValue returns a safe sample value for one declared parameter,
+// preferring a realistic value that satisfies the declared pattern.
+func sampleParamValue(p model.CapabilityParam) string {
+	candidates := []string{"sample"}
+	switch p.Name {
+	case "domain":
+		candidates = append(candidates, "example.com")
+	case "instance_id":
+		candidates = append(candidates, "i-sample123")
+	}
+	for _, candidate := range candidates {
+		if p.Pattern == "" {
+			return candidate
+		}
+		if re, err := regexp.Compile(p.Pattern); err == nil && re.MatchString(candidate) {
+			return candidate
+		}
+	}
+	return candidates[0]
+}
+
 // jsonEscape returns s escaped as the contents of a JSON string (without the
 // surrounding quotes). It uses the same escaping rules encoding/json applies,
 // with HTML escaping disabled so ARN-like values stay readable.
@@ -280,4 +375,21 @@ func jsonEscape(s string) string {
 		b = b[1 : len(b)-1]
 	}
 	return string(b)
+}
+
+// sameAccessTemplate reports whether cap is exactly the code-defined access
+// template: the same policy, level, provider type and parameter rules. A
+// stored row that borrows the ID with a looser parameter pattern is refused.
+func sameAccessTemplate(want, cap model.Capability) bool {
+	if want.PolicyTemplate != cap.PolicyTemplate || want.Access != cap.Access ||
+		want.ProviderType != cap.ProviderType || len(want.Params) != len(cap.Params) {
+		return false
+	}
+	for i := range want.Params {
+		if want.Params[i].Name != cap.Params[i].Name || want.Params[i].Pattern != cap.Params[i].Pattern ||
+			want.Params[i].Required != cap.Params[i].Required {
+			return false
+		}
+	}
+	return true
 }

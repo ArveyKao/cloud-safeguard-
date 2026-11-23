@@ -15,7 +15,6 @@ import (
 
 	"github.com/arveykao/cloud-safeguard/internal/model"
 	"github.com/arveykao/cloud-safeguard/internal/store"
-	"github.com/arveykao/cloud-safeguard/internal/token"
 )
 
 // rawRequest performs an HTTP request against a handler (used by tests that
@@ -44,143 +43,90 @@ func rawRequest(t *testing.T, handler http.Handler, method, path, bearer string,
 	return rec
 }
 
-func TestInitForcePreservesDataAndRotatesAdminToken(t *testing.T) {
+// Init never touches an existing install: not its data, not its master key,
+// whatever options it is given. There is nothing to rotate any more.
+func TestInitRefusesAnInitializedDirAndLeavesItIntact(t *testing.T) {
 	dir := t.TempDir()
-	first, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true})
-	if err != nil {
+	if _, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	keyBefore, err := os.ReadFile(filepath.Join(dir, "master.key"))
-	if err != nil {
-		t.Fatalf("read master.key: %v", err)
+	snapshot := func() map[string][]byte {
+		out := map[string][]byte{}
+		for _, name := range []string{"master.key", store.DBFileName} {
+			data, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatalf("read %s: %v", name, err)
+			}
+			out[name] = data
+		}
+		return out
+	}
+	before := snapshot()
+
+	different := make([]byte, 32)
+	for i := range different {
+		different[i] = 0xEE
+	}
+	for name, opts := range map[string]InitOptions{
+		"plain":            {DataDir: dir},
+		"demo":             {DataDir: dir, Demo: true},
+		"another key":      {DataDir: dir, MasterKey: different},
+		"another username": {DataDir: dir, SupervisorUsername: "someone-else"},
+	} {
+		if _, err := Init(context.Background(), opts); err == nil || !strings.Contains(err.Error(), "already initialized") {
+			t.Fatalf("%s: Init on an initialized dir = %v, want a refusal", name, err)
+		}
+	}
+	t.Setenv("CSG_MASTER_KEY", base64.StdEncoding.EncodeToString(different))
+	if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err == nil {
+		t.Fatal("Init with a conflicting CSG_MASTER_KEY touched an initialized dir")
+	}
+	t.Setenv("CSG_MASTER_KEY", "")
+	after := snapshot()
+	for name := range before {
+		if !bytes.Equal(before[name], after[name]) {
+			t.Fatalf("a refused Init changed %s", name)
+		}
 	}
 
-	// Mutate data through a running server: audit event + a lease credential.
+	// The install still works: the key decrypts the demo account's credential.
+	env := &testEnv{t: t, dir: dir, clock: newFakeClock(time.Now()), logs: &bytes.Buffer{}}
 	srv, err := New(Config{DataDir: dir})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("New after refused inits: %v", err)
 	}
-	if err := srv.db.AppendAudit(context.Background(), &model.AuditEvent{
-		ActorType: "system", ActorID: "system", ActorName: model.ProductName,
-		Action: "test.marker", Status: "ok", Severity: "info",
-	}); err != nil {
-		t.Fatalf("append marker audit event: %v", err)
+	defer srv.Close()
+	env.srv = srv
+	providers, err := srv.db.ListProviders(context.Background())
+	if err != nil || len(providers) != 1 {
+		t.Fatalf("providers = %d, %v", len(providers), err)
 	}
-	if err := srv.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if ok, message, _ := srv.testProvider(context.Background(), providers[0]); !ok {
+		t.Fatalf("the demo account's credential no longer decrypts: %s", message)
 	}
-
-	// Force re-init rotates the admin token but keeps the data and key.
-	second, err := Init(context.Background(), InitOptions{DataDir: dir, Demo: true, Force: true})
-	if err != nil {
-		t.Fatalf("Init --force: %v", err)
-	}
-	if first.AdminToken == second.AdminToken {
-		t.Fatal("--force did not rotate the admin token")
-	}
-	if len(second.Agents) != 0 {
-		t.Fatalf("--force re-issued %d agent tokens, want 0 (data intact)", len(second.Agents))
-	}
-	if len(second.ProviderIDs) != 0 {
-		t.Fatalf("--force re-created %d providers, want 0", len(second.ProviderIDs))
-	}
-	if len(second.CapabilityIDs) != 5 {
-		t.Fatalf("--force capability ids = %v, want 5", second.CapabilityIDs)
-	}
-	keyAfter, err := os.ReadFile(filepath.Join(dir, "master.key"))
-	if err != nil {
-		t.Fatalf("read master.key after force: %v", err)
-	}
-	if !bytes.Equal(keyBefore, keyAfter) {
-		t.Fatal("--force replaced the master key and would orphan encrypted data")
-	}
-
-	// No duplicate seed rows; the pre-existing audit chain still verifies.
-	db, err := store.Open(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	if caps, err := db.ListCapabilities(context.Background()); err != nil || len(caps) != 5 {
-		t.Fatalf("capabilities after force = %d, %v", len(caps), err)
-	}
-	if providers, err := db.ListProviders(context.Background()); err != nil || len(providers) != 1 {
-		t.Fatalf("providers after force = %d, %v", len(providers), err)
-	}
-	if agents, err := db.ListAgents(context.Background()); err != nil || len(agents) != 2 {
-		t.Fatalf("agents after force = %d, %v", len(agents), err)
-	}
-	if result, err := db.VerifyAudit(context.Background()); err != nil || !result.OK || result.Events != 1 {
-		t.Fatalf("audit chain after force = %+v, %v", result, err)
-	}
-	if hash, _ := db.GetMeta(context.Background(), store.MetaAdminTokenHash); hash != token.Hash(second.AdminToken) {
-		t.Fatal("stored admin token hash was not rotated")
-	}
-	providers, _ := db.ListProviders(context.Background())
-	db.Close()
-
-	// The rotated admin token works; the old one is rejected.
-	srv2, err := New(Config{DataDir: dir})
-	if err != nil {
-		t.Fatalf("New after force: %v", err)
-	}
-	defer srv2.Close()
-	handler := srv2.Handler()
-	rec := rawRequest(t, handler, http.MethodPost, "/api/v1/admin/login", second.AdminToken, nil)
-	requireStatus(t, rec, http.StatusOK)
-	rec = rawRequest(t, handler, http.MethodPost, "/api/v1/admin/login", first.AdminToken, nil)
-	requireErrorCode(t, rec, http.StatusUnauthorized, model.ErrCodeUnauthorized)
-
-	// The preserved master key still decrypts the demo provider credential:
-	// provider testing decrypts it, so ok=true proves decryption works.
-	rec = rawRequest(t, handler, http.MethodPost, "/api/v1/admin/providers/"+providers[0].ID+"/test", second.AdminToken, nil)
-	requireStatus(t, rec, http.StatusOK)
-	tested := decodeEnvelope[providerTestResult](t, rec)
-	if !tested.OK {
-		t.Fatalf("provider credential no longer decrypts after force: %+v", tested)
-	}
-
-	// Force again without --demo: still allowed, data intact, demo flag updated.
-	third, err := Init(context.Background(), InitOptions{DataDir: dir, Force: true})
-	if err != nil {
-		t.Fatalf("Init --force (non-demo): %v", err)
-	}
-	if third.AdminToken == second.AdminToken {
-		t.Fatal("second --force did not rotate the admin token")
-	}
-	db3, err := store.Open(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer db3.Close()
-	if agents, _ := db3.ListAgents(context.Background()); len(agents) != 2 {
-		t.Fatalf("agents after second force = %d, want 2", len(agents))
-	}
-	if mode, _ := db3.GetMeta(context.Background(), store.MetaDemoMode); mode != "false" {
-		t.Fatalf("demo_mode after non-demo force = %q, want false", mode)
+	people, err := srv.db.ListPersons(context.Background())
+	if err != nil || len(people) != 1 {
+		t.Fatalf("a refused Init added a person: %+v, %v", people, err)
 	}
 }
 
 func TestInitNonDemoBootstrap(t *testing.T) {
 	dir := t.TempDir()
-	result, err := Init(context.Background(), InitOptions{DataDir: dir})
+	result, err := Init(context.Background(), InitOptions{DataDir: dir, SupervisorUsername: "root"})
 	if err != nil {
 		t.Fatalf("Init non-demo: %v", err)
 	}
-	if len(result.Agents) != 0 || len(result.ProviderIDs) != 0 {
-		t.Fatalf("non-demo init seeded agents/providers: %+v", result)
+	if len(result.ProviderIDs) != 0 {
+		t.Fatalf("non-demo init added a cloud account: %+v", result)
 	}
-	if len(result.CapabilityIDs) != 5 {
-		t.Fatalf("capability IDs = %v, want 5 builtins", result.CapabilityIDs)
-	}
-	if !strings.HasPrefix(result.AdminToken, token.AdminPrefix) {
-		t.Fatal("admin token missing expected prefix")
+	if result.Supervisor == nil || result.Supervisor.Person.Username != "root" || result.Supervisor.SetupCode == "" {
+		t.Fatalf("first supervisor = %+v", result.Supervisor)
 	}
 
 	db, err := store.Open(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer db.Close()
 	ctx := context.Background()
 	providers, _ := db.ListProviders(ctx)
 	agents, _ := db.ListAgents(ctx)
@@ -194,16 +140,17 @@ func TestInitNonDemoBootstrap(t *testing.T) {
 	if err != nil || settings != model.DefaultPolicySettings() {
 		t.Fatalf("policy settings = %+v, %v", settings, err)
 	}
+	db.Close()
 
-	// The server starts on a non-demo install.
+	// The server starts on a non-demo install, and the setup code works.
 	srv, err := New(Config{DataDir: dir})
 	if err != nil {
 		t.Fatalf("New non-demo: %v", err)
 	}
 	defer srv.Close()
-	if rec := rawRequest(t, srv.Handler(), http.MethodPost, "/api/v1/admin/login", result.AdminToken, nil); rec.Code != http.StatusOK {
-		t.Fatalf("admin login on non-demo install status = %d", rec.Code)
-	}
+	rec := rawRequest(t, srv.Handler(), http.MethodPost, "/api/v1/auth/setup/begin", "",
+		model.SetupBeginInput{SetupCode: result.Supervisor.SetupCode, Password: testPassword})
+	requireStatus(t, rec, http.StatusOK)
 }
 
 func TestInitExplicitMasterKey(t *testing.T) {
@@ -243,18 +190,6 @@ func TestInitExplicitMasterKey(t *testing.T) {
 		t.Fatal("Init accepted a 16-byte master key")
 	}
 
-	// A different key on --force must not silently orphan the encrypted data.
-	different := make([]byte, 32)
-	if _, err := Init(context.Background(), InitOptions{DataDir: dir, Force: true, MasterKey: different}); err == nil {
-		t.Fatal("Init --force accepted a different master key")
-	} else if !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("mismatched key error = %v", err)
-	}
-	// The original key survived the refused force.
-	after, _ := os.ReadFile(filepath.Join(dir, "master.key"))
-	if !bytes.Equal(after, key) {
-		t.Fatal("refused --force altered the master key")
-	}
 }
 
 func TestInitCreatesDataDirPermissions(t *testing.T) {
@@ -272,7 +207,7 @@ func TestInitCreatesDataDirPermissions(t *testing.T) {
 	}
 }
 
-func TestInitForceOnExistingUninitializedDir(t *testing.T) {
+func TestInitOnADirWithOtherFiles(t *testing.T) {
 	dir := t.TempDir()
 	// A stray file that is not part of an install does not block init.
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("hello"), 0o600); err != nil {
@@ -281,59 +216,27 @@ func TestInitForceOnExistingUninitializedDir(t *testing.T) {
 	if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err != nil {
 		t.Fatalf("Init on dir with stray file: %v", err)
 	}
-	// A bare empty directory is initialized normally (Force is not required).
-	dir2 := t.TempDir()
-	if _, err := Init(context.Background(), InitOptions{DataDir: dir2, Force: true}); err != nil {
-		t.Fatalf("Init --force on empty dir: %v", err)
-	}
-	db, err := store.Open(context.Background(), dir2)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer db.Close()
-	caps, _ := db.ListCapabilities(context.Background())
-	if len(caps) != 5 {
-		t.Fatalf("capabilities = %d, want 5", len(caps))
-	}
-	_ = time.Now
 }
 
-func TestInitRefusesDatabaseWithoutMasterKey(t *testing.T) {
-	dir := t.TempDir()
-	// Simulate a damaged install: database present, master key lost.
-	if err := os.WriteFile(filepath.Join(dir, store.DBFileName), []byte("not really sqlite"), 0o600); err != nil {
-		t.Fatalf("write fake db: %v", err)
-	}
-	// Without --force it is "already initialized"; with --force it must refuse
-	// rather than generate a fresh key and orphan the encrypted data.
-	if _, err := Init(context.Background(), InitOptions{DataDir: dir, Force: true}); err == nil {
-		t.Fatal("Init --force accepted a database without a master key")
-	} else if !strings.Contains(err.Error(), "master.key") {
-		t.Fatalf("error = %v, want a master.key hint", err)
-	}
-}
-
-func TestInitRejectsMismatchedEnvironmentMasterKey(t *testing.T) {
-	dir := t.TempDir()
-	if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	keyBefore, err := os.ReadFile(filepath.Join(dir, "master.key"))
-	if err != nil {
-		t.Fatalf("read master.key: %v", err)
-	}
-	different := make([]byte, 32)
-	for i := range different {
-		different[i] = 0xEE
-	}
-	t.Setenv("CSG_MASTER_KEY", base64.StdEncoding.EncodeToString(different))
-	if _, err := Init(context.Background(), InitOptions{DataDir: dir, Force: true}); err == nil {
-		t.Fatal("Init --force accepted a conflicting CSG_MASTER_KEY")
-	} else if !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("error = %v, want a mismatch error", err)
-	}
-	keyAfter, _ := os.ReadFile(filepath.Join(dir, "master.key"))
-	if !bytes.Equal(keyBefore, keyAfter) {
-		t.Fatal("refused --force altered the master key file")
+// A damaged install (database present, master key lost, or the other way
+// round) is never initialized over: a fresh key would orphan the encrypted
+// data.
+func TestInitRefusesAPartialInstall(t *testing.T) {
+	for _, name := range []string{store.DBFileName, "master.key"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("left over from a damaged install"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Init(context.Background(), InitOptions{DataDir: dir}); err == nil {
+			t.Fatalf("Init accepted a directory that already has %s", name)
+		}
+		if data, _ := os.ReadFile(path); string(data) != "left over from a damaged install" {
+			t.Fatalf("a refused Init changed %s", name)
+		}
+		entries, _ := os.ReadDir(dir)
+		if len(entries) != 1 {
+			t.Fatalf("a refused Init left %d files next to %s", len(entries), name)
+		}
 	}
 }

@@ -8,13 +8,16 @@ import react from '@vitejs/plugin-react'
 const apiTarget = process.env.CSG_API_PROXY ?? 'http://127.0.0.1:8787'
 
 export default defineConfig({
-  base: './',
+  // Absolute asset paths: the console has nested routes (/accounts/new), and
+  // the server answers any unknown path with index.html.
+  base: '/',
   plugins: [react()],
   server: {
     port: 18803,
     strictPort: true,
     proxy: {
-      '/api': { target: apiTarget, changeOrigin: true },
+      // Keep the browser's Host: the server checks Origin against it.
+      '/api': { target: apiTarget },
       '/mock-cloud': { target: apiTarget, changeOrigin: true },
       '/healthz': { target: apiTarget, changeOrigin: true },
     },

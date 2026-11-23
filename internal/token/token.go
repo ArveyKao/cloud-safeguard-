@@ -1,24 +1,20 @@
-// Package token generates and hashes opaque bearer tokens for agent and admin
-// identities. Only the SHA-256 hash of a token is ever stored; the plaintext is
-// returned exactly once, at creation or rotation time.
+// Package token generates and hashes the opaque bearer tokens of agents. Only
+// the SHA-256 hash of a token is ever stored; the plaintext is returned
+// exactly once, to the agent, when a person approves its sign-in.
 package token
 
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"strings"
 )
 
-// Token prefixes. The prefix lets the CLI and the server route a bearer token
-// to the right identity domain without a second lookup.
-const (
-	AgentPrefix = "csg_agt_"
-	AdminPrefix = "csg_adm_"
-)
+// AgentPrefix starts every agent token, the only bearer token there is.
+// People sign in with a password and an authenticator code instead.
+const AgentPrefix = "csg_agt_"
 
 // ErrEntropy is returned when the system random source fails.
 var ErrEntropy = errors.New("token: cannot read system randomness")
@@ -28,7 +24,7 @@ const entropyBytes = 32
 // Generate creates a new token with the given prefix. It returns the plaintext
 // token (show once) and the hex SHA-256 hash to persist.
 func Generate(prefix string) (plain string, hash string, err error) {
-	if prefix != AgentPrefix && prefix != AdminPrefix {
+	if prefix != AgentPrefix {
 		return "", "", errors.New("token: unknown prefix")
 	}
 	buf := make([]byte, entropyBytes)
@@ -45,18 +41,11 @@ func Hash(plain string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// HashEqual compares two token hashes in constant time.
-func HashEqual(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
-// Kind classifies a plaintext token by its prefix: "agent", "admin" or "".
+// Kind classifies a plaintext token by its prefix: "agent" or "".
 func Kind(plain string) string {
 	switch {
 	case strings.HasPrefix(plain, AgentPrefix):
 		return "agent"
-	case strings.HasPrefix(plain, AdminPrefix):
-		return "admin"
 	default:
 		return ""
 	}

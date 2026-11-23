@@ -51,6 +51,7 @@ type handler struct {
 	signingKey []byte
 	now        func() time.Time
 	state      *cloudState
+	s3         *s3State
 }
 
 // authContext is the validated identity behind one mock-cloud request.
@@ -59,6 +60,7 @@ type authContext struct {
 	payload   provider.MockTokenPayload
 	policy    policyDoc
 	agentName string
+	cloud     model.ProviderType
 }
 
 // cloudError is an Aliyun-shaped API error.
@@ -86,6 +88,7 @@ func NewHandler(deps Deps) http.Handler {
 		signingKey: deps.SigningKey,
 		now:        time.Now,
 		state:      newCloudState(),
+		s3:         newS3State(),
 	}
 
 	mux := http.NewServeMux()
@@ -150,6 +153,16 @@ func NewHandler(deps Deps) http.Handler {
 		resource: func(r *http.Request, ac *authContext) string { return ac.alidnsResource(r.PathValue("zone")) },
 		handle:   handleDNSDeleteRecord,
 	}))
+	// RAM is reachable but never allowed: the mandatory deny statement carried
+	// by every minted credential (CONTRACT §16.3) makes this route the
+	// end-to-end proof of the IAM prohibition.
+	mux.HandleFunc("GET /v1/ram/users", h.wrap(route{
+		service:  ramService,
+		action:   "ram:ListUsers",
+		resource: func(_ *http.Request, _ *authContext) string { return "*" },
+		handle:   handleRAMListUsers,
+	}))
+	h.registerAWS(mux)
 	mux.HandleFunc("/", h.handleUnknownRoute)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +190,16 @@ func (h *handler) wrap(rt route) http.HandlerFunc {
 			return
 		}
 
+		// A route belongs to one cloud: an Alibaba Cloud token never reaches
+		// S3 or IAM, an AWS token never reaches ECS, DNS or RAM, whatever its
+		// policy says.
+		if routeCloud(rt.service) != ac.cloud {
+			cerr := &cloudError{status: http.StatusUnauthorized, code: "InvalidSecurityToken",
+				message: "The security token is not valid for this service"}
+			h.auditAPIDenied(reqID, rt, cerr)
+			writeCloudError(w, reqID, cerr)
+			return
+		}
 		resource := rt.resource(r, ac)
 		if !policyAllows(ac.policy, rt.action, resource) {
 			cerr := &cloudError{
@@ -245,6 +268,24 @@ func (h *handler) authenticate(r *http.Request) (*authContext, *cloudError) {
 		}
 	}
 
+	// 4a. A long-lived credential (CONTRACT §17.14) works while it is active.
+	if strings.HasPrefix(payload.LeaseID, "llc_") {
+		llc, err := h.store.GetLongLived(r.Context(), payload.LeaseID)
+		if err != nil || llc.ProviderID != payload.ProviderID || llc.Status != model.LongLivedActive {
+			return nil, &cloudError{
+				status:  http.StatusUnauthorized,
+				code:    "InvalidAccessKeyId.Inactive",
+				message: "The access key has been deleted",
+			}
+		}
+		doc, err := parsePolicyDoc(payload.Policy)
+		if err != nil {
+			return nil, &cloudError{status: http.StatusUnauthorized, code: "InvalidSecurityToken", message: "The key carries an invalid policy"}
+		}
+		return &authContext{lease: model.Lease{ID: llc.ID, ProviderID: llc.ProviderID, AgentID: llc.AgentID},
+			payload: payload, policy: doc, cloud: prov.Type}, nil
+	}
+
 	// 4. Lease must still be active and unexpired (immediate revocation).
 	lease, err := h.store.GetLease(r.Context(), payload.LeaseID)
 	if err != nil {
@@ -295,7 +336,7 @@ func (h *handler) authenticate(r *http.Request) (*authContext, *cloudError) {
 		}
 	}
 
-	ac := &authContext{lease: lease, payload: payload, policy: doc}
+	ac := &authContext{lease: lease, payload: payload, policy: doc, cloud: prov.Type}
 	if agent, err := h.store.GetAgent(r.Context(), lease.AgentID); err == nil {
 		ac.agentName = agent.Name
 	}

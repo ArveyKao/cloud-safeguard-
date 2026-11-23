@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,7 +19,7 @@ type rowScanner interface {
 // ================= Providers =================
 
 const providerColumns = `id, name, type, mode, region, role_arn, access_key_id_masked,
-	status, last_tested_at, last_test_ok, created_at, updated_at`
+	status, last_tested_at, last_test_ok, created_at, updated_at, cloud_account_id, user_admin_key_masked`
 
 // scanProvider scans one provider row (credential blob excluded).
 func scanProvider(row rowScanner) (model.Provider, error) {
@@ -32,7 +33,7 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 	err := row.Scan(
 		&p.ID, &p.Name, &p.Type, &p.Mode, &p.Region, &p.RoleARN,
 		&p.AccessKeyIDMasked, &p.Status, &lastTestedAt, &lastTestOK,
-		&createdAt, &updatedAt,
+		&createdAt, &updatedAt, &p.CloudAccountID, &p.UserAdminKeyMasked,
 	)
 	if err != nil {
 		return model.Provider{}, mapErr(err)
@@ -48,14 +49,23 @@ func scanProvider(row rowScanner) (model.Provider, error) {
 func (db *DB) CreateProvider(ctx context.Context, p model.Provider, encryptedCredential string) error {
 	_, err := db.sql.ExecContext(ctx,
 		`INSERT INTO providers(`+providerColumns+`, encrypted_credential)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)`,
 		p.ID, p.Name, string(p.Type), string(p.Mode), p.Region, p.RoleARN,
 		p.AccessKeyIDMasked, string(p.Status),
 		millisPtr(p.LastTestedAt), boolPtrInt(p.LastTestOK),
-		toMillis(p.CreatedAt), toMillis(p.UpdatedAt),
+		toMillis(p.CreatedAt), toMillis(p.UpdatedAt), p.CloudAccountID,
 		encryptedCredential,
 	)
 	return mapErr(err)
+}
+
+// GetProviderByCloudAccountID returns the provider for a cloud account ID.
+func (db *DB) GetProviderByCloudAccountID(ctx context.Context, cloudAccountID string) (model.Provider, error) {
+	if cloudAccountID == "" {
+		return model.Provider{}, ErrNotFound
+	}
+	row := db.sql.QueryRowContext(ctx, `SELECT `+providerColumns+` FROM providers WHERE cloud_account_id = ?`, cloudAccountID)
+	return scanProvider(row)
 }
 
 // GetProvider returns a provider by ID without its credential blob.
@@ -88,29 +98,111 @@ func (db *DB) ListProviders(ctx context.Context) ([]model.Provider, error) {
 	return out, nil
 }
 
-// UpdateProvider updates the mutable provider fields (not the credential blob).
+// UpdateProvider writes what a supervisor can edit on a provider: its name,
+// region, role ARN and status. It never touches the cloud account ID, the
+// stored credential or the test result, and it writes only while the
+// provider still has the cloud account ID the caller read (ErrConflict
+// otherwise), so an edit based on an old read cannot pair one account's ID
+// with another account's role.
 func (db *DB) UpdateProvider(ctx context.Context, p model.Provider) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE providers SET name = ?, region = ?, role_arn = ?, access_key_id_masked = ?,
-			status = ?, last_tested_at = ?, last_test_ok = ?, updated_at = ?
-		 WHERE id = ?`,
-		p.Name, p.Region, p.RoleARN, p.AccessKeyIDMasked, string(p.Status),
-		millisPtr(p.LastTestedAt), boolPtrInt(p.LastTestOK), toMillis(p.UpdatedAt), p.ID,
+		`UPDATE providers SET name = ?, region = ?, role_arn = ?, status = ?, updated_at = ?
+		 WHERE id = ? AND cloud_account_id = ?`,
+		p.Name, p.Region, p.RoleARN, string(p.Status), toMillis(p.UpdatedAt), p.ID, p.CloudAccountID,
 	)
+	if err != nil {
+		return mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return mapErr(err)
+	}
+	if n == 0 {
+		if _, err := db.GetProvider(ctx, p.ID); err != nil {
+			return err
+		}
+		return ErrConflict
+	}
+	return nil
+}
+
+// SetProviderTestResult records the outcome of a connection test and nothing
+// else.
+func (db *DB) SetProviderTestResult(ctx context.Context, id string, at time.Time, ok bool) error {
+	res, err := db.sql.ExecContext(ctx,
+		`UPDATE providers SET last_tested_at = ?, last_test_ok = ? WHERE id = ?`,
+		toMillis(at), boolPtrInt(&ok), id)
 	if err != nil {
 		return mapErr(err)
 	}
 	return affectedOrNotFound(res)
 }
 
-// UpdateProviderCredential replaces the encrypted broker credential blob.
-func (db *DB) UpdateProviderCredential(ctx context.Context, id, encryptedCredential string) error {
+// RotateProviderCredential replaces the encrypted broker credential and its
+// masked AccessKey ID in one statement, and nothing else.
+func (db *DB) RotateProviderCredential(ctx context.Context, id, encryptedCredential, maskedAccessKeyID string, now time.Time) error {
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE providers SET encrypted_credential = ? WHERE id = ?`, encryptedCredential, id)
+		`UPDATE providers SET encrypted_credential = ?, access_key_id_masked = ?, updated_at = ? WHERE id = ?`,
+		encryptedCredential, maskedAccessKeyID, toMillis(now), id)
 	if err != nil {
 		return mapErr(err)
 	}
 	return affectedOrNotFound(res)
+}
+
+// AdoptProviderCloudAccountID gives a provider that has no cloud account ID
+// one, together with the role ARN it comes from, and in the same transaction
+// removes every role binding on that provider: roles given while it had no
+// account did nothing and must not start to count for an account nobody
+// chose them for. It returns the removed bindings. Nothing changes, bindings
+// included, when another provider already has that ID or this one got an ID
+// meanwhile (ErrConflict).
+func (db *DB) AdoptProviderCloudAccountID(ctx context.Context, id, roleARN, cloudAccountID string, now time.Time) ([]model.RoleBinding, error) {
+	if cloudAccountID == "" {
+		return nil, errors.New("store: cloud account ID is required")
+	}
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE providers SET role_arn = ?, cloud_account_id = ?, updated_at = ?
+		 WHERE id = ? AND cloud_account_id = ''`, roleARN, cloudAccountID, toMillis(now), id)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if n == 0 {
+		return nil, ErrConflict
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+bindingColumns+` FROM role_bindings WHERE provider_id = ? ORDER BY person_id ASC`, id)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	removed := []model.RoleBinding{}
+	for rows.Next() {
+		b, err := scanBinding(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		removed = append(removed, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM role_bindings WHERE provider_id = ?`, id); err != nil {
+		return nil, mapErr(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, mapErr(err)
+	}
+	return removed, nil
 }
 
 // GetProviderCredential returns the encrypted broker credential blob.
@@ -139,7 +231,7 @@ func (db *DB) CountProviderCredentials(ctx context.Context) (int, error) {
 
 // ================= Capabilities =================
 
-const capabilityColumns = `id, name, description, provider_type, risk, policy_template,
+const capabilityColumns = `id, name, description, provider_type, risk, access, policy_template,
 	params_json, default_ttl_seconds, max_ttl_seconds, enabled, builtin, created_at, updated_at`
 
 // scanCapability scans one capability row.
@@ -153,7 +245,7 @@ func scanCapability(row rowScanner) (model.Capability, error) {
 		updatedAt  int64
 	)
 	err := row.Scan(
-		&c.ID, &c.Name, &c.Description, &c.ProviderType, &c.Risk, &c.PolicyTemplate,
+		&c.ID, &c.Name, &c.Description, &c.ProviderType, &c.Risk, &c.Access, &c.PolicyTemplate,
 		&paramsJSON, &c.DefaultTTLSeconds, &c.MaxTTLSeconds, &enabled, &builtin,
 		&createdAt, &updatedAt,
 	)
@@ -172,6 +264,10 @@ func scanCapability(row rowScanner) (model.Capability, error) {
 	return c, nil
 }
 
+// The stored-capability functions below belong to the removed capability
+// model (CONTRACT §17.7a). The server no longer calls them; they remain for
+// the schema-2 migration's tests and for reading an upgraded database.
+
 // CreateCapability persists a capability.
 func (db *DB) CreateCapability(ctx context.Context, c model.Capability) error {
 	paramsJSON, err := marshalJSON(c.Params, "[]")
@@ -180,9 +276,10 @@ func (db *DB) CreateCapability(ctx context.Context, c model.Capability) error {
 	}
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO capabilities(`+capabilityColumns+`)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.Name, c.Description, string(c.ProviderType), string(c.Risk), c.PolicyTemplate,
-		paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds, boolInt(c.Enabled), boolInt(c.Builtin),
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.Name, c.Description, string(c.ProviderType), string(c.Risk), string(c.Access),
+		c.PolicyTemplate, paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds,
+		boolInt(c.Enabled), boolInt(c.Builtin),
 		toMillis(c.CreatedAt), toMillis(c.UpdatedAt),
 	)
 	return mapErr(err)
@@ -225,11 +322,12 @@ func (db *DB) UpdateCapability(ctx context.Context, c model.Capability) error {
 	}
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE capabilities SET name = ?, description = ?, provider_type = ?, risk = ?,
-			policy_template = ?, params_json = ?, default_ttl_seconds = ?, max_ttl_seconds = ?,
-			enabled = ?, builtin = ?, updated_at = ?
+			access = ?, policy_template = ?, params_json = ?, default_ttl_seconds = ?,
+			max_ttl_seconds = ?, enabled = ?, builtin = ?, updated_at = ?
 		 WHERE id = ?`,
-		c.Name, c.Description, string(c.ProviderType), string(c.Risk), c.PolicyTemplate,
-		paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds, boolInt(c.Enabled), boolInt(c.Builtin),
+		c.Name, c.Description, string(c.ProviderType), string(c.Risk), string(c.Access),
+		c.PolicyTemplate, paramsJSON, c.DefaultTTLSeconds, c.MaxTTLSeconds,
+		boolInt(c.Enabled), boolInt(c.Builtin),
 		toMillis(c.UpdatedAt), c.ID,
 	)
 	if err != nil {
@@ -240,8 +338,8 @@ func (db *DB) UpdateCapability(ctx context.Context, c model.Capability) error {
 
 // ================= Agents =================
 
-const agentColumns = `id, name, description, status, grants_json, max_ttl_seconds,
-	max_concurrent_leases, token_prefix, last_seen_at, created_at, updated_at`
+const agentColumns = `id, name, description, status, role, grants_json, max_ttl_seconds,
+	max_concurrent_leases, token_prefix, last_seen_at, created_at, updated_at, owner_id`
 
 // scanAgent scans one agent row (token hash excluded).
 func scanAgent(row rowScanner) (model.Agent, error) {
@@ -253,8 +351,8 @@ func scanAgent(row rowScanner) (model.Agent, error) {
 		updatedAt  int64
 	)
 	err := row.Scan(
-		&a.ID, &a.Name, &a.Description, &a.Status, &grantsJSON, &a.MaxTTLSeconds,
-		&a.MaxConcurrentLeases, &a.TokenPrefix, &lastSeenAt, &createdAt, &updatedAt,
+		&a.ID, &a.Name, &a.Description, &a.Status, &a.Role, &grantsJSON, &a.MaxTTLSeconds,
+		&a.MaxConcurrentLeases, &a.TokenPrefix, &lastSeenAt, &createdAt, &updatedAt, &a.OwnerID,
 	)
 	if err != nil {
 		return model.Agent{}, mapErr(err)
@@ -273,21 +371,52 @@ func scanAgent(row rowScanner) (model.Agent, error) {
 	return a, nil
 }
 
+// execer is satisfied by *sql.DB and *sql.Tx.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // CreateAgent persists an agent together with its bearer token hash.
 func (db *DB) CreateAgent(ctx context.Context, a model.Agent, tokenHash string) error {
+	return insertAgent(ctx, db.sql, a, tokenHash)
+}
+
+func insertAgent(ctx context.Context, x execer, a model.Agent, tokenHash string) error {
 	grantsJSON, err := marshalJSON(a.Grants, "[]")
 	if err != nil {
 		return err
 	}
-	_, err = db.sql.ExecContext(ctx,
-		`INSERT INTO agents(id, name, description, status, grants_json, max_ttl_seconds,
-			max_concurrent_leases, token_hash, token_prefix, last_seen_at, created_at, updated_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.Name, a.Description, string(a.Status), grantsJSON, a.MaxTTLSeconds,
+	_, err = x.ExecContext(ctx,
+		`INSERT INTO agents(id, name, description, status, role, grants_json, max_ttl_seconds,
+			max_concurrent_leases, token_hash, token_prefix, last_seen_at, created_at, updated_at, owner_id)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.Name, a.Description, string(a.Status), string(a.Role), grantsJSON, a.MaxTTLSeconds,
 		a.MaxConcurrentLeases, tokenHash, a.TokenPrefix, millisPtr(a.LastSeenAt),
-		toMillis(a.CreatedAt), toMillis(a.UpdatedAt),
+		toMillis(a.CreatedAt), toMillis(a.UpdatedAt), a.OwnerID,
 	)
 	return mapErr(err)
+}
+
+// ListAgentsByOwner returns the agents owned by a person, oldest first.
+func (db *DB) ListAgentsByOwner(ctx context.Context, ownerID string) ([]model.Agent, error) {
+	if ownerID == "" {
+		return []model.Agent{}, nil
+	}
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+agentColumns+` FROM agents WHERE owner_id = ? ORDER BY created_at ASC, id ASC`, ownerID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := []model.Agent{}
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, mapErr(rows.Err())
 }
 
 // GetAgent returns an agent by ID.
@@ -332,11 +461,11 @@ func (db *DB) UpdateAgent(ctx context.Context, a model.Agent) error {
 		return err
 	}
 	res, err := db.sql.ExecContext(ctx,
-		`UPDATE agents SET name = ?, description = ?, status = ?, grants_json = ?,
+		`UPDATE agents SET name = ?, description = ?, status = ?, role = ?, grants_json = ?,
 			max_ttl_seconds = ?, max_concurrent_leases = ?, token_prefix = ?,
 			last_seen_at = ?, updated_at = ?
 		 WHERE id = ?`,
-		a.Name, a.Description, string(a.Status), grantsJSON, a.MaxTTLSeconds,
+		a.Name, a.Description, string(a.Status), string(a.Role), grantsJSON, a.MaxTTLSeconds,
 		a.MaxConcurrentLeases, a.TokenPrefix, millisPtr(a.LastSeenAt), toMillis(a.UpdatedAt), a.ID,
 	)
 	if err != nil {

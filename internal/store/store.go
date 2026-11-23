@@ -66,14 +66,20 @@ type Store interface {
 	GetProvider(ctx context.Context, id string) (model.Provider, error)
 	ListProviders(ctx context.Context) ([]model.Provider, error)
 	UpdateProvider(ctx context.Context, p model.Provider) error
-	// UpdateProviderCredential replaces the encrypted broker credential blob.
-	UpdateProviderCredential(ctx context.Context, id, encryptedCredential string) error
+	// SetProviderTestResult records a connection test's outcome only.
+	SetProviderTestResult(ctx context.Context, id string, at time.Time, ok bool) error
+	// RotateProviderCredential replaces the encrypted broker credential and
+	// its masked AccessKey ID only.
+	RotateProviderCredential(ctx context.Context, id, encryptedCredential, maskedAccessKeyID string, now time.Time) error
+	// GetLongLived returns a long-lived credential (CONTRACT §17.14); the
+	// mock cloud uses it to accept the mock key of an active one.
+	GetLongLived(ctx context.Context, id string) (LongLivedRow, error)
 	// GetProviderCredential returns the encrypted broker credential blob.
 	GetProviderCredential(ctx context.Context, id string) (string, error)
 	// CountProviderCredentials counts providers that hold a credential.
 	CountProviderCredentials(ctx context.Context) (int, error)
 
-	// ---- Capabilities ----
+	// ---- Capabilities (removed model; kept for upgrades, see entities.go) ----
 	CreateCapability(ctx context.Context, c model.Capability) error
 	GetCapability(ctx context.Context, id string) (model.Capability, error)
 	ListCapabilities(ctx context.Context) ([]model.Capability, error)
@@ -95,9 +101,19 @@ type Store interface {
 	GetLease(ctx context.Context, id string) (model.Lease, error)
 	// ListLeases returns a page and the total number of matching records.
 	ListLeases(ctx context.Context, f LeaseFilter) (items []model.Lease, total int, err error)
+	// ListAllLeases returns every matching lease from one query (a consistent
+	// snapshot); Limit and Offset are ignored. Use it for security sweeps.
+	ListAllLeases(ctx context.Context, f LeaseFilter) ([]model.Lease, error)
 	UpdateLease(ctx context.Context, l model.Lease) error
-	// SetLeaseCredential stores the encrypted credential blob for an active
-	// lease together with its display fingerprint.
+	// UpdateLeaseIfStatus persists l like UpdateLease, but only while the stored
+	// lease still has status expected. It returns ErrConflict when the lease has
+	// moved to another status in the meantime and ErrNotFound when it does not
+	// exist. Use it for every transition into active so a concurrent revoke,
+	// expiry or demotion can never be overwritten.
+	UpdateLeaseIfStatus(ctx context.Context, l model.Lease, expected model.LeaseStatus) error
+	// SetLeaseCredential stores the encrypted credential blob for a lease that
+	// is being activated, together with its display fingerprint. It writes only
+	// while the lease is pending and returns ErrConflict otherwise.
 	SetLeaseCredential(ctx context.Context, leaseID, encryptedCredential, fingerprint string) error
 	GetLeaseCredential(ctx context.Context, leaseID string) (string, error)
 	// ClearLeaseCredential scrubs the stored credential blob (revoke/expire).
@@ -133,7 +149,42 @@ type DB struct {
 	// race-free across goroutines. VerifyAudit also takes it for a consistent
 	// snapshot.
 	appendMu sync.Mutex
+	// migration describes the data changes made by migrations during Open,
+	// or is nil when the database was already current.
+	migration *MigrationReport
 }
+
+// MigrationReport describes what data migrations changed while opening the
+// database, so the server can record it in the audit log.
+type MigrationReport struct {
+	FromVersion int `json:"from_version"`
+	ToVersion   int `json:"to_version"`
+	// DisabledCapabilities lists capabilities the migration disabled (retired,
+	// or a custom template that violates the IAM prohibition).
+	DisabledCapabilities []string `json:"disabled_capabilities"`
+	// Agents lists every agent the role migration touched.
+	Agents []AgentMigration `json:"agents"`
+	// RevokedAgents lists the agents without an owner that the schema-8
+	// migration revoked.
+	RevokedAgents []string `json:"revoked_agents,omitempty"`
+	// DeletedAdminToken is true when the schema-8 migration deleted the
+	// admin token of an older version.
+	DeletedAdminToken bool `json:"deleted_admin_token"`
+}
+
+// AgentMigration is one agent's outcome in the schema-2 role migration.
+type AgentMigration struct {
+	AgentID       string          `json:"agent_id"`
+	Role          model.AgentRole `json:"role"`
+	DroppedGrants []string        `json:"dropped_grants,omitempty"`
+	// ReplacedRetiredGrant is true when aliyun.iam.break_glass was swapped
+	// for aliyun.account.admin.
+	ReplacedRetiredGrant bool `json:"replaced_retired_grant,omitempty"`
+}
+
+// MigrationReport returns what an upgrade changed and has not been written to
+// the audit log yet, or nil. It survives restarts until RecordMigrationAudit.
+func (db *DB) MigrationReport() *MigrationReport { return db.migration }
 
 // DBFileName is the SQLite database file inside the data directory.
 const DBFileName = "csg.db"

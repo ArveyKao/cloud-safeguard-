@@ -58,13 +58,20 @@ var (
 // the broker AccessKey and a per-lease inline policy.
 type stsMinter struct{}
 
-// assumeRoleResponse is the JSON body of a successful AssumeRole call.
+// STSMaxPolicyLength is the longest session policy AssumeRole accepts.
+const STSMaxPolicyLength = 2048
+
+// assumeRoleResponse is the JSON body of a successful AssumeRole call. The
+// credential is nested under "Credentials", next to "AssumedRoleUser" and
+// "RequestId".
 type assumeRoleResponse struct {
-	AccessKeyID     string `json:"AccessKeyId"`
-	AccessKeySecret string `json:"AccessKeySecret"`
-	SecurityToken   string `json:"SecurityToken"`
-	Expiration      string `json:"Expiration"`
-	RequestID       string `json:"RequestId"`
+	Credentials struct {
+		AccessKeyID     string `json:"AccessKeyId"`
+		AccessKeySecret string `json:"AccessKeySecret"`
+		SecurityToken   string `json:"SecurityToken"`
+		Expiration      string `json:"Expiration"`
+	} `json:"Credentials"`
+	RequestID string `json:"RequestId"`
 }
 
 // stsErrorResponse is the Aliyun-shaped error body of a failed STS call.
@@ -93,6 +100,11 @@ func (stsMinter) Mint(ctx context.Context, req MintRequest) (model.Credential, e
 	if !json.Valid(req.PolicyJSON) {
 		return model.Credential{}, fmt.Errorf("provider sts: policy is not valid JSON")
 	}
+	// Alibaba Cloud refuses a session policy longer than 2048 characters.
+	// Refuse it here with a clear message instead of a cloud error.
+	if n := len(compactJSON(req.PolicyJSON)); n > STSMaxPolicyLength {
+		return model.Credential{}, fmt.Errorf("provider sts: the policy is %d characters; the limit is %d", n, STSMaxPolicyLength)
+	}
 
 	now := time.Now().UTC()
 	params := map[string]string{
@@ -119,10 +131,11 @@ func (stsMinter) Mint(ctx context.Context, req MintRequest) (model.Credential, e
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return model.Credential{}, fmt.Errorf("InvalidResponse: STS returned an unparseable AssumeRole response")
 	}
-	if resp.AccessKeyID == "" || resp.AccessKeySecret == "" || resp.SecurityToken == "" || resp.Expiration == "" {
+	issued := resp.Credentials
+	if issued.AccessKeyID == "" || issued.AccessKeySecret == "" || issued.SecurityToken == "" || issued.Expiration == "" {
 		return model.Credential{}, fmt.Errorf("InvalidResponse: STS AssumeRole response is missing credential fields")
 	}
-	expiresAt, err := time.Parse(time.RFC3339, resp.Expiration)
+	expiresAt, err := time.Parse(time.RFC3339, issued.Expiration)
 	if err != nil {
 		return model.Credential{}, fmt.Errorf("InvalidResponse: STS returned an invalid Expiration timestamp")
 	}
@@ -131,15 +144,15 @@ func (stsMinter) Mint(ctx context.Context, req MintRequest) (model.Credential, e
 		ProviderID:      req.Provider.ID,
 		ProviderMode:    model.ModeSTS,
 		LeaseID:         req.LeaseID,
-		AccessKeyID:     resp.AccessKeyID,
-		AccessKeySecret: resp.AccessKeySecret,
-		SecurityToken:   resp.SecurityToken,
+		AccessKeyID:     issued.AccessKeyID,
+		AccessKeySecret: issued.AccessKeySecret,
+		SecurityToken:   issued.SecurityToken,
 		ExpiresAt:       expiresAt.UTC(),
 	}, nil
 }
 
-// Test implements Minter for the aliyun sts provider by making a signed,
-// read-only GetCallerIdentity call with the broker credentials.
+// Test implements Minter for the aliyun sts provider: a signed, read-only
+// GetCallerIdentity call with the broker credentials, then one AssumeRole.
 func (stsMinter) Test(ctx context.Context, req MintRequest) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -160,15 +173,40 @@ func (stsMinter) Test(ctx context.Context, req MintRequest) error {
 	if _, err := callSTS(ctx, req.BrokerAccessKeySecret, params); err != nil {
 		return err
 	}
+	// A valid AccessKey is not enough: every credential comes from assuming
+	// the role. Assume it once, for the shortest period and with a policy
+	// that allows nothing useful, and throw the result away. A wrong role
+	// ARN, a missing trust policy or a missing sts:AssumeRole permission
+	// fails here instead of at the first request.
+	if req.Provider.RoleARN == "" {
+		return fmt.Errorf("provider sts: role ARN is required")
+	}
+	probe := req
+	probe.DurationSeconds = STSMinDuration
+	probe.PolicyJSON = []byte(connectionTestPolicy)
+	probe.SessionName = "csg-connection-test"
+	if _, err := (stsMinter{}).Mint(ctx, probe); err != nil {
+		return fmt.Errorf("the AccessKey is valid, but it cannot assume the role: %w", err)
+	}
 	return nil
 }
+
+// connectionTestPolicy is the session policy of the connection test's
+// AssumeRole call: the credential it yields can only ask who it is.
+const connectionTestPolicy = `{"Version":"1","Statement":[{"Effect":"Allow","Action":"sts:GetCallerIdentity","Resource":"*"}]}`
 
 // callSTS signs the params and performs the single STS RPC call. It returns the
 // raw body of a 200 response. Errors are sanitized: they contain only provider
 // error codes/messages or a transport reason, never the broker AccessKey or the
 // signed request URL (which embeds the AccessKey ID).
 func callSTS(ctx context.Context, accessKeySecret string, params map[string]string) ([]byte, error) {
-	requestURL := stsEndpoint + "?" + signedQuery(params, accessKeySecret)
+	return callAliyunRPC(ctx, stsEndpoint, accessKeySecret, params)
+}
+
+// callAliyunRPC signs the params and performs one Alibaba Cloud RPC call to
+// endpoint, with the same sanitized errors as callSTS.
+func callAliyunRPC(ctx context.Context, endpoint, accessKeySecret string, params map[string]string) ([]byte, error) {
+	requestURL := endpoint + "?" + signedQuery(params, accessKeySecret)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {

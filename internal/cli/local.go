@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -24,16 +25,17 @@ func (a *App) defaultDataDir() string {
 
 // runInit implements `csg init`.
 func (a *App) runInit(args []string) error {
-	fs := a.newFlagSet("init", `Usage: csg init [--data-dir DIR] [--demo] [--force] [--admin-token-file PATH] [--json]
+	fs := a.newFlagSet("init", `Usage: csg init [--data-dir DIR] [--demo] [--supervisor NAME] [--json]
 
-Bootstraps a data directory: master key, SQLite database, admin token and the
-built-in capability catalog. --demo also seeds the mock provider and two demo
-agents and prints their one-time tokens.
+Bootstraps a new data directory: master key, SQLite database and the first
+supervisor, with a one-time setup code for choosing a password and enrolling
+an authenticator app. --demo also adds a mock cloud account. An existing data
+directory is never touched: csg serve upgrades it, and csg supervisor recover
+issues a new setup code.
 `)
 	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
-	demo := fs.Bool("demo", false, "seed the mock provider and demo agents")
-	force := fs.Bool("force", false, "re-initialize an existing data directory (rotates the admin token)")
-	adminTokenFile := fs.String("admin-token-file", "", "also write the admin token to this 0600 file")
+	demo := fs.Bool("demo", false, "add a mock cloud account")
+	supervisor := fs.String("supervisor", server.DefaultSupervisorUsername, "username of the first supervisor")
 	jsonOut := fs.Bool("json", false, "print the InitResult as JSON")
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
@@ -49,16 +51,11 @@ agents and prints their one-time tokens.
 	res, err := server.Init(context.Background(), server.InitOptions{
 		DataDir: *dataDir,
 		Demo:    *demo,
-		Force:   *force,
+
+		SupervisorUsername: *supervisor,
 	})
 	if err != nil {
 		return fmt.Errorf("cannot initialize data directory %s: %v", *dataDir, err)
-	}
-
-	if tokenFile := strings.TrimSpace(*adminTokenFile); tokenFile != "" {
-		if err := os.WriteFile(tokenFile, []byte(res.AdminToken+"\n"), 0o600); err != nil {
-			return fmt.Errorf("cannot write admin token file: %v", err)
-		}
 	}
 
 	if *jsonOut {
@@ -72,33 +69,34 @@ agents and prints their one-time tokens.
 		}
 	}
 	fmt.Fprintln(a.Stdout)
-	fmt.Fprintf(a.Stdout, "Admin token (shown once, store securely): %s\n", res.AdminToken)
-	fmt.Fprintf(a.Stdout, "Admin token prefix: %s\n", res.AdminTokenPrefix)
 	if len(res.ProviderIDs) > 0 {
-		fmt.Fprintf(a.Stdout, "Providers: %s\n", strings.Join(res.ProviderIDs, ", "))
+		fmt.Fprintln(a.Stdout, "Demo cloud account added (mock cloud).")
 	}
-	fmt.Fprintf(a.Stdout, "Capabilities: %s\n", strings.Join(res.CapabilityIDs, ", "))
-	if len(res.Agents) > 0 {
-		fmt.Fprintln(a.Stdout, "Demo agents (tokens shown once):")
-		for _, agent := range res.Agents {
-			fmt.Fprintf(a.Stdout, "  %-20s %-12s %s\n", agent.Name, agent.ID, agent.Token)
-		}
+	if _, statErr := os.Stat(filepath.Join(res.DataDir, "master.key")); statErr != nil {
+		fmt.Fprintln(a.Stdout, "The master key came from $CSG_MASTER_KEY and was not written to master.key.")
+		fmt.Fprintln(a.Stdout, "Keep that key: csg serve needs it set every time, and without it the data cannot be read.")
+	}
+	if res.Supervisor != nil {
+		a.printSetupCode("First supervisor", *res.Supervisor)
 	}
 	fmt.Fprintln(a.Stdout)
-	fmt.Fprintln(a.Stdout, "Store these tokens now: they cannot be retrieved later.")
 	fmt.Fprintf(a.Stdout, "Next: csg serve --data-dir %s\n", res.DataDir)
 	return nil
 }
 
 // runServe implements `csg serve`.
 func (a *App) runServe(args []string) error {
-	fs := a.newFlagSet("serve", `Usage: csg serve [--data-dir DIR] [--addr 127.0.0.1:8787]
+	fs := a.newFlagSet("serve", `Usage: csg serve [--data-dir DIR] [--addr 127.0.0.1:8787] [--public-url URL] [--trusted-proxy ADDRS]
+                 [--trust-master-key]
 
 Runs the control plane (HTTP API, embedded console, mock cloud) until SIGINT or
 SIGTERM, then shuts down gracefully.
 `)
 	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address (loopback only by default)")
+	publicURL := fs.String("public-url", "", "origin people open the console at, e.g. https://csg.example.com (set it behind a TLS proxy)")
+	trustedProxy := fs.String("trusted-proxy", "", "comma-separated addresses or CIDR ranges of reverse proxies whose X-Forwarded-For is trusted")
+	trustKey := fs.Bool("trust-master-key", false, trustMasterKeyHelp)
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -110,7 +108,7 @@ SIGTERM, then shuts down gracefully.
 		return usagef("--data-dir must not be empty")
 	}
 
-	srv, err := server.New(server.Config{Addr: *addr, DataDir: *dataDir})
+	srv, err := server.New(server.Config{Addr: *addr, DataDir: *dataDir, PublicOrigin: *publicURL, TrustedProxies: strings.Split(*trustedProxy, ","), TrustMasterKey: *trustKey})
 	if err != nil {
 		return fmt.Errorf("cannot start control plane: %v", err)
 	}
@@ -137,3 +135,59 @@ SIGTERM, then shuts down gracefully.
 	fmt.Fprintln(a.Stdout, "shutting down: control plane stopped")
 	return nil
 }
+
+// printSetupCode prints a person's one-time setup code.
+func (a *App) printSetupCode(label string, p model.PersonWithSetupCode) {
+	fmt.Fprintln(a.Stdout)
+	fmt.Fprintf(a.Stdout, "%s: %s\n", label, p.Person.Username)
+	fmt.Fprintf(a.Stdout, "Setup code (shown once, valid until %s): %s\n",
+		p.SetupExpiresAt.Local().Format("2006-01-02 15:04"), p.SetupCode)
+	fmt.Fprintln(a.Stdout, "Open the console, choose a password and enroll an authenticator app with this code.")
+}
+
+// runSupervisor implements `csg supervisor recover`.
+func (a *App) runSupervisor(args []string) error {
+	if len(args) == 0 {
+		return usagef("usage: csg supervisor people|roles|accounts|settings|audit|requests ... (signed in with csg person login), or csg supervisor recover --username NAME (on the server host)")
+	}
+	if args[0] != "recover" {
+		return a.runSupervisorCommands(args)
+	}
+	fs := a.newFlagSet("supervisor recover", `Usage: csg supervisor recover --username NAME [--data-dir DIR] [--trust-master-key] [--json]
+
+Restores console access for a locked-out supervisor. Run it on the server
+host: it needs the data directory and its master key. The named person
+becomes a supervisor (created if missing, reactivated if suspended); their
+password, authenticator and sessions are erased and a new one-time setup code
+is printed. Whoever holds that code controls the account, so use it only for
+a person you trust as supervisor. The recovery is recorded in the audit log
+at critical severity.
+`)
+	dataDir := fs.String("data-dir", a.defaultDataDir(), "data directory (default: $CSG_DATA_DIR or ./data)")
+	username := fs.String("username", "", "supervisor to restore (required)")
+	trustKey := fs.Bool("trust-master-key", false, trustMasterKeyHelp)
+	jsonOut := fs.Bool("json", false, "print the result as JSON")
+	positionals, err := parseFlags(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return usagef("supervisor recover takes no positional arguments")
+	}
+	if strings.TrimSpace(*username) == "" {
+		return usagef("--username is required")
+	}
+	out, err := server.RecoverSupervisor(context.Background(), server.RecoverOptions{DataDir: *dataDir, Username: *username, TrustMasterKey: *trustKey})
+	if err != nil {
+		return fmt.Errorf("cannot recover supervisor: %v", err)
+	}
+	if *jsonOut {
+		return a.printJSON(map[string]any{"data": out})
+	}
+	a.printSetupCode("Supervisor restored", out)
+	return nil
+}
+
+// trustMasterKeyHelp describes --trust-master-key, which only matters for a
+// data directory that holds nothing to verify a key against.
+const trustMasterKeyHelp = "accept the key in $CSG_MASTER_KEY as this data directory's key when nothing can verify it (an old directory with no master.key and nothing stored); recorded in the audit log"

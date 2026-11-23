@@ -1,0 +1,143 @@
+/** The console: session gate, shell and pages (CONTRACT §17). */
+import { useCallback, useEffect, useState } from 'react'
+import { api, setCsrf, setSignedOutHandler } from './api'
+import type { Person, SessionInfo } from './types'
+import { navigate, useLocation } from './router'
+import { Shell } from './Shell'
+import { useLoad, useToast } from './ui'
+import { ApiError } from './api'
+import { LoginPage } from './pages/Login'
+import { SetupPage } from './pages/Setup'
+import { InboxPage } from './pages/Inbox'
+import { SignInApprovalPage } from './pages/SignInApproval'
+import { CLISignInApprovalPage } from './pages/CLISignInApproval'
+import { MCPConnectApprovalPage } from './pages/MCPConnectApproval'
+import { LongLivedConfirmPage } from './pages/LongLived'
+import { AgentsPage } from './pages/Agents'
+import { AccountsPage } from './pages/Accounts'
+import { AddAccountPage } from './pages/AddAccount'
+import { ActivityPage } from './pages/Activity'
+import { PeoplePage } from './pages/People'
+import { SettingsPage } from './pages/Settings'
+
+// A sign-in link survives the login screen, for as long as the code lives at
+// most, and is used once: /?signin=CODE for an agent, /?cli-signin=CODE for
+// csg signed in as the person, /?mcp-connect=ID for a remote MCP client.
+const SIGNIN_KEY = 'csg.pendingSignIn'
+const SIGNIN_TTL_MS = 10 * 60 * 1000
+// A long-lived link is valid for an hour on the server; keep it as long.
+const LONG_LIVED_TTL_MS = 60 * 60 * 1000
+
+export type SignInKind = 'agent' | 'cli' | 'mcp' | 'long-lived'
+
+export function rememberSignIn(code: string, kind: SignInKind = 'agent') {
+  try { sessionStorage.setItem(SIGNIN_KEY, JSON.stringify({ code, kind, at: Date.now() })) } catch { /* storage may be off */ }
+}
+
+export function takeSignIn(): { code: string; kind: SignInKind } | null {
+  try {
+    const raw = sessionStorage.getItem(SIGNIN_KEY)
+    sessionStorage.removeItem(SIGNIN_KEY)
+    const v = raw ? JSON.parse(raw) as { code?: string; kind?: string; at?: number } : null
+    const ttl = v?.kind === 'long-lived' ? LONG_LIVED_TTL_MS : SIGNIN_TTL_MS
+    if (!v?.code || !v.at || Date.now() - v.at >= ttl) return null
+    return { code: v.code, kind: v.kind === 'cli' || v.kind === 'mcp' || v.kind === 'long-lived' ? v.kind : 'agent' }
+  } catch {
+    return null
+  }
+}
+
+function signInPath(link: { code: string; kind: SignInKind }): string {
+  const page = link.kind === 'cli' ? '/cli-signin' : link.kind === 'mcp' ? '/mcp-connect' : link.kind === 'long-lived' ? '/long-lived' : '/signin'
+  return `${page}?code=${encodeURIComponent(link.code)}`
+}
+
+export function App() {
+  const { path, query } = useLocation()
+  const [session, setSession] = useState<SessionInfo | null>(null)
+  const [checked, setChecked] = useState(false)
+
+  const signedIn = useCallback((s: SessionInfo) => {
+    setCsrf(s.csrf_token)
+    setSession(s)
+    const link = takeSignIn()
+    navigate(link ? signInPath(link) : (path === '/login' || path === '/setup' || path === '/' ? '/inbox' : path))
+  }, [path])
+
+  useEffect(() => {
+    const agentCode = query.get('signin')
+    const cliCode = query.get('cli-signin')
+    const mcpID = query.get('mcp-connect')
+    const longLived = query.get('long-lived')
+    if (longLived) rememberSignIn(longLived, 'long-lived')
+    else if (mcpID) rememberSignIn(mcpID, 'mcp')
+    else if (cliCode) rememberSignIn(cliCode, 'cli')
+    else if (agentCode) rememberSignIn(agentCode, 'agent')
+    setSignedOutHandler(() => { setCsrf(''); setSession(null) })
+    api.me()
+      .then((s) => {
+        setCsrf(s.csrf_token)
+        setSession(s)
+        const link = takeSignIn()
+        if (link) navigate(signInPath(link))
+      })
+      .catch(() => setSession(null))
+      .finally(() => setChecked(true))
+    return () => setSignedOutHandler(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  if (!checked) return null
+  if (!session) {
+    return path === '/setup' ? <SetupPage onSignedIn={signedIn} /> : <LoginPage onSignedIn={signedIn} />
+  }
+  return <SignedIn session={session} path={path} query={query} setSession={setSession} />
+}
+
+function SignedIn({ session, path, query, setSession }: {
+  session: SessionInfo; path: string; query: URLSearchParams; setSession: (s: SessionInfo | null) => void
+}) {
+  const person = session.person
+  const pending = useLoad(() => api.myRequests('pending'), [], 10000)
+  const setPerson = (p: Person) => setSession({ ...session, person: p })
+  const toast = useToast()
+
+  useEffect(() => {
+    if (path === '/' || path === '/login' || path === '/setup') navigate('/inbox')
+  }, [path])
+
+  // The page only shows "signed out" once the server has ended the session
+  // (or says there is none); otherwise the cookie would still work.
+  async function logout() {
+    try {
+      await api.logout()
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 401)) {
+        toast('Sign out failed, so your session may still be active. Try again.', 'error')
+        return
+      }
+    }
+    setCsrf('')
+    setSession(null)
+    navigate('/login')
+  }
+
+  let page
+  if (path === '/signin') page = <SignInApprovalPage code={query.get('code') ?? ''} />
+  else if (path === '/cli-signin') page = <CLISignInApprovalPage code={query.get('code') ?? ''} person={person} />
+  else if (path === '/mcp-connect') page = <MCPConnectApprovalPage id={query.get('code') ?? ''} person={person} />
+  else if (path === '/long-lived') page = <LongLivedConfirmPage code={query.get('code') ?? ''} />
+  else if (path === '/agents') page = <AgentsPage />
+  else if (path === '/accounts/new' && person.supervisor) page = <AddAccountPage />
+  else if (path.startsWith('/accounts')) page = <AccountsPage person={person} />
+  else if (path === '/activity') page = <ActivityPage person={person} />
+  else if (path === '/people' && person.supervisor) page = <PeoplePage me={person} />
+  else if (path === '/settings') page = <SettingsPage person={person} onPersonChange={setPerson} />
+  else page = <InboxPage person={person} onChange={pending.reload} />
+
+  return (
+    <Shell person={person} path={path} pending={pending.data?.total ?? 0} onLogout={logout}>
+      {page}
+    </Shell>
+  )
+}

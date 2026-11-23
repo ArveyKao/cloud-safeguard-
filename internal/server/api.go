@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -30,58 +31,129 @@ func agentFromContext(ctx context.Context) (model.Agent, bool) {
 	return ag, ok
 }
 
-// buildHandler assembles the complete HTTP surface: health, agent API, admin
-// API, mock cloud, and the embedded SPA.
+// buildHandler assembles the complete HTTP surface: health, sign-in, the
+// person, supervisor and agent APIs, the mock cloud and the embedded console.
 func (s *Server) buildHandler() http.Handler {
 	agentMux := http.NewServeMux()
 	agentMux.HandleFunc("GET /api/v1/agent/me", s.handleAgentMe)
-	agentMux.HandleFunc("GET /api/v1/agent/capabilities", s.handleAgentCapabilities)
-	agentMux.HandleFunc("POST /api/v1/agent/leases", s.handleAgentCreateLease)
 	agentMux.HandleFunc("GET /api/v1/agent/leases", s.handleAgentListLeases)
 	agentMux.HandleFunc("GET /api/v1/agent/leases/{id}", s.handleAgentGetLease)
 	agentMux.HandleFunc("POST /api/v1/agent/leases/{id}/credential", s.handleAgentFetchCredential)
 	agentMux.HandleFunc("POST /api/v1/agent/leases/{id}/revoke", s.handleAgentRevokeLease)
 	agentMux.HandleFunc("POST /api/v1/agent/heartbeat", s.handleAgentHeartbeat)
+	// Access requests (CONTRACT §17.4). The request ID is also the lease ID
+	// for the credential and revoke endpoints above.
+	agentMux.HandleFunc("GET /api/v1/agent/accounts", s.handleAgentListAccounts)
+	agentMux.HandleFunc("POST /api/v1/agent/access-requests", s.handleAgentCreateAccessRequest)
+	agentMux.HandleFunc("POST /api/v1/agent/long-lived", s.handleAgentLongLivedRequest)
+	agentMux.HandleFunc("GET /api/v1/agent/access-requests/{id}", s.handleAgentGetAccessRequest)
+	agentMux.HandleFunc("POST /api/v1/agent/access-requests/{id}/refresh", s.handleAgentRefreshAccessRequest)
 	agentMux.HandleFunc("/", s.handleUnknownAPI)
+	s.agentAPI = agentMux
 
-	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("POST /api/v1/admin/login", s.handleAdminLogin)
-	adminMux.HandleFunc("GET /api/v1/admin/overview", s.handleAdminOverview)
-	adminMux.HandleFunc("GET /api/v1/admin/providers", s.handleAdminListProviders)
-	adminMux.HandleFunc("POST /api/v1/admin/providers", s.handleAdminCreateProvider)
-	adminMux.HandleFunc("GET /api/v1/admin/providers/{id}", s.handleAdminGetProvider)
-	adminMux.HandleFunc("PATCH /api/v1/admin/providers/{id}", s.handleAdminUpdateProvider)
-	adminMux.HandleFunc("POST /api/v1/admin/providers/{id}/rotate", s.handleAdminRotateProvider)
-	adminMux.HandleFunc("POST /api/v1/admin/providers/{id}/test", s.handleAdminTestProvider)
-	adminMux.HandleFunc("GET /api/v1/admin/capabilities", s.handleAdminListCapabilities)
-	adminMux.HandleFunc("POST /api/v1/admin/capabilities", s.handleAdminCreateCapability)
-	adminMux.HandleFunc("PATCH /api/v1/admin/capabilities/{id}", s.handleAdminUpdateCapability)
-	adminMux.HandleFunc("GET /api/v1/admin/agents", s.handleAdminListAgents)
-	adminMux.HandleFunc("POST /api/v1/admin/agents", s.handleAdminCreateAgent)
-	adminMux.HandleFunc("GET /api/v1/admin/agents/{id}", s.handleAdminGetAgent)
-	adminMux.HandleFunc("PATCH /api/v1/admin/agents/{id}", s.handleAdminUpdateAgent)
-	adminMux.HandleFunc("POST /api/v1/admin/agents/{id}/suspend", s.handleAdminSuspendAgent)
-	adminMux.HandleFunc("POST /api/v1/admin/agents/{id}/activate", s.handleAdminActivateAgent)
-	adminMux.HandleFunc("POST /api/v1/admin/agents/{id}/token/rotate", s.handleAdminRotateAgentToken)
-	adminMux.HandleFunc("GET /api/v1/admin/leases", s.handleAdminListLeases)
-	adminMux.HandleFunc("GET /api/v1/admin/leases/{id}", s.handleAdminGetLease)
-	adminMux.HandleFunc("POST /api/v1/admin/leases/{id}/approve", s.handleAdminApproveLease)
-	adminMux.HandleFunc("POST /api/v1/admin/leases/{id}/deny", s.handleAdminDenyLease)
-	adminMux.HandleFunc("POST /api/v1/admin/leases/{id}/revoke", s.handleAdminRevokeLease)
-	adminMux.HandleFunc("GET /api/v1/admin/audit", s.handleAdminListAudit)
-	adminMux.HandleFunc("GET /api/v1/admin/audit/verify", s.handleAdminVerifyAudit)
-	adminMux.HandleFunc("GET /api/v1/admin/policy", s.handleAdminGetPolicy)
-	adminMux.HandleFunc("PUT /api/v1/admin/policy", s.handleAdminPutPolicy)
-	adminMux.HandleFunc("/", s.handleUnknownAPI)
+	// Human sign-in (CONTRACT §17.3). Setup and login are unauthenticated.
+	authMux := http.NewServeMux()
+	authMux.Handle("POST /api/v1/auth/setup/begin", s.requireSameOrigin(http.HandlerFunc(s.handleSetupBegin)))
+	authMux.Handle("POST /api/v1/auth/setup/finish", s.requireSameOrigin(http.HandlerFunc(s.handleSetupFinish)))
+	authMux.Handle("POST /api/v1/auth/login", s.requireSameOrigin(http.HandlerFunc(s.handleLogin)))
+	authMux.Handle("POST /api/v1/auth/logout", s.requireSession(http.HandlerFunc(s.handleLogout)))
+	authMux.Handle("GET /api/v1/auth/me", s.requireSession(http.HandlerFunc(s.handleAuthMe)))
+	authMux.HandleFunc("/", s.handleUnknownAPI)
+
+	// Agent-first sign-in: the agent's two calls need no authentication; the
+	// person's side runs in their console session.
+	signInMux := http.NewServeMux()
+	signInMux.Handle("POST /api/v1/agent-signin/start", s.requireSameOrigin(http.HandlerFunc(s.handleAgentSignInStart)))
+	signInMux.Handle("POST /api/v1/agent-signin/token", s.requireSameOrigin(http.HandlerFunc(s.handleAgentSignInToken)))
+	signInMux.HandleFunc("/", s.handleUnknownAPI)
+
+	meMux := http.NewServeMux()
+	meMux.HandleFunc("GET /api/v1/me/signins/{code}", s.handleGetSignIn)
+	meMux.HandleFunc("POST /api/v1/me/signins/{code}/approve", s.consoleOnly(s.handleApproveSignIn))
+	meMux.HandleFunc("POST /api/v1/me/signins/{code}/deny", s.handleDenySignIn)
+	meMux.HandleFunc("GET /api/v1/me/agents", s.handleListMyAgents)
+	meMux.HandleFunc("POST /api/v1/me/agents/{id}/revoke", s.handleRevokeMyAgent)
+	meMux.HandleFunc("PUT /api/v1/me/accounts/{provider}/mode", s.handleSetMyAccountMode)
+	meMux.HandleFunc("GET /api/v1/me/accounts", s.handleListMyAccounts)
+	meMux.HandleFunc("GET /api/v1/me/requests", s.handleListMyRequests)
+	meMux.HandleFunc("POST /api/v1/me/requests/{id}/approve", s.consoleOnly(s.handleApproveMyRequest))
+	// Command-line sign-ins and sessions of the person (CONTRACT §17.9).
+	meMux.HandleFunc("GET /api/v1/me/cli-signins/{code}", s.handleGetCLISignIn)
+	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/approve", s.consoleOnly(s.handleApproveCLISignIn))
+	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/deny", s.handleDenyCLISignIn)
+	meMux.HandleFunc("POST /api/v1/me/cli-signins/{code}/cancel", s.handleCancelCLISignIn)
+	meMux.HandleFunc("POST /api/v1/me/long-lived", s.handleMyLongLivedRequest)
+	meMux.HandleFunc("GET /api/v1/me/long-lived", s.handleListMyLongLived)
+	meMux.HandleFunc("POST /api/v1/me/long-lived/{id}/revoke", s.handleRevokeLongLived(true))
+	meMux.HandleFunc("GET /api/v1/me/long-lived-requests/{key}", s.handleGetLongLivedRequest)
+	meMux.HandleFunc("POST /api/v1/me/long-lived-requests/{key}/create", s.consoleOnly(s.handleCreateLongLived))
+	meMux.HandleFunc("POST /api/v1/me/long-lived-requests/{key}/deny", s.handleDenyLongLivedRequest)
+	meMux.HandleFunc("GET /api/v1/me/mcp-connections/{key}", s.handleGetMCPConnection)
+	meMux.HandleFunc("POST /api/v1/me/mcp-connections/{key}/approve", s.consoleOnly(s.handleApproveMCPConnection))
+	meMux.HandleFunc("POST /api/v1/me/mcp-connections/{key}/deny", s.handleDenyMCPConnection)
+	meMux.HandleFunc("GET /api/v1/me/cli-sessions", s.handleListCLISessions)
+	meMux.HandleFunc("POST /api/v1/me/cli-sessions/{id}/revoke", s.handleRevokeCLISession)
+	meMux.HandleFunc("POST /api/v1/me/requests/{id}/deny", s.handleDenyMyRequest)
+	meMux.HandleFunc("POST /api/v1/me/requests/{id}/revoke", s.handleRevokeMyRequest)
+	meMux.HandleFunc("/", s.handleUnknownAPI)
+
+	supervisorMux := http.NewServeMux()
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/people", s.handleListPeople)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/people", s.handleCreatePerson)
+	supervisorMux.HandleFunc("PATCH /api/v1/supervisor/people/{id}", s.handleUpdatePerson)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/people/{id}/reset", s.handleResetPerson)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/bindings", s.handleListBindings)
+	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/people/{person}", s.handlePutBinding)
+	supervisorMux.HandleFunc("DELETE /api/v1/supervisor/accounts/{provider}/people/{person}", s.handleDeleteBinding)
+	// Cloud accounts, settings, audit and the emergency stop (CONTRACT §17.8).
+	// Actions are attributed to the signed-in supervisor. There is
+	// deliberately no approve route: a supervisor can stop any request or
+	// credential but never grant one for somebody else's agent.
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts", s.handleListAccounts)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts", s.consoleOnly(s.handleCreateAccount))
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/accounts/{id}", s.handleGetAccount)
+	supervisorMux.HandleFunc("PATCH /api/v1/supervisor/accounts/{id}", s.handleUpdateAccount)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/rotate", s.handleRotateAccount)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/accounts/{id}/test", s.handleTestAccount)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/settings", s.handleGetSettings)
+	supervisorMux.HandleFunc("PUT /api/v1/supervisor/settings", s.handlePutSettings)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit", s.handleListAudit)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/audit/verify", s.handleVerifyAudit)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/long-lived", s.handleListAllLongLived)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/long-lived/{id}/revoke", s.handleRevokeLongLived(false))
+	supervisorMux.HandleFunc("PUT /api/v1/supervisor/accounts/{provider}/user-admin", s.consoleOnly(s.handleSetUserAdmin))
+	supervisorMux.HandleFunc("DELETE /api/v1/supervisor/accounts/{provider}/user-admin", s.handleClearUserAdmin)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases", s.handleListLeases)
+	supervisorMux.HandleFunc("GET /api/v1/supervisor/leases/{id}", s.handleGetLease)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/deny", s.handleDenyLease)
+	supervisorMux.HandleFunc("POST /api/v1/supervisor/leases/{id}/revoke", s.handleRevokeLease)
+	supervisorMux.HandleFunc("/", s.handleUnknownAPI)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", s.handleHealth)
+	root.Handle("/api/v1/auth/", authMux)
+	root.Handle("/api/v1/agent-signin/", signInMux)
+	personSignInMux := http.NewServeMux()
+	personSignInMux.Handle("POST /api/v1/person-signin/start", s.requireSameOrigin(http.HandlerFunc(s.handlePersonSignInStart)))
+	personSignInMux.Handle("POST /api/v1/person-signin/token", s.requireSameOrigin(http.HandlerFunc(s.handlePersonSignInToken)))
+	personSignInMux.HandleFunc("/", s.handleUnknownAPI)
+	root.Handle("/api/v1/person-signin/", personSignInMux)
+	root.Handle("/api/v1/me/", s.requireSession(meMux))
+	root.Handle("/api/v1/supervisor/", s.requireSession(s.requireSupervisor(supervisorMux)))
 	root.Handle("/api/v1/agent/", s.requireAgent(agentMux))
-	root.Handle("/api/v1/admin/", s.requireAdmin(adminMux))
+	// Remote MCP and its OAuth sign-in (CONTRACT §17.10).
+	root.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
+	root.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.handleProtectedResourceMetadata)
+	root.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleAuthorizationServerMetadata)
+	root.HandleFunc("POST /oauth/register", s.handleOAuthRegister)
+	root.HandleFunc("GET /oauth/authorize", s.handleOAuthAuthorize)
+	root.HandleFunc("POST /oauth/token", s.handleOAuthToken)
+	root.Handle("/mcp", s.mcpGate(s.requireAgent(http.HandlerFunc(s.handleMCP))))
+	root.HandleFunc("POST "+credentialLinkPrefix+"{token}", s.handleCredentialLink)
 	root.HandleFunc("/mock-cloud/", s.handleMockCloud)
 	root.HandleFunc("/", s.handleStatic)
 
-	return s.withAccessLog(s.recoverPanics(root))
+	return s.withAccessLog(securityHeaders(s.recoverPanics(runToCompletion(root))))
 }
 
 // ================= middleware =================
@@ -103,7 +175,7 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 		ag, err := s.db.GetAgentByTokenHash(r.Context(), token.Hash(plain))
 		if err != nil {
 			s.systemAudit(r.Context(), "auth.agent_auth_failed", "denied", "warning", "agent", "", map[string]any{
-				"remote_addr":  remoteHost(r),
+				"remote_addr":  s.clientAddr(r),
 				"token_prefix": token.DisplayPrefix(plain),
 				"reason":       "unknown token",
 			})
@@ -112,11 +184,24 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 		}
 		if ag.Status != model.AgentActive {
 			s.systemAudit(r.Context(), "auth.agent_auth_failed", "denied", "warning", "agent", ag.ID, map[string]any{
-				"remote_addr":  remoteHost(r),
+				"remote_addr":  s.clientAddr(r),
 				"token_prefix": token.DisplayPrefix(plain),
 				"reason":       "agent is " + string(ag.Status),
 			})
 			s.writeError(w, http.StatusForbidden, model.ErrCodeForbidden, "agent is "+string(ag.Status))
+			return
+		}
+		// An owned agent acts only while its owner is active (§17.1).
+		if problem, err := s.agentOwnerProblem(r.Context(), ag); err != nil {
+			s.internalError(w, "check agent owner", err)
+			return
+		} else if problem != "" {
+			s.systemAudit(r.Context(), "auth.agent_auth_failed", "denied", "warning", "agent", ag.ID, map[string]any{
+				"remote_addr":  s.clientAddr(r),
+				"token_prefix": token.DisplayPrefix(plain),
+				"reason":       problem,
+			})
+			s.writeError(w, http.StatusForbidden, model.ErrCodeForbidden, problem)
 			return
 		}
 		// Refresh last_seen_at at most once per 60 s.
@@ -129,35 +214,6 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), agentContextKey{}, ag)
 		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// requireAdmin authenticates the single admin bearer token.
-func (s *Server) requireAdmin(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		plain, ok := bearerToken(r)
-		if !ok {
-			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "missing or malformed bearer token")
-			return
-		}
-		if token.Kind(plain) != "admin" {
-			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "admin token required")
-			return
-		}
-		stored, err := s.db.GetMeta(r.Context(), store.MetaAdminTokenHash)
-		if err != nil {
-			s.logf("admin auth: read token hash: %v", err)
-			s.writeError(w, http.StatusInternalServerError, model.ErrCodeInternal, "authentication is not configured")
-			return
-		}
-		if !token.HashEqual(token.Hash(plain), stored) {
-			s.systemAudit(r.Context(), "auth.admin_auth_failed", "denied", "warning", "admin", "admin", map[string]any{
-				"remote_addr": remoteHost(r),
-			})
-			s.writeError(w, http.StatusUnauthorized, model.ErrCodeUnauthorized, "invalid admin token")
-			return
-		}
-		next.ServeHTTP(w, r)
 	})
 }
 
@@ -201,8 +257,38 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		s.logf("%s %s %d %dms", r.Method, r.URL.Path, status, time.Since(start).Milliseconds())
+		s.logf("%s %s %d %dms", r.Method, logPath(r.URL.Path), status, time.Since(start).Milliseconds())
 	})
+}
+
+// logPath is the request path as written to the access log, the audit log
+// and panic messages. A sign-in user code (of an agent or of csg) or an MCP
+// connection key is an approval secret while pending, and a credential link
+// is a secret until used, so they are masked: everything after the prefix,
+// except a final approve or deny.
+func logPath(path string) string {
+	for _, prefix := range []string{"/api/v1/me/signins/", "/api/v1/me/cli-signins/", "/api/v1/me/mcp-connections/",
+		"/api/v1/me/long-lived-requests/", credentialLinkPrefix} {
+		i := strings.Index(path, prefix)
+		if i < 0 {
+			i = strings.Index(strings.ToLower(path), strings.ToLower(prefix))
+		}
+		if i < 0 {
+			continue
+		}
+		rest := path[i+len(prefix):]
+		if rest == "" {
+			return path
+		}
+		masked := path[:i+len(prefix)] + "***"
+		for _, action := range []string{"/approve", "/deny", "/create"} {
+			if strings.HasSuffix(rest, action) {
+				return masked + action
+			}
+		}
+		return masked
+	}
+	return path
 }
 
 // recoverPanics turns a handler panic into a JSON 500 without leaking details.
@@ -210,7 +296,7 @@ func (s *Server) recoverPanics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				s.logf("panic serving %s %s: %v", r.Method, r.URL.Path, rec)
+				s.logf("panic serving %s %s: %v", r.Method, logPath(r.URL.Path), rec)
 				s.writeError(w, http.StatusInternalServerError, model.ErrCodeInternal, "internal error")
 			}
 		}()
@@ -234,6 +320,8 @@ type listData[T any] struct {
 // writeData writes a success envelope.
 func (s *Server) writeData(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// API responses are per-identity and may carry one-time secrets.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(dataEnvelope{Data: payload}); err != nil {
 		s.logf("write response: %v", err)
@@ -256,6 +344,7 @@ func (s *Server) writeError(w http.ResponseWriter, status int, code, message str
 // writeErrorDetails writes the standard error envelope with details.
 func (s *Server) writeErrorDetails(w http.ResponseWriter, status int, code, message string, details map[string]any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	body := model.ErrorBody{Error: model.ErrorDetail{Code: code, Message: message, Details: details}}
 	if err := json.NewEncoder(w).Encode(body); err != nil {
@@ -332,7 +421,66 @@ func bearerToken(r *http.Request) (string, bool) {
 	return value, true
 }
 
-// remoteHost returns the client IP (without port) for audit metadata.
+// parseTrustedProxies parses Config.TrustedProxies (addresses or CIDRs).
+func parseTrustedProxies(raw []string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(raw))
+	for _, item := range raw {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(item); err == nil {
+			out = append(out, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(item)
+		if err != nil {
+			return nil, fmt.Errorf("server: trusted proxy %q is not an IP address or CIDR range", item)
+		}
+		addr = addr.Unmap()
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return out, nil
+}
+
+func (s *Server) isTrustedProxy(host string) bool {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range s.trustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientAddr returns the client's IP address for rate limits, the sign-in
+// approval screen and audit metadata. It is the direct peer, unless that
+// peer is a configured trusted proxy: then it is the right-most
+// X-Forwarded-For entry that is not itself a trusted proxy. A forwarded
+// header from any other peer is ignored, so a client cannot spoof it.
+func (s *Server) clientAddr(r *http.Request) string {
+	peer := remoteHost(r)
+	if len(s.trustedProxies) == 0 || !s.isTrustedProxy(peer) {
+		return peer
+	}
+	entries := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(entries) - 1; i >= 0; i-- {
+		addr, err := netip.ParseAddr(strings.TrimSpace(entries[i]))
+		if err != nil {
+			break // malformed: trust nothing further left
+		}
+		if !s.isTrustedProxy(addr.String()) {
+			return addr.Unmap().String()
+		}
+	}
+	return peer
+}
+
+// remoteHost returns the direct peer's IP (without port).
 func remoteHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -468,13 +616,23 @@ func sanitizeSessionName(name string) string {
 
 // appendAudit appends an audit event, logging (never leaking) append failures.
 func (s *Server) appendAudit(ctx context.Context, ev model.AuditEvent) {
-	if err := s.db.AppendAudit(ctx, &ev); err != nil {
+	// An audit record must not be lost because the caller went away.
+	if err := s.db.AppendAudit(context.WithoutCancel(ctx), &ev); err != nil {
 		s.logf("audit append failed: %v", err)
 	}
 }
 
 // agentAudit appends an audit event attributed to an agent.
 func (s *Server) agentAudit(ctx context.Context, ag model.Agent, action, status, severity, targetType, targetID string, metadata map[string]any) {
+	// Every event of an owned agent also names the person behind it (§17.6).
+	if ag.OwnerID != "" {
+		withOwner := make(map[string]any, len(metadata)+1)
+		for k, v := range metadata {
+			withOwner[k] = v
+		}
+		withOwner["owner_id"] = ag.OwnerID
+		metadata = withOwner
+	}
 	s.appendAudit(ctx, model.AuditEvent{
 		ActorType:  "agent",
 		ActorID:    ag.ID,
@@ -488,19 +646,15 @@ func (s *Server) agentAudit(ctx context.Context, ag model.Agent, action, status,
 	})
 }
 
-// adminAudit appends an audit event attributed to the operator.
-func (s *Server) adminAudit(ctx context.Context, action, status, severity, targetType, targetID string, metadata map[string]any) {
-	s.appendAudit(ctx, model.AuditEvent{
-		ActorType:  "admin",
-		ActorID:    "admin",
-		ActorName:  "operator",
-		Action:     action,
-		Status:     status,
-		Severity:   severity,
-		TargetType: targetType,
-		TargetID:   targetID,
-		Metadata:   metadata,
-	})
+// actorAudit appends an audit event attributed to the person whose console
+// session the request runs in. Without a session (a sweep, a startup check)
+// the event is the control plane's own.
+func (s *Server) actorAudit(ctx context.Context, action, status, severity, targetType, targetID string, metadata map[string]any) {
+	if sc, ok := sessionFromContext(ctx); ok {
+		s.personAudit(ctx, sc.person, action, status, severity, targetType, targetID, metadata)
+		return
+	}
+	s.systemAudit(ctx, action, status, severity, targetType, targetID, metadata)
 }
 
 // systemAudit appends an audit event attributed to the control plane itself.
@@ -553,4 +707,38 @@ func denyDecisionReasons(decision model.PolicyDecision) []string {
 		}
 	}
 	return out
+}
+
+// runToCompletion detaches state-changing requests from the client's
+// connection. A browser that aborts after an authority change has been
+// written (a cloud account disabled, settings lowered, a key rotated) would
+// otherwise cancel the request context and stop the lease sweep and the
+// audit record that follow the write, leaving a committed change with no
+// record of who made it. Reads stay cancellable.
+func runToCompletion(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isSafeMethod(r.Method) {
+			r = r.WithContext(context.WithoutCancel(r.Context()))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// contentSecurityPolicy allows only the console's own files: no inline
+// script, no other origins, and no framing by any page.
+const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+	"connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+// securityHeaders sets the browser protections on every response. Framing
+// is refused so no other page, same-site ones included, can overlay the
+// console and trick a click on Approve or Disable.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }

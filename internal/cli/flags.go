@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/arveykao/cloud-safeguard/internal/model"
 )
 
 // flagSet aliases flag.FlagSet for brevity in command implementations.
@@ -110,80 +108,4 @@ func parseOptionalDurationSeconds(value string) (int, error) {
 		return 0, nil
 	}
 	return parseDurationSeconds(value)
-}
-
-// parseRiskTier parses a risk tier flag (case-insensitive).
-func parseRiskTier(value string) (model.RiskTier, error) {
-	v := strings.ToLower(strings.TrimSpace(value))
-	r, ok := model.ParseRiskTier(v)
-	if !ok {
-		return "", fmt.Errorf("unknown risk tier %q (valid: low, medium, high, critical)", value)
-	}
-	return r, nil
-}
-
-// paramValues collects repeated --param key=value flags.
-type paramValues map[string]string
-
-// String implements flag.Value.
-func (p *paramValues) String() string {
-	if p == nil || len(*p) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(*p))
-	for k, v := range *p {
-		parts = append(parts, k+"="+v)
-	}
-	return strings.Join(parts, ",")
-}
-
-// Set implements flag.Value.
-func (p *paramValues) Set(value string) error {
-	key, val, ok := strings.Cut(value, "=")
-	key = strings.TrimSpace(key)
-	if !ok || key == "" {
-		return fmt.Errorf("--param expects key=value (got %q)", value)
-	}
-	if *p == nil {
-		*p = make(paramValues)
-	}
-	(*p)[key] = val
-	return nil
-}
-
-// mapValue returns the params as a plain map (nil when empty).
-func (p paramValues) mapValue() map[string]string {
-	if len(p) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(p))
-	for k, v := range p {
-		out[k] = v
-	}
-	return out
-}
-
-// stringSliceFlag collects repeated flags, splitting comma-separated values.
-type stringSliceFlag []string
-
-// String implements flag.Value.
-func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
-
-// Set implements flag.Value.
-func (s *stringSliceFlag) Set(value string) error {
-	for _, part := range strings.Split(value, ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			*s = append(*s, part)
-		}
-	}
-	return nil
-}
-
-// values returns the collected strings (nil when empty).
-func (s stringSliceFlag) values() []string {
-	if len(s) == 0 {
-		return nil
-	}
-	return append([]string(nil), s...)
 }

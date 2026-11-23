@@ -9,6 +9,7 @@ package model
 
 import (
 	"fmt"
+	"regexp"
 	"time"
 )
 
@@ -58,11 +59,109 @@ func (r RiskTier) Rank() int {
 	return 0
 }
 
-// ParseRiskTier parses a risk tier string. It accepts the canonical lowercase
-// values only; callers should normalize user input first.
-func ParseRiskTier(s string) (RiskTier, bool) {
-	r := RiskTier(s)
-	return r, r.Valid()
+// AgentRole is the guest < member < administrator ladder. It is a person's
+// role on a cloud account (CONTRACT §17.2, where it is called Role); agents
+// inherit their owner's and have none of their own.
+//
+// A role permits a set of capability access levels:
+//
+//	guest         -> read
+//	member        -> read, write
+//	administrator -> read, write, admin
+type AgentRole string
+
+const (
+	RoleGuest         AgentRole = "guest"
+	RoleMember        AgentRole = "member"
+	RoleAdministrator AgentRole = "administrator"
+)
+
+// Valid reports whether the role is one of the known values.
+func (r AgentRole) Valid() bool {
+	switch r {
+	case RoleGuest, RoleMember, RoleAdministrator:
+		return true
+	}
+	return false
+}
+
+// Rank maps a role to an ordered integer: guest=1, member=2, administrator=3.
+// Unknown roles rank 0.
+func (r AgentRole) Rank() int {
+	switch r {
+	case RoleGuest:
+		return 1
+	case RoleMember:
+		return 2
+	case RoleAdministrator:
+		return 3
+	}
+	return 0
+}
+
+// Permits reports whether the role permits the given capability access level.
+// An invalid role or access level never permits anything (fail closed).
+func (r AgentRole) Permits(access AccessLevel) bool {
+	if !r.Valid() || !access.Valid() {
+		return false
+	}
+	return r.Rank() >= access.Rank()
+}
+
+// AgentRoles returns the known roles in ascending order of privilege.
+func AgentRoles() []AgentRole { return []AgentRole{RoleGuest, RoleMember, RoleAdministrator} }
+
+// LowestRolePermitting returns the least privileged role that permits every
+// given access level. It returns guest for an empty list, and false when an
+// access level is invalid (no role can cover it).
+func LowestRolePermitting(accesses []AccessLevel) (AgentRole, bool) {
+	role := RoleGuest
+	for _, a := range accesses {
+		if !a.Valid() {
+			return RoleGuest, false
+		}
+		for _, candidate := range AgentRoles() {
+			if candidate.Permits(a) {
+				if candidate.Rank() > role.Rank() {
+					role = candidate
+				}
+				break
+			}
+		}
+	}
+	return role, true
+}
+
+// AccessLevel is the kind of cloud access a capability grants (CONTRACT §16.1).
+type AccessLevel string
+
+const (
+	AccessRead  AccessLevel = "read"
+	AccessWrite AccessLevel = "write"
+	AccessAdmin AccessLevel = "admin"
+)
+
+// Valid reports whether the access level is one of the known values.
+func (a AccessLevel) Valid() bool {
+	switch a {
+	case AccessRead, AccessWrite, AccessAdmin:
+		return true
+	}
+	return false
+}
+
+// Rank maps an access level to an ordered integer: read=1, write=2, admin=3.
+// Unknown levels rank 0.
+func (a AccessLevel) Rank() int {
+	switch a {
+	case AccessRead:
+		return 1
+	case AccessWrite:
+		return 2
+	case AccessAdmin:
+		return 3
+	}
+	return 0
 }
 
 // ProviderType is the cloud vendor family of a provider.
@@ -70,10 +169,11 @@ type ProviderType string
 
 const (
 	ProviderAliyun ProviderType = "aliyun"
+	ProviderAWS    ProviderType = "aws"
 )
 
 // Valid reports whether the provider type is supported.
-func (p ProviderType) Valid() bool { return p == ProviderAliyun }
+func (p ProviderType) Valid() bool { return p == ProviderAliyun || p == ProviderAWS }
 
 // ProviderMode selects how a provider mints short-lived credentials.
 //
@@ -115,10 +215,19 @@ type Provider struct {
 	Region string `json:"region"`
 	// RoleARN is the RAM role assumed when minting credentials (sts mode).
 	RoleARN string `json:"role_arn,omitempty"`
+	// CloudAccountID is the cloud's own account ID (for Alibaba Cloud the
+	// numeric UID), taken from RoleARN when the provider is created. It never
+	// changes afterwards and is unique across providers; access requests
+	// name the account by it (CONTRACT §17.2). Empty when unknown: such a
+	// provider cannot serve access requests.
+	CloudAccountID string `json:"cloud_account_id,omitempty"`
 	// AccessKeyIDMasked is a display-only form such as "LTAI****9f2c". The raw
 	// broker AccessKey ID is never returned by the API.
-	AccessKeyIDMasked string         `json:"access_key_id_masked"`
-	Status            ProviderStatus `json:"status"`
+	AccessKeyIDMasked string `json:"access_key_id_masked"`
+	// UserAdminKeyMasked is the masked ID of the second key that creates
+	// long-lived credentials (CONTRACT §17.14); empty when not enabled.
+	UserAdminKeyMasked string         `json:"user_admin_key_masked,omitempty"`
+	Status             ProviderStatus `json:"status"`
 	// LastTestedAt / LastTestOK report the most recent connection test.
 	LastTestedAt *time.Time `json:"last_tested_at,omitempty"`
 	LastTestOK   *bool      `json:"last_test_ok,omitempty"`
@@ -126,7 +235,7 @@ type Provider struct {
 	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
-// CreateProviderInput is the admin request body for POST /admin/providers.
+// CreateProviderInput is the request body of POST /supervisor/accounts.
 type CreateProviderInput struct {
 	Name            string       `json:"name"`
 	Type            ProviderType `json:"type"`
@@ -137,7 +246,7 @@ type CreateProviderInput struct {
 	AccessKeySecret string       `json:"access_key_secret"`
 }
 
-// UpdateProviderInput is the admin request body for PATCH /admin/providers/{id}.
+// UpdateProviderInput is the request body of PATCH /supervisor/accounts/{id}.
 // Nil fields are left unchanged.
 type UpdateProviderInput struct {
 	Name    *string         `json:"name,omitempty"`
@@ -172,6 +281,10 @@ type Capability struct {
 	// ProviderType must match the leased provider's Type.
 	ProviderType ProviderType `json:"provider_type"`
 	Risk         RiskTier     `json:"risk"`
+	// Access is the kind of cloud access this capability grants. It gates which
+	// agent roles may request it (CONTRACT §16.1) and how strictly the IAM
+	// prohibition inspects the rendered policy (§16.3).
+	Access AccessLevel `json:"access"`
 	// PolicyTemplate is a JSON IAM policy document that may contain
 	// {{placeholder}} references to capability params, e.g.
 	// "acs:alidns:*:*:domain/{{domain}}".
@@ -208,43 +321,25 @@ type Agent struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	Status      AgentStatus `json:"status"`
-	// Grants are capability IDs this agent may request.
-	Grants []string `json:"grants"`
-	// MaxTTLSeconds caps any single lease this agent may hold.
-	MaxTTLSeconds int `json:"max_ttl_seconds"`
-	// MaxConcurrentLeases caps simultaneously active leases.
+	// Role and Grants are left over from the removed agent model and mean
+	// nothing: an agent inherits its owner's role on each cloud account.
+	// They are always "guest" and empty.
+	Role   AgentRole `json:"role"`
+	Grants []string  `json:"grants"`
+	// MaxTTLSeconds and MaxConcurrentLeases record the platform limits when
+	// the agent signed in. The supervisor's current settings are what is
+	// enforced.
+	MaxTTLSeconds       int `json:"max_ttl_seconds"`
 	MaxConcurrentLeases int `json:"max_concurrent_leases"`
+	// OwnerID is the person this agent belongs to (CONTRACT §17.1). It is set
+	// when the agent signs in and never changes. An agent without one is
+	// left over from the removed agent model and is refused everywhere.
+	OwnerID string `json:"owner_id,omitempty"`
 	// TokenPrefix is a display-only hint (e.g. "csg_agt_7f3a").
 	TokenPrefix string     `json:"token_prefix"`
 	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
-}
-
-// CreateAgentInput is the admin request body for POST /admin/agents.
-type CreateAgentInput struct {
-	Name                string   `json:"name"`
-	Description         string   `json:"description"`
-	Grants              []string `json:"grants"`
-	MaxTTLSeconds       int      `json:"max_ttl_seconds"`
-	MaxConcurrentLeases int      `json:"max_concurrent_leases"`
-}
-
-// UpdateAgentInput is the admin request body for PATCH /admin/agents/{id}.
-type UpdateAgentInput struct {
-	Name                *string      `json:"name,omitempty"`
-	Description         *string      `json:"description,omitempty"`
-	Grants              *[]string    `json:"grants,omitempty"`
-	MaxTTLSeconds       *int         `json:"max_ttl_seconds,omitempty"`
-	MaxConcurrentLeases *int         `json:"max_concurrent_leases,omitempty"`
-	Status              *AgentStatus `json:"status,omitempty"`
-}
-
-// AgentWithToken is returned exactly once when an agent is created or its
-// token is rotated.
-type AgentWithToken struct {
-	Agent Agent  `json:"agent"`
-	Token string `json:"token"`
 }
 
 // LeaseStatus is the lifecycle state of a lease request.
@@ -259,7 +354,9 @@ const (
 	LeaseDenied LeaseStatus = "denied"
 	// LeaseExpired ran past its TTL or approval window.
 	LeaseExpired LeaseStatus = "expired"
-	// LeaseRevoked was killed by an agent or admin before its TTL.
+	// LeaseRevoked was ended before its deadline: by the agent, its owner,
+	// a supervisor, or the control plane when the owner's role no longer
+	// allows it.
 	LeaseRevoked LeaseStatus = "revoked"
 	// LeaseFailed could not mint credentials (provider error).
 	LeaseFailed LeaseStatus = "failed"
@@ -326,7 +423,7 @@ type Lease struct {
 	Status              LeaseStatus    `json:"status"`
 	Decision            PolicyDecision `json:"decision"`
 	BreakGlass          bool           `json:"break_glass"`
-	// ApprovedBy is "auto", an admin actor label, or empty.
+	// ApprovedBy is "auto", "owner:<person id>", or empty.
 	ApprovedBy    string `json:"approved_by,omitempty"`
 	ApprovalNote  string `json:"approval_note,omitempty"`
 	DeniedReason  string `json:"denied_reason,omitempty"`
@@ -344,6 +441,13 @@ type Lease struct {
 	IssuedAt              *time.Time `json:"issued_at,omitempty"`
 	ExpiresAt             *time.Time `json:"expires_at,omitempty"`
 	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
+	// MaxLifetimeSeconds bounds refreshes from first issue; RefreshUntil is
+	// issue time + MaxLifetimeSeconds (CONTRACT §17.12).
+	MaxLifetimeSeconds int        `json:"max_lifetime_seconds,omitempty"`
+	RefreshUntil       *time.Time `json:"refresh_until,omitempty"`
+	RefreshCount       int        `json:"refresh_count,omitempty"`
+	// LastRefreshedAt is the last refresh attempt, successful or not.
+	LastRefreshedAt *time.Time `json:"last_refreshed_at,omitempty"`
 }
 
 // CreateLeaseInput is the agent request body for POST /agent/leases.
@@ -353,24 +457,27 @@ type CreateLeaseInput struct {
 	// TTLSeconds 0 means "use the capability default".
 	TTLSeconds int    `json:"ttl_seconds,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+	// MaxLifetimeSeconds bounds refreshes (access requests only).
+	MaxLifetimeSeconds int `json:"-"`
 	// BreakGlass must be true to request a critical capability; it forces human
 	// approval and critical-severity audit.
 	BreakGlass bool `json:"break_glass,omitempty"`
 }
 
-// ApproveLeaseInput is the admin request body for POST /admin/leases/{id}/approve.
+// ApproveLeaseInput is the request body of POST /me/requests/{id}/approve.
 type ApproveLeaseInput struct {
 	// TTLSeconds 0 means "use the lease's requested/effective TTL".
 	TTLSeconds int    `json:"ttl_seconds,omitempty"`
 	Note       string `json:"note,omitempty"`
 }
 
-// DenyLeaseInput is the admin request body for POST /admin/leases/{id}/deny.
+// DenyLeaseInput is the request body of POST /supervisor/leases/{id}/deny.
 type DenyLeaseInput struct {
 	Reason string `json:"reason"`
 }
 
-// RevokeLeaseInput is the request body for lease revocation (agent or admin).
+// RevokeLeaseInput is the request body for revoking a credential (the agent,
+// its owner or a supervisor).
 type RevokeLeaseInput struct {
 	Reason string `json:"reason"`
 }
@@ -399,8 +506,9 @@ type EnvVar struct {
 // to know how to convert credentials themselves.
 type CredentialEnvelope struct {
 	Credential Credential `json:"credential"`
-	// Env contains ALIBABA_CLOUD_ACCESS_KEY_ID, ALIBABA_CLOUD_ACCESS_KEY_SECRET,
-	// ALIBABA_CLOUD_SECURITY_TOKEN, plus CSG_LEASE_ID / CSG_SERVER.
+	// Env contains the cloud's credential variables (ALIBABA_CLOUD_* for
+	// Alibaba Cloud, AWS_* for AWS) plus CSG_LEASE_ID / CSG_SERVER /
+	// CSG_CAPABILITY.
 	Env []EnvVar `json:"env"`
 }
 
@@ -409,7 +517,7 @@ type AuditEvent struct {
 	Seq        int64          `json:"seq"`
 	ID         string         `json:"id"`
 	Time       time.Time      `json:"time"`
-	ActorType  string         `json:"actor_type"` // agent | admin | system
+	ActorType  string         `json:"actor_type"` // agent | person | system
 	ActorID    string         `json:"actor_id"`
 	ActorName  string         `json:"actor_name"`
 	Action     string         `json:"action"`
@@ -422,7 +530,7 @@ type AuditEvent struct {
 	Hash       string         `json:"hash"`
 }
 
-// AuditVerifyResult is returned by GET /admin/audit/verify.
+// AuditVerifyResult is returned by GET /supervisor/audit/verify.
 type AuditVerifyResult struct {
 	OK              bool   `json:"ok"`
 	Events          int64  `json:"events"`
@@ -430,55 +538,46 @@ type AuditVerifyResult struct {
 	Message         string `json:"message"`
 }
 
-// PolicySettings are the global guardrails that drive auto-approval. They are
-// editable from the console.
+// PolicySettings are the platform-wide limits a supervisor can change. What
+// needs approval is not here: that is each person's approval mode on each
+// cloud account (CONTRACT §17.11).
 type PolicySettings struct {
-	// AutoApproveMaxRisk: requests whose capability risk is <= this tier and
-	// whose TTL is <= AutoApproveMaxTTLSeconds are granted automatically.
-	AutoApproveMaxRisk RiskTier `json:"auto_approve_max_risk"`
-	// AutoApproveMaxTTLSeconds caps the TTL of an automatically granted lease.
-	AutoApproveMaxTTLSeconds int `json:"auto_approve_max_ttl_seconds"`
-	// MaxLeaseTTLSeconds is the absolute TTL ceiling for any lease.
+	// MaxLeaseTTLSeconds is the longest validity period of any credential.
 	MaxLeaseTTLSeconds int `json:"max_lease_ttl_seconds"`
-	// PendingTimeoutSeconds is how long a pending request survives before it
-	// expires without a decision.
+	// PendingTimeoutSeconds is how long a request waits for approval before
+	// it expires.
 	PendingTimeoutSeconds int `json:"pending_timeout_seconds"`
-	// MaxConcurrentLeasesPerAgent caps simultaneously active leases.
+	// MaxConcurrentLeasesPerAgent caps the credentials an agent holds at once.
 	MaxConcurrentLeasesPerAgent int `json:"max_concurrent_leases_per_agent"`
-	// LeasesPerMinutePerAgent rate-limits lease creation per agent.
+	// LeasesPerMinutePerAgent rate-limits requests per agent.
 	LeasesPerMinutePerAgent int `json:"leases_per_minute_per_agent"`
-	// RequireReasonForRisk requires a non-empty reason at or above this tier.
-	RequireReasonForRisk RiskTier `json:"require_reason_for_risk"`
+	// MaxRefreshLifetimeSeconds is the longest an agent may keep refreshing
+	// one request's credential, from first issue (CONTRACT §17.12).
+	MaxRefreshLifetimeSeconds int `json:"max_refresh_lifetime_seconds"`
 }
 
-// DefaultPolicySettings returns the shipped guardrails: read-only requests are
-// auto-approved for up to 15 minutes; everything else needs a human; the hard
-// ceiling is one hour.
+// DefaultRefreshLifetimeSeconds is the refresh window of a request that
+// declares none (CONTRACT §17.12).
+const DefaultRefreshLifetimeSeconds = 8 * 3600
+
+// MaxRefreshLifetimeLimit is the highest MaxRefreshLifetimeSeconds allowed.
+const MaxRefreshLifetimeLimit = 30 * 24 * 3600
+
+// DefaultPolicySettings returns the shipped limits.
 func DefaultPolicySettings() PolicySettings {
 	return PolicySettings{
-		AutoApproveMaxRisk:          RiskLow,
-		AutoApproveMaxTTLSeconds:    900,
 		MaxLeaseTTLSeconds:          3600,
 		PendingTimeoutSeconds:       600,
 		MaxConcurrentLeasesPerAgent: 3,
 		LeasesPerMinutePerAgent:     6,
-		RequireReasonForRisk:        RiskMedium,
+		MaxRefreshLifetimeSeconds:   24 * 3600,
 	}
 }
 
-// Validate checks the policy settings for obviously invalid combinations.
+// Validate checks the settings for obviously invalid values.
 func (p PolicySettings) Validate() error {
-	if !p.AutoApproveMaxRisk.Valid() {
-		return fmt.Errorf("auto_approve_max_risk: unknown risk tier %q", p.AutoApproveMaxRisk)
-	}
-	if !p.RequireReasonForRisk.Valid() {
-		return fmt.Errorf("require_reason_for_risk: unknown risk tier %q", p.RequireReasonForRisk)
-	}
-	if p.AutoApproveMaxTTLSeconds <= 0 {
-		return fmt.Errorf("auto_approve_max_ttl_seconds must be positive")
-	}
-	if p.MaxLeaseTTLSeconds < p.AutoApproveMaxTTLSeconds {
-		return fmt.Errorf("max_lease_ttl_seconds must be >= auto_approve_max_ttl_seconds")
+	if p.MaxLeaseTTLSeconds <= 0 {
+		return fmt.Errorf("max_lease_ttl_seconds must be positive")
 	}
 	if p.PendingTimeoutSeconds <= 0 {
 		return fmt.Errorf("pending_timeout_seconds must be positive")
@@ -489,56 +588,10 @@ func (p PolicySettings) Validate() error {
 	if p.LeasesPerMinutePerAgent <= 0 {
 		return fmt.Errorf("leases_per_minute_per_agent must be positive")
 	}
+	if p.MaxRefreshLifetimeSeconds < p.MaxLeaseTTLSeconds || p.MaxRefreshLifetimeSeconds > MaxRefreshLifetimeLimit {
+		return fmt.Errorf("max_refresh_lifetime_seconds must be at least max_lease_ttl_seconds and at most 30 days")
+	}
 	return nil
-}
-
-// OverviewCounts are the headline numbers on the console dashboard.
-type OverviewCounts struct {
-	Agents          int `json:"agents"`
-	ActiveAgents    int `json:"active_agents"`
-	Capabilities    int `json:"capabilities"`
-	Providers       int `json:"providers"`
-	ActiveLeases    int `json:"active_leases"`
-	PendingLeases   int `json:"pending_leases"`
-	Events24h       int `json:"events_24h"`
-	DeniedLeases24h int `json:"denied_leases_24h"`
-}
-
-// RiskBreakdown counts active+pending leases by risk tier.
-type RiskBreakdown struct {
-	Low      int `json:"low"`
-	Medium   int `json:"medium"`
-	High     int `json:"high"`
-	Critical int `json:"critical"`
-}
-
-// VaultStatus is a non-secret view of the credential vault.
-type VaultStatus struct {
-	Configured     bool   `json:"configured"`
-	KeyFingerprint string `json:"key_fingerprint"`
-	SecretsStored  int    `json:"secrets_stored"`
-}
-
-// Overview is returned by GET /admin/overview for the dashboard.
-type Overview struct {
-	Counts        OverviewCounts `json:"counts"`
-	RiskBreakdown RiskBreakdown  `json:"risk_breakdown"`
-	Policy        PolicySettings `json:"policy"`
-	Vault         VaultStatus    `json:"vault"`
-	PendingLeases []Lease        `json:"pending_leases"`
-	ActiveLeases  []Lease        `json:"active_leases"`
-	RecentEvents  []AuditEvent   `json:"recent_events"`
-	Providers     []Provider     `json:"providers"`
-	Version       string         `json:"version"`
-	UptimeSeconds int64          `json:"uptime_seconds"`
-	ServerTime    time.Time      `json:"server_time"`
-}
-
-// LoginResult is returned by POST /admin/login.
-type LoginResult struct {
-	OK      bool   `json:"ok"`
-	Role    string `json:"role"` // "admin"
-	Version string `json:"version"`
 }
 
 // Health is returned by GET /healthz.
@@ -581,4 +634,69 @@ const (
 	ErrCodeCredentialUnavailable = "credential_unavailable"
 	ErrCodeProviderError         = "provider_error"
 	ErrCodePolicyDenied          = "policy_denied"
+	// ErrCodeConsoleOnly: a command-line session asked for something that
+	// is done in the console only (CONTRACT §17.9).
+	ErrCodeConsoleOnly = "console_only"
+	// ErrCodeAuthenticatorCodeRequired: a command-line session asked for a
+	// change that raises access without a fresh authenticator code.
+	ErrCodeAuthenticatorCodeRequired = "authenticator_code_required"
+	// ErrCodeAuthenticatorCodeInvalid: the code sent was not accepted.
+	ErrCodeAuthenticatorCodeInvalid = "authenticator_code_invalid"
 )
+
+var aliyunRoleARN = regexp.MustCompile(`^acs:ram::([0-9]{6,32}):role/[A-Za-z0-9._/-]+$`)
+
+// awsRoleARN is an IAM role ARN in the standard partition: a 12-digit
+// account and a role name (with an optional path).
+var awsRoleARN = regexp.MustCompile(`^arn:aws:iam::([0-9]{12}):role/[A-Za-z0-9+=,.@_/-]{1,512}$`)
+
+// CloudAccountIDFromRoleARN extracts the cloud account ID from a role ARN,
+// or returns "" when the ARN does not have the provider type's form.
+func CloudAccountIDFromRoleARN(t ProviderType, roleARN string) string {
+	pattern := aliyunRoleARN
+	if t == ProviderAWS {
+		pattern = awsRoleARN
+	} else if t != ProviderAliyun {
+		return ""
+	}
+	if m := pattern.FindStringSubmatch(roleARN); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// awsRegion and aliyunRegion are the shapes of region names. A region ends up
+// in an endpoint host name and in AWS_REGION, so nothing else is accepted:
+// no dots, slashes, colons or at signs.
+var (
+	awsRegion    = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$`)
+	aliyunRegion = regexp.MustCompile(`^[a-z]{2}-[a-z0-9]+(-[a-z0-9]+){0,3}$`)
+)
+
+// ValidRegion reports whether region is a well-formed region name of the
+// provider type (for example us-east-1, cn-hangzhou).
+func ValidRegion(t ProviderType, region string) bool {
+	if len(region) > 40 {
+		return false
+	}
+	if t == ProviderAWS {
+		return awsRegion.MatchString(region)
+	}
+	return aliyunRegion.MatchString(region)
+}
+
+// RegionExample is an example region of a provider type, for messages.
+func RegionExample(t ProviderType) string {
+	if t == ProviderAWS {
+		return "us-east-1"
+	}
+	return "cn-hangzhou"
+}
+
+// RoleARNExample is an example role ARN of a provider type, for messages.
+func RoleARNExample(t ProviderType) string {
+	if t == ProviderAWS {
+		return "arn:aws:iam::123456789012:role/cloud-safeguard"
+	}
+	return "acs:ram::1234567890123456:role/cloud-safeguard"
+}

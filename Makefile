@@ -1,6 +1,6 @@
 # Cloud Safeguard — build/test/demo entry points.
 #
-# make build   build the web console and the single Go binary (bin/csg)
+# make build   build the web console and the single Go binary (build/csg)
 # make test    run the full Go test suite
 # make demo    run the end-to-end demo against the built-in mock cloud
 # make web     rebuild only the web console into web/dist
@@ -8,7 +8,7 @@
 # make clean   remove build artifacts
 
 SHELL := /bin/bash
-BINARY := bin/csg
+BINARY := build/csg
 GO ?= go
 NPM ?= npm
 DATA_DIR ?= .demo/data
@@ -20,15 +20,15 @@ WEB_DIR := web
 all: build
 
 help:
-	@echo "make build   build web console + bin/csg"
+	@echo "make build   build web console + build/csg"
 	@echo "make test    go test ./..."
 	@echo "make demo    end-to-end demo (mock cloud, port $(DEMO_PORT))"
 	@echo "make web     build web console only"
 	@echo "make fmt     gofmt -w ."
-	@echo "make clean   remove bin/ .demo/"
+	@echo "make clean   remove build/ .demo/"
 
 build: web
-	mkdir -p bin
+	mkdir -p build
 	$(GO) build -trimpath -ldflags "-s -w" -o $(BINARY) ./cmd/csg
 
 web:
@@ -48,4 +48,4 @@ demo: build
 	./scripts/demo.sh --port $(DEMO_PORT) --data-dir $(DATA_DIR)
 
 clean:
-	rm -rf bin .demo
+	rm -rf build .demo
