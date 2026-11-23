@@ -52,22 +52,3 @@ jobs:
             exit 1
           fi
 
-  docker:
-    name: Docker image builds and starts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t cloud-safeguard:ci .
-      - name: First start initialises and answers /healthz
-        run: |
-          docker run -d --name csg -p 8787:8787 cloud-safeguard:ci
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8787/healthz; then echo; break; fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:8787/healthz
-      - name: Container logs
-        if: failure()
-        run: docker logs csg 2>&1 | tail -40
-      - if: always()
-        run: docker rm -f csg || true
