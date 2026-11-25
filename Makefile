@@ -3,6 +3,7 @@
 # make build   build the web console and the single Go binary (build/csg)
 # make test    run the full Go test suite
 # make demo    run the end-to-end demo against the built-in mock cloud
+# make qa      every automated check: format, vet, tests, race, console, demo, smoke
 # make web     rebuild only the web console into web/dist
 # make fmt     gofmt the Go tree
 # make clean   remove build artifacts
@@ -15,7 +16,7 @@ DATA_DIR ?= .demo/data
 DEMO_PORT ?= 18787
 WEB_DIR := web
 
-.PHONY: all build test demo web fmt vet clean help
+.PHONY: all build test demo web fmt vet qa clean help
 
 all: build
 
@@ -23,6 +24,7 @@ help:
 	@echo "make build   build web console + build/csg"
 	@echo "make test    go test ./..."
 	@echo "make demo    end-to-end demo (mock cloud, port $(DEMO_PORT))"
+	@echo "make qa      full QA run (QA_FLAGS=--docker adds the image check)"
 	@echo "make web     build web console only"
 	@echo "make fmt     gofmt -w ."
 	@echo "make clean   remove build/ .demo/"
@@ -46,6 +48,9 @@ vet:
 
 demo: build
 	./scripts/demo.sh --port $(DEMO_PORT) --data-dir $(DATA_DIR)
+
+qa:
+	./scripts/qa.sh $(QA_FLAGS)
 
 clean:
 	rm -rf build .demo

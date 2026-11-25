@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/arveykao/cloud-safeguard/internal/capcatalog"
 	"github.com/arveykao/cloud-safeguard/internal/model"
 )
 
@@ -30,7 +31,7 @@ func (a *App) runLeases(args []string) error {
 func (a *App) runLeasesMine(args []string) error {
 	fs := a.newFlagSet("leases mine", "Usage: csg leases mine [--status S] [--json]\n")
 	cf := a.addClientFlags(fs)
-	status := fs.String("status", "", "filter by lease status")
+	status := fs.String("status", "", "filter by request status")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
@@ -74,7 +75,7 @@ func (a *App) runLeasesGet(args []string) error {
 		return err
 	}
 	if len(positionals) != 1 {
-		return usagef("leases get requires exactly one lease ID")
+		return usagef("leases get requires exactly one request ID")
 	}
 	client, err := a.agentClient(cf)
 	if err != nil {
@@ -91,36 +92,60 @@ func (a *App) runLeasesGet(args []string) error {
 	return nil
 }
 
-// printLeaseTable renders the lease list view.
+// printLeaseTable renders the request list view with the same ACCESS wording
+// as `csg me requests`, plus CREATED and EXPIRES.
 func printLeaseTable(w io.Writer, leases []model.Lease) {
 	if len(leases) == 0 {
-		fmt.Fprintln(w, "no leases")
+		fmt.Fprintln(w, "no requests")
 		return
 	}
 	rows := make([][]string, 0, len(leases))
 	for _, l := range leases {
+		account, access, validFor := leaseRequestColumns(l)
 		rows = append(rows, []string{
 			l.ID,
 			string(l.Status),
 			l.AgentName,
-			l.CapabilityName,
-			string(l.Risk),
-			formatSeconds(l.EffectiveTTLSeconds),
+			account,
+			access,
+			formatSeconds(validFor),
 			fmtTime(l.CreatedAt),
 			fmtTimePtr(l.ExpiresAt),
 		})
 	}
-	writeTable(w, []string{"ID", "STATUS", "AGENT", "CAPABILITY", "RISK", "TTL", "CREATED", "EXPIRES"}, rows)
+	writeTable(w, []string{"ID", "STATUS", "AGENT", "ACCOUNT", "ACCESS", "VALID FOR", "CREATED", "EXPIRES"}, rows)
 }
 
-// printLeaseDetail renders one lease with its explainable decision.
+// leaseRequestColumns maps a lease (including access-template leases) to the
+// ACCOUNT / ACCESS / VALID FOR cells shared with `csg me requests`.
+func leaseRequestColumns(l model.Lease) (account, access string, validFor int) {
+	account = l.ProviderName
+	validFor = l.RequestedTTLSeconds
+	if validFor == 0 {
+		validFor = l.EffectiveTTLSeconds
+	}
+	if tpl, ok := capcatalog.AccessTemplateByID(l.CapabilityID); ok {
+		name := ""
+		if l.Params != nil {
+			name = l.Params[capcatalog.ResourceNameParam]
+		}
+		if name == capcatalog.AllResources {
+			name = ""
+		}
+		return account, formatAccessLabel(string(tpl.Permission), tpl.Resource, name), validFor
+	}
+	return account, l.CapabilityName, validFor
+}
+
+// printLeaseDetail renders one request with its explainable decision.
 func printLeaseDetail(w io.Writer, l model.Lease) {
+	account, access, validFor := leaseRequestColumns(l)
 	fmt.Fprintf(w, "id:               %s\n", l.ID)
 	fmt.Fprintf(w, "status:           %s\n", l.Status)
 	fmt.Fprintf(w, "agent:            %s (%s)\n", l.AgentName, l.AgentID)
-	fmt.Fprintf(w, "capability:       %s (%s)\n", l.CapabilityName, l.CapabilityID)
+	fmt.Fprintf(w, "account:          %s\n", orDash(account))
+	fmt.Fprintf(w, "access:           %s\n", orDash(access))
 	fmt.Fprintf(w, "provider:         %s (%s)\n", l.ProviderName, l.ProviderMode)
-	fmt.Fprintf(w, "risk:             %s\n", l.Risk)
 	if len(l.Params) > 0 {
 		keys := make([]string, 0, len(l.Params))
 		for k := range l.Params {
@@ -137,8 +162,10 @@ func printLeaseDetail(w io.Writer, l model.Lease) {
 		fmt.Fprintf(w, "reason:           %s\n", l.Reason)
 	}
 	fmt.Fprintf(w, "break glass:      %s\n", yesNo(l.BreakGlass))
-	fmt.Fprintf(w, "requested ttl:    %s\n", formatSeconds(l.RequestedTTLSeconds))
-	fmt.Fprintf(w, "effective ttl:    %s\n", formatSeconds(l.EffectiveTTLSeconds))
+	switch l.Status {
+	case model.LeasePending, model.LeaseActive:
+		fmt.Fprintf(w, "valid for:        %s\n", formatSeconds(validFor))
+	}
 	fmt.Fprintf(w, "decision:         %s\n", l.Decision.Outcome)
 	for _, reason := range l.Decision.Reasons {
 		fmt.Fprintf(w, "  - %s [%s]: %s\n", reason.Rule, reason.Outcome, reason.Detail)

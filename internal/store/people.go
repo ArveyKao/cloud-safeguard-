@@ -354,15 +354,16 @@ func (db *DB) BeginPersonSetup(ctx context.Context, id, setupCodeHash, passwordH
 }
 
 // FinishPersonSetup activates a pending person and consumes the setup code in
-// one compare-and-set. It returns ErrConflict when the code was already used,
+// one compare-and-set. Finishing setup signs the person in, so it is also
+// their last sign-in. It returns ErrConflict when the code was already used,
 // replaced or expired, or setup was never begun.
 func (db *DB) FinishPersonSetup(ctx context.Context, id, setupCodeHash string, totpStep int64, now time.Time) error {
 	res, err := db.sql.ExecContext(ctx,
 		`UPDATE persons SET status = 'active', setup_code_hash = '', setup_expires_at = NULL,
-			totp_last_step = ?, failed_logins = 0, locked_until = NULL, updated_at = ?
+			totp_last_step = ?, failed_logins = 0, locked_until = NULL, last_login_at = ?, updated_at = ?
 		 WHERE id = ? AND status = 'pending' AND setup_code_hash = ? AND setup_code_hash <> ''
 		   AND setup_expires_at > ? AND password_hash <> '' AND totp_secret_enc <> ''`,
-		totpStep, toMillis(now), id, setupCodeHash, toMillis(now))
+		totpStep, toMillis(now), toMillis(now), id, setupCodeHash, toMillis(now))
 	if err != nil {
 		return mapErr(err)
 	}

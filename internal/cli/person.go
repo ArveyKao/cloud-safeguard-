@@ -384,6 +384,16 @@ func (a *App) runMeRequests(args []string) error {
 	return nil
 }
 
+// formatAccessLabel is the ACCESS column shared by `csg me requests` and
+// `csg leases mine`: e.g. "write ecs (i-2ze0demo001)" or "read ecs (all)".
+func formatAccessLabel(permission, resource, resourceName string) string {
+	scope := resourceName
+	if scope == "" {
+		scope = "all"
+	}
+	return permission + " " + resource + " (" + scope + ")"
+}
+
 func printRequestTable(w io.Writer, items []model.AccessRequest) {
 	if len(items) == 0 {
 		fmt.Fprintln(w, "no requests")
@@ -391,12 +401,8 @@ func printRequestTable(w io.Writer, items []model.AccessRequest) {
 	}
 	rows := make([][]string, 0, len(items))
 	for _, r := range items {
-		scope := r.ResourceName
-		if scope == "" {
-			scope = "all"
-		}
 		rows = append(rows, []string{r.ID, string(r.Status), r.AgentName, r.CloudAccountID,
-			r.Permission + " " + r.Resource + " (" + scope + ")", formatSeconds(r.TTLSeconds), r.Reason})
+			formatAccessLabel(r.Permission, r.Resource, r.ResourceName), formatSeconds(r.TTLSeconds), r.Reason})
 	}
 	writeTable(w, []string{"ID", "STATUS", "AGENT", "ACCOUNT", "ACCESS", "VALID FOR", "REASON"}, rows)
 }
@@ -517,22 +523,24 @@ func (a *App) runMeAccounts(args []string) error {
 }
 
 func (a *App) runMeMode(args []string) error {
-	fs := a.newFlagSet("me mode", `Usage: csg me mode ACCOUNT read|write|full [--for DUR] [--code CODE]
+	fs := a.newFlagSet("me mode", `Usage: csg me mode ACCOUNT|--account ID_OR_NAME read|write|full [--for DUR] [--code CODE]
 
 Sets how much your agents get without asking you on one cloud account (its
 cloud account ID or name, from csg me accounts), never beyond your role
 there. Anything above read asks for a code from your authenticator app.
 `)
+	accountFlag := fs.String("account", "", "cloud account ID or name")
 	forDur := fs.String("for", "", "fall back to read after this long (e.g. 2h); default: until changed")
 	code := fs.String("code", "", "code from your authenticator app")
 	positionals, err := parseFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(positionals) != 2 {
-		return usagef("me mode takes an ACCOUNT and a mode: read, write or full")
+	accountRef, modeStr, err := resolveMeModeArgs(positionals, *accountFlag)
+	if err != nil {
+		return err
 	}
-	mode := model.ApprovalMode(strings.ToLower(positionals[1]))
+	mode := model.ApprovalMode(strings.ToLower(modeStr))
 	if !mode.Valid() {
 		return usagef("mode must be read, write or full")
 	}
@@ -550,20 +558,20 @@ there. Anything above read asks for a code from your authenticator app.
 	}
 	var matches []model.PersonAccount
 	for _, acct := range list.Items {
-		if acct.CloudAccountID == positionals[0] || acct.ProviderID == positionals[0] {
+		if acct.CloudAccountID == accountRef || acct.ProviderID == accountRef {
 			matches = []model.PersonAccount{acct}
 			break
 		}
-		if strings.EqualFold(acct.Name, positionals[0]) {
+		if strings.EqualFold(acct.Name, accountRef) {
 			matches = append(matches, acct)
 		}
 	}
 	switch len(matches) {
 	case 0:
-		return usagef("no cloud account %q among yours (see csg me accounts)", positionals[0])
+		return usagef("no cloud account %q among yours (see csg me accounts)", accountRef)
 	case 1:
 	default:
-		return usagef("%d of your cloud accounts are named %q: use the cloud account ID", len(matches), positionals[0])
+		return usagef("%d of your cloud accounts are named %q: use the cloud account ID", len(matches), accountRef)
 	}
 	var out model.PersonAccount
 	if err := a.raising(client, *code, http.MethodPut, apiPrefix+"/me/accounts/"+pathEscape(matches[0].ProviderID)+"/mode",
@@ -625,6 +633,26 @@ func (a *App) runMeEndSession(args []string) error {
 	}
 	fmt.Fprintln(a.Stdout, "session ended")
 	return nil
+}
+
+// resolveMeModeArgs accepts either `ACCOUNT MODE` or `--account ID_OR_NAME MODE`.
+func resolveMeModeArgs(positionals []string, accountFlag string) (accountRef, modeStr string, err error) {
+	accountFlag = strings.TrimSpace(accountFlag)
+	switch len(positionals) {
+	case 2:
+		accountRef, modeStr = positionals[0], positionals[1]
+		if accountFlag != "" && accountFlag != accountRef {
+			return "", "", usagef("--account and the ACCOUNT argument disagree")
+		}
+		return accountRef, modeStr, nil
+	case 1:
+		if accountFlag == "" {
+			return "", "", usagef("me mode takes an ACCOUNT and a mode: read, write or full")
+		}
+		return accountFlag, positionals[0], nil
+	default:
+		return "", "", usagef("me mode takes an ACCOUNT and a mode: read, write or full")
+	}
 }
 
 // ---- lookups ----

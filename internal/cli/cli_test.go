@@ -134,6 +134,16 @@ func testLease(status model.LeaseStatus) model.Lease {
 	return lease
 }
 
+// testAccessLease is a §17 access-template lease for table/detail wording tests.
+func testAccessLease(status model.LeaseStatus) model.Lease {
+	lease := testLease(status)
+	lease.CapabilityID = "aliyun.access.ecs.write"
+	lease.CapabilityName = "ECS: write"
+	lease.Risk = model.RiskMedium
+	lease.Params = map[string]string{"resource_name": "i-2ze0demo001"}
+	return lease
+}
+
 // ---- basic commands and parsing ----
 
 func TestVersionCommand(t *testing.T) {

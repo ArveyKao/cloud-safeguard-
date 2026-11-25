@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { Person, PolicySettings } from '../types'
 import { navigate } from '../router'
-import { Button, Card, ErrorNote, PageHead, ago, useAction, useLoad, useToast, when } from '../ui'
+import { Button, Card, ErrorNote, PageHead, ago, useAction, useLoad, useToast, when, Pending, duration } from '../ui'
 
 export function SettingsPage({ person }: { person: Person; onPersonChange?: (p: Person) => void }) {
   const issued = person.setup_issued
@@ -21,7 +21,7 @@ export function SettingsPage({ person }: { person: Person; onPersonChange?: (p: 
           {issued && <div><dt>Password set up with a code from</dt><dd>{issued.by_name} · {when(issued.at)}</dd></div>}
         </dl>
         {issued && issued.by_id !== 'system' && issued.by_id !== person.id && (
-          <p className="muted small">If you did not choose your own password after that, tell another supervisor.</p>
+          <p className="muted small">If you did not choose your own password after that, tell a supervisor other than {issued.by_name}.</p>
         )}
       </Card>
 
@@ -42,7 +42,7 @@ function CLISessions() {
     <Card title="Command-line sign-ins">
       <p className="muted">Each <code>csg person login</code> you approved. End one you do not recognise, or no longer use.</p>
       <ErrorNote error={action.error ?? sessions.error} />
-      {items.length === 0 ? <p className="muted">None.</p> : (
+      {!sessions.ready ? <Pending error={sessions.error} /> : items.length === 0 ? <p className="muted">None.</p> : (
         <table className="table compact">
           <thead><tr><th>Client</th><th>From</th><th>Signed in</th><th>Last used</th><th /></tr></thead>
           <tbody>
@@ -72,6 +72,14 @@ const LIMITS: { key: keyof PolicySettings; label: string; unit: string }[] = [
   { key: 'max_refresh_lifetime_seconds', label: 'An agent may keep refreshing one request for at most', unit: 'seconds' },
 ]
 
+/** The server names the JSON field; say the label the person sees instead. */
+function labelled(error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  let message = error.message
+  for (const l of LIMITS) message = message.split(l.key).join(`"${l.label}"`)
+  return message === error.message ? error : new Error(message)
+}
+
 function Limits() {
   const settings = useLoad(() => api.settings(), [])
   const [draft, setDraft] = useState<PolicySettings | null>(null)
@@ -88,11 +96,11 @@ function Limits() {
             <span>{l.label}</span>
             <input type="number" min={1} value={draft[l.key] as number}
               onChange={(e) => setDraft({ ...draft, [l.key]: Number(e.target.value) })} />
-            {l.unit && <small>{l.unit}</small>}
+            {l.unit && <small>{l.unit}{(draft[l.key] as number) > 0 && ` · ${duration(draft[l.key] as number)}`}</small>}
           </label>
         ))}
       </div>
-      <ErrorNote error={action.error ?? settings.error} />
+      <ErrorNote error={labelled(action.error) ?? settings.error} />
       <div className="row-actions left">
         <Button kind="primary" busy={action.busy} onClick={() => action.run(async () => { setDraft(await api.putSettings(draft)); toast('Limits saved') })}>Save limits</Button>
       </div>

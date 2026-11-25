@@ -25,17 +25,23 @@ const (
 	OutcomeDeny            = string(model.OutcomeDeny)
 )
 
-// DenySummary renders a short human-readable denial reason from a decision.
-// It is used for lease.DeniedReason and is never empty for denied decisions.
+// DenySummary renders a short human-readable denial reason from a decision:
+// the details of the rules that denied, for the agent and the person to read.
+// The rule names stay in decision.Reasons. It is used for lease.DeniedReason
+// and is never empty for denied decisions.
 func DenySummary(decision model.PolicyDecision) string {
 	var parts []string
 	for _, r := range decision.Reasons {
 		if r.Outcome == OutcomeDeny {
-			parts = append(parts, r.Rule+": "+r.Detail)
+			detail := r.Detail
+			if detail == "" {
+				detail = r.Rule
+			}
+			parts = append(parts, detail)
 		}
 	}
 	if len(parts) == 0 {
 		return "denied by policy"
 	}
-	return "denied by policy (" + strings.Join(parts, "; ") + ")"
+	return strings.Join(parts, "; ")
 }

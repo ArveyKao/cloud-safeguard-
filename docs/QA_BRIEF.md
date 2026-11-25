@@ -70,7 +70,8 @@ is listed in CONTRACT §17.8; `docs/QUICKSTART.md` walks through the whole flow.
 - The removed routes (`/api/v1/admin/*`, `POST /api/v1/agent/leases`,
   `GET /api/v1/agent/capabilities`) answer 404, and the removed commands (`csg providers`,
   `agents`, `caps`, `policy`, `audit`, `request`) are unknown.
-- `csg mcp`: the five tools work, and `get_credential` never returns the secret.
+- `csg mcp`: the seven tools work (`csg mcp -h` lists them), and `get_credential` and
+  `refresh_credential` never return the secret.
 - Remote MCP (`<server>/mcp`): an MCP client connects with the URL alone, the person approves
   in the console and sees where the sign-in goes; `get_credential` returns a one-time link
   that sets the credential in a shell once, within 60 seconds. Try wrong verifiers, reused

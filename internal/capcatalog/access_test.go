@@ -187,23 +187,23 @@ func TestAccessTemplateIDsAreReserved(t *testing.T) {
 // is the point: a reviewer sees the action that was added.
 func TestAccessTemplateActionsAreExactlyAsReviewed(t *testing.T) {
 	want := map[string][]string{
-		"aliyun.access.ecs.read":  {"ecs:Describe*"},
-		"aliyun.access.ecs.write": {"ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance"},
+		"aliyun.access.ecs.read":  {"ecs:Describe*", "ecs:DescribeInstances"},
+		"aliyun.access.ecs.write": {"ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance", "ecs:DescribeInstances"},
 		"aliyun.access.ecs.full": {"ecs:Describe*", "ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance",
-			"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance"},
-		"aliyun.access.dns.read": {"alidns:Describe*"},
+			"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance", "ecs:DescribeInstances"},
+		"aliyun.access.dns.read": {"alidns:Describe*", "alidns:DescribeDomains"},
 		"aliyun.access.dns.write": {"alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
-			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus"},
+			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus", "alidns:DescribeDomains"},
 		"aliyun.access.dns.full": {"alidns:Describe*", "alidns:AddDomainRecord", "alidns:UpdateDomainRecord",
-			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus", "alidns:AddDomain", "alidns:DeleteDomain"},
-		"aliyun.access.oss.read":  {"oss:Get*", "oss:List*"},
-		"aliyun.access.oss.write": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
+			"alidns:DeleteDomainRecord", "alidns:SetDomainRecordStatus", "alidns:AddDomain", "alidns:DeleteDomain", "alidns:DescribeDomains"},
+		"aliyun.access.oss.read":  {"oss:Get*", "oss:List*", "oss:ListBuckets"},
+		"aliyun.access.oss.write": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload", "oss:ListBuckets"},
 		"aliyun.access.oss.full": {"oss:Get*", "oss:List*", "oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload",
-			"oss:PutBucket", "oss:DeleteBucket"},
-		"aws.access.s3.read":  {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts"},
-		"aws.access.s3.write": {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
+			"oss:PutBucket", "oss:DeleteBucket", "oss:ListBuckets"},
+		"aws.access.s3.read":  {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:ListAllMyBuckets"},
+		"aws.access.s3.write": {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListAllMyBuckets"},
 		"aws.access.s3.full": {"s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
-			"s3:CreateBucket", "s3:DeleteBucket"},
+			"s3:CreateBucket", "s3:DeleteBucket", "s3:ListAllMyBuckets"},
 	}
 	if len(want) != len(accessTemplates) {
 		t.Fatalf("%d templates reviewed, %d defined", len(want), len(accessTemplates))
@@ -280,6 +280,19 @@ func TestDocumentedRolePolicyMatchesTheTemplates(t *testing.T) {
 					want[action] = true
 				}
 			}
+			// A list action needs its own entry unless a wildcard read action
+			// of the same type (ecs:Describe*) already covers it.
+			for _, action := range spec.list {
+				covered := false
+				for _, r := range spec.read {
+					if strings.HasSuffix(r, "*") && strings.HasPrefix(action, strings.TrimSuffix(r, "*")) {
+						covered = true
+					}
+				}
+				if !covered {
+					want[action] = true
+				}
+			}
 		}
 		for _, file := range []string{"../../web/src/app/rolePolicy.ts", "../../docs/QUICKSTART.md"} {
 			raw, err := os.ReadFile(file)
@@ -330,6 +343,48 @@ func TestLevelCheckAcceptsOnlyDeclaredActions(t *testing.T) {
 		doc := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["` + action + `"],"Resource":["*"]}]}`
 		if err := CheckAccessTemplateLevel(tpl, []byte(doc)); err == nil {
 			t.Errorf("level check accepted %s in the s3 full template", action)
+		}
+	}
+}
+
+// The list statement of every template: exactly these read actions, on exactly
+// these resources, whatever resource the credential names. It lets a
+// credential for one resource find it; it must never grow a write action.
+func TestAccessTemplateListStatementIsExactlyAsReviewed(t *testing.T) {
+	want := map[string]string{
+		"ecs": `{"Action":["ecs:DescribeInstances"],"Effect":"Allow","Resource":["acs:ecs:*:*:instance/*"]}`,
+		"dns": `{"Action":["alidns:DescribeDomains"],"Effect":"Allow","Resource":["*"]}`,
+		"oss": `{"Action":["oss:ListBuckets"],"Effect":"Allow","Resource":["acs:oss:*:*:*"]}`,
+		"s3":  `{"Action":["s3:ListAllMyBuckets"],"Effect":"Allow","Resource":["*"]}`,
+	}
+	names := map[string]string{"ecs": "i-2ze0demo001", "dns": "example.com", "oss": "my-bucket", "s3": "claudecode"}
+	for id, tpl := range accessTemplates {
+		raw, err := RenderPolicy(tpl.Capability, map[string]string{ResourceNameParam: names[tpl.Resource]})
+		if err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		var doc struct{ Statement []json.RawMessage }
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		// Statement 0 is the resource's own, 1 the list, then the mandatory deny.
+		if len(doc.Statement) != 3 {
+			t.Fatalf("%s has %d statements, want own + list + deny", id, len(doc.Statement))
+		}
+		var list map[string]any
+		_ = json.Unmarshal(doc.Statement[1], &list)
+		got, _ := json.Marshal(list)
+		if string(got) != want[tpl.Resource] {
+			t.Errorf("%s list statement\n  %s\nreviewed\n  %s", id, got, want[tpl.Resource])
+		}
+		for _, a := range list["Action"].([]any) {
+			if classifyAction(a.(string)) != PermissionRead {
+				t.Errorf("%s list statement allows %v, which is not a read action", id, a)
+			}
+		}
+		// The resource's own statement still names only that resource.
+		if !strings.Contains(string(doc.Statement[0]), names[tpl.Resource]) || strings.Contains(string(doc.Statement[0]), `/*"`) && tpl.Resource == "ecs" {
+			t.Errorf("%s own statement no longer names the resource: %s", id, doc.Statement[0])
 		}
 	}
 }

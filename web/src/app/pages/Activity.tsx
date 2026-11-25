@@ -1,6 +1,6 @@
 import { api } from '../api'
 import type { Person } from '../types'
-import { Badge, Card, Empty, ErrorNote, PageHead, ago, permissionTone, useLoad } from '../ui'
+import { Badge, Card, Empty, ErrorNote, PageHead, ago, permissionTone, useLoad, Pending } from '../ui'
 import { statusText } from './Inbox'
 
 export function ActivityPage({ person }: { person: Person }) {
@@ -15,7 +15,7 @@ function MyHistory() {
       <PageHead title="Activity" lead="Everything your agents asked for, newest first." />
       <ErrorNote error={requests.error} />
       <Card>
-        {items.length === 0 ? <Empty>No requests yet.</Empty> : (
+        {!requests.ready ? <Pending error={requests.error} /> : items.length === 0 ? <Empty>No requests yet.</Empty> : (
           <table className="table">
             <thead><tr><th>When</th><th>Agent</th><th>Access</th><th>Account</th><th>Outcome</th></tr></thead>
             <tbody>
@@ -45,12 +45,13 @@ function AuditLog() {
   return (
     <>
       <PageHead title="Activity" lead="The tamper-evident audit log of the whole platform, newest first."
-        actions={verify.data && (verify.data.ok
+        actions={verify.data ? (verify.data.ok
           ? <Badge tone="green">chain verified · {verify.data.events} events</Badge>
-          : <Badge tone="red">chain broken: {verify.data.message}</Badge>)} />
-      <ErrorNote error={audit.error} />
+          : <Badge tone="red">chain broken: {verify.data.message}</Badge>)
+          : verify.error ? <Badge tone="red">chain not verified</Badge> : null} />
+      <ErrorNote error={audit.error ?? verify.error} />
       <Card>
-        {items.length === 0 ? <Empty>No events yet.</Empty> : (
+        {!audit.ready ? <Pending error={audit.error} /> : items.length === 0 ? <Empty>No events yet.</Empty> : (
           <table className="table">
             <thead><tr><th>When</th><th>Who</th><th>What</th><th>On</th><th /></tr></thead>
             <tbody>

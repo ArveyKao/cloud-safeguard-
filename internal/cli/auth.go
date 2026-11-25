@@ -72,7 +72,7 @@ Shows the identity behind the configured token.
 	}
 	fmt.Fprintf(a.Stdout, "agent:         %s (%s)\n", me.Agent.Name, me.Agent.ID)
 	fmt.Fprintf(a.Stdout, "status:        %s\n", me.Agent.Status)
-	fmt.Fprintf(a.Stdout, "active leases: %d\n", me.ActiveLeases)
+	fmt.Fprintf(a.Stdout, "active requests: %d\n", me.ActiveLeases)
 	fmt.Fprintf(a.Stdout, "server:        %s\n", client.baseURL)
 	return nil
 }

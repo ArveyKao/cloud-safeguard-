@@ -836,3 +836,18 @@ func TestResetRecoversSuspendedInvitation(t *testing.T) {
 	client := env.completeSetup(reset.SetupCode)
 	requireStatus(t, client.do(http.MethodGet, "/api/v1/auth/me", nil), http.StatusOK)
 }
+
+// Finishing setup signs the person in, so the People page shows it as their
+// last sign-in instead of "never" (found in the hands-on check, 2026-11-23).
+func TestFinishingSetupIsTheFirstSignIn(t *testing.T) {
+	env := newTestEnv(t, true)
+	sup := env.supervisorClient()
+	mei := env.addPerson(sup, "mei", false)
+	got, err := env.srv.db.GetPerson(context.Background(), mei.person.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastLoginAt == nil || !got.LastLoginAt.Equal(env.clock.Now()) {
+		t.Fatalf("last sign-in after setup = %v, want %v", got.LastLoginAt, env.clock.Now())
+	}
+}

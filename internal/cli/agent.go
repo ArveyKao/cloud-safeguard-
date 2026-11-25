@@ -9,14 +9,14 @@ import (
 	"github.com/arveykao/cloud-safeguard/internal/model"
 )
 
-// pollInterval is how often `--wait` and `csg exec` poll a pending lease.
+// pollInterval is how often `--wait` and `csg exec` poll a pending request.
 const pollInterval = time.Second
 
 // runCredential implements `csg credential` (agent side).
 func (a *App) runCredential(args []string) error {
 	fs := a.newFlagSet("credential", `Usage: csg credential --lease ID [--export | --json | --process aws|aliyun]
 
-Fetches the short-lived credential for an active lease. Each fetch is audited.
+Fetches the short-lived credential for an active request. Each fetch is audited.
   --export          print export NAME='value' lines for the shell
   --process aws     print the JSON of an AWS credential_process
   --process aliyun  print the JSON of the Alibaba Cloud CLI External mode
@@ -26,7 +26,7 @@ left and the request's refresh window allows it, so an SDK that calls the
 command again before expiry keeps itself supplied.
 `)
 	cf := a.addClientFlags(fs)
-	leaseID := fs.String("lease", "", "lease ID (required)")
+	leaseID := fs.String("lease", "", "request ID (required)")
 	export := fs.Bool("export", false, "print shell export lines instead of JSON")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	process := fs.String("process", "", "aws or aliyun: print a credential process answer")
@@ -117,9 +117,10 @@ func shellSingleQuote(value string) string {
 
 // runRevoke implements `csg revoke` (agent side).
 func (a *App) runRevoke(args []string) error {
-	fs := a.newFlagSet("revoke", "Usage: csg revoke --lease ID [--reason TEXT] [--json]\n")
+	fs := a.newFlagSet("revoke", "Usage: csg revoke --lease|--request ID [--reason TEXT] [--json]\n")
 	cf := a.addClientFlags(fs)
-	leaseID := fs.String("lease", "", "lease ID (required)")
+	leaseID := fs.String("lease", "", "request ID")
+	requestID := fs.String("request", "", "request ID (alias of --lease)")
 	reason := fs.String("reason", "revoked by agent", "revocation reason")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	positionals, err := parseFlags(fs, args)
@@ -129,25 +130,42 @@ func (a *App) runRevoke(args []string) error {
 	if len(positionals) != 0 {
 		return usagef("revoke takes no positional arguments")
 	}
-	if strings.TrimSpace(*leaseID) == "" {
-		return usagef("revoke requires --lease")
+	id, err := resolveLeaseOrRequestID(*leaseID, *requestID)
+	if err != nil {
+		return err
 	}
 	client, err := a.agentClient(cf)
 	if err != nil {
 		return err
 	}
 	var lease model.Lease
-	if err := client.post(context.Background(), apiPrefix+"/agent/leases/"+pathEscape(*leaseID)+"/revoke",
+	if err := client.post(context.Background(), apiPrefix+"/agent/leases/"+pathEscape(id)+"/revoke",
 		model.RevokeLeaseInput{Reason: *reason}, &lease); err != nil {
 		return err
 	}
 	// The ID the user named, not one echoed by the server.
-	a.removeCredentialFile(strings.TrimSpace(*leaseID))
+	a.removeCredentialFile(id)
 	if *jsonOut {
 		return a.printJSON(lease)
 	}
-	fmt.Fprintf(a.Stdout, "lease %s revoked\n", lease.ID)
+	fmt.Fprintf(a.Stdout, "request %s revoked\n", lease.ID)
 	return nil
+}
+
+// resolveLeaseOrRequestID accepts --lease and/or its --request alias.
+func resolveLeaseOrRequestID(leaseFlag, requestFlag string) (string, error) {
+	leaseFlag = strings.TrimSpace(leaseFlag)
+	requestFlag = strings.TrimSpace(requestFlag)
+	switch {
+	case leaseFlag == "" && requestFlag == "":
+		return "", usagef("revoke requires --lease or --request")
+	case leaseFlag != "" && requestFlag != "" && leaseFlag != requestFlag:
+		return "", usagef("--lease and --request disagree")
+	case leaseFlag != "":
+		return leaseFlag, nil
+	default:
+		return requestFlag, nil
+	}
 }
 
 // runExec implements `csg exec`: request -> wait -> fetch credential -> run the

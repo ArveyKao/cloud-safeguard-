@@ -1114,6 +1114,16 @@ func (s *Server) revalidateLeasesAs(ctx context.Context, filter store.LeaseFilte
 // revokeLeaseWithCause revokes a lease on behalf of the control plane and
 // records what triggered it.
 func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, reason string, cause map[string]any) (model.Lease, error) {
+	return s.revokeLeaseRecorded(ctx, lease, reason, cause, false)
+}
+
+// revokeLeaseByPerson revokes a lease that the signed-in person ended
+// directly: the event names that person as the actor, not the control plane.
+func (s *Server) revokeLeaseByPerson(ctx context.Context, lease model.Lease, reason string, cause map[string]any) (model.Lease, error) {
+	return s.revokeLeaseRecorded(ctx, lease, reason, cause, true)
+}
+
+func (s *Server) revokeLeaseRecorded(ctx context.Context, lease model.Lease, reason string, cause map[string]any, byPerson bool) (model.Lease, error) {
 	updated, previousStatus, err := s.markLeaseRevoked(ctx, lease, reason)
 	if err != nil {
 		return model.Lease{}, err
@@ -1125,6 +1135,11 @@ func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, re
 	})
 	for k, v := range cause {
 		metadata[k] = v
+	}
+	if sc, ok := sessionFromContext(ctx); byPerson && ok {
+		metadata["actor"] = "person:" + sc.person.ID
+		s.personAudit(ctx, sc.person, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
+		return updated, nil
 	}
 	s.systemAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
 	return updated, nil

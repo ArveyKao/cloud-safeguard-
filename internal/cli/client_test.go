@@ -115,7 +115,7 @@ func TestWhoami(t *testing.T) {
 	if code := ta.run("whoami"); code != ExitOK {
 		t.Fatalf("whoami exit = %d, stderr = %s", code, ta.errOut())
 	}
-	for _, want := range []string{"claude-code (agt_demo1)", "active leases: 2", srv.URL} {
+	for _, want := range []string{"claude-code (agt_demo1)", "active requests: 2", srv.URL} {
 		if !strings.Contains(ta.out(), want) {
 			t.Fatalf("whoami output %q has no %q", ta.out(), want)
 		}

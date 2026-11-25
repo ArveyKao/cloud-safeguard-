@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { api } from '../api'
 import type { AgentSignIn } from '../types'
 import { navigate } from '../router'
-import { Button, Card, ErrorNote, PageHead, ago, roleLabel, useAction, useLoad } from '../ui'
+import { Button, Card, ErrorNote, PageHead, ago, roleLabel, useAction, useLoad, Pending } from '../ui'
 
 /** An agent asks to sign in as the person's agent (the link csg login prints). */
 export function SignInApprovalPage({ code }: { code: string }) {
@@ -55,7 +55,8 @@ export function SignInApprovalPage({ code }: { code: string }) {
           <div><dt>Started from</dt><dd className="mono">{s.remote_addr}</dd></div>
         </dl>
         <h3>It will inherit your role on each cloud account</h3>
-        {(accounts.data?.items ?? []).length === 0
+        <ErrorNote error={accounts.error ?? agents.error} />
+        {!accounts.ready ? <Pending error={accounts.error} /> : accounts.data!.items.length === 0
           ? <p className="muted">You have no role on any cloud account yet, so it cannot get access until a supervisor gives you one.</p>
           : (
             <table className="table compact">
@@ -66,7 +67,7 @@ export function SignInApprovalPage({ code }: { code: string }) {
               </tbody>
             </table>
           )}
-        <p className="muted small">What is issued without asking you is set by your approval mode in Settings.</p>
+        <p className="muted small">What is issued without asking you is set by your approval mode, per account, on the Cloud accounts page.</p>
         {(agents.data?.items ?? []).some((a) => a.name === s.agent_name && a.status !== 'revoked') && (
           <p className="note note-info">You already have an agent named <b>{s.agent_name}</b>. Approving replaces it: the old one stops working and its credentials are revoked.</p>
         )}
