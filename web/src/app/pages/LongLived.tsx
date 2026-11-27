@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { api } from '../api'
 import type { LongLivedCredential, LongLivedSecret, Person, PersonAccount, Provider } from '../types'
 import { navigate } from '../router'
-import { Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, ago, useAction, useConfirm, useLoad, useToast, when } from '../ui'
+import { Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, ago, useAction, useConfirm, useLoad, useToast, when, Pending } from '../ui'
 import { AWS_BOUNDARY_POLICY_NAME, awsBoundaryPolicy, awsUserAdminPolicy, userAdminPolicy } from '../rolePolicy'
 
 // Long-lived credentials (CONTRACT §17.14): cloud users with access keys that
@@ -114,7 +114,7 @@ export function LongLivedCard({ person, accounts }: { person: Person; accounts: 
     <Card title="Long-lived keys">
       <p className="muted">Cloud users with access keys that do not expire, for things like a CDN origin or a bucket sync. Revoking deletes the key, its policy and the user in the cloud.</p>
       <ErrorNote error={list.error} />
-      {items.length === 0 ? <Empty>None.</Empty> : (
+      {!list.ready ? <Pending error={list.error} /> : items.length === 0 ? <Empty>None.</Empty> : (
         <table className="table compact">
           <thead><tr><th>Account</th><th>Access</th><th>Cloud user</th>{person.supervisor && <th>Owner</th>}<th>Created</th><th>Status</th><th /></tr></thead>
           <tbody>
@@ -149,6 +149,8 @@ export function LongLivedCard({ person, accounts }: { person: Person; accounts: 
 }
 
 const RESOURCES: Record<string, string[]> = { aliyun: ['ecs', 'dns', 'oss'], aws: ['s3'] }
+const RESOURCE_LABEL: Record<string, string> = { ecs: 'ECS instances', dns: 'DNS domains', oss: 'OSS buckets', s3: 'S3 buckets' }
+const PERMISSION_LABEL: Record<string, string> = { read: 'read', write: 'write: change existing', full: 'full: also create and delete' }
 
 function AskDialog({ accounts, onClose }: { accounts: PersonAccount[]; onClose: () => void }) {
   const [account, setAccount] = useState(accounts[0]?.cloud_account_id ?? '')
@@ -167,11 +169,11 @@ function AskDialog({ accounts, onClose }: { accounts: PersonAccount[]; onClose: 
         </select>
       </label>
       <label className="field"><span>Resource type</span>
-        <select value={resource} onChange={(e) => setResource(e.target.value)}>{resources.map((r) => <option key={r} value={r}>{r}</option>)}</select>
+        <select value={resource} onChange={(e) => setResource(e.target.value)}>{resources.map((r) => <option key={r} value={r}>{RESOURCE_LABEL[r] ?? r}</option>)}</select>
       </label>
       <label className="field"><span>Permission</span>
         <select value={permission} onChange={(e) => setPermission(e.target.value)}>
-          {['read', 'write', 'full'].map((p) => <option key={p} value={p}>{p}</option>)}
+          {['read', 'write', 'full'].map((p) => <option key={p} value={p}>{PERMISSION_LABEL[p]}</option>)}
         </select>
       </label>
       <Field label="Resource name" value={name} onChange={setName} hint="One bucket, instance or domain. Leave empty for all of that type." />

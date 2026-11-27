@@ -59,7 +59,7 @@ export const AWS_ROLE_ACTIONS = [
   's3:GetObject', 's3:GetObjectVersion', 's3:GetBucketLocation', 's3:ListBucket', 's3:ListBucketVersions',
   's3:ListBucketMultipartUploads', 's3:ListMultipartUploadParts',
   's3:PutObject', 's3:DeleteObject', 's3:AbortMultipartUpload',
-  's3:CreateBucket', 's3:DeleteBucket',
+  's3:CreateBucket', 's3:DeleteBucket', 's3:ListAllMyBuckets',
   'sts:GetCallerIdentity',
 ]
 

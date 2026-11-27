@@ -3,9 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { api, setCsrf } from './api'
-import { ToastProvider } from './ui'
+import { ToastProvider, duration } from './ui'
 import { InboxPage } from './pages/Inbox'
 import { PeoplePage } from './pages/People'
+import { SettingsPage } from './pages/Settings'
 import { AccountsPage } from './pages/Accounts'
 import { AddAccountPage } from './pages/AddAccount'
 import { LongLivedConfirmPage } from './pages/LongLived'
@@ -317,3 +318,80 @@ describe('agent sign-in', () => {
 
 // keep `act` imported for React's act environment in older setups
 void act
+
+describe('loading and failed loads', () => {
+  it('shows Loading, never an empty state, until the data arrives', async () => {
+    let release: (v: unknown) => void = () => {}
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((resolve) => { release = resolve })))
+    wrap(<InboxPage person={{ ...person, supervisor: false }} onChange={() => {}} />)
+    await screen.findAllByText('Loading…')
+    expect(screen.queryByText(/Nothing waits for you/)).toBeNull()
+    release(respond(200, { data: { items: [], total: 0 } }))
+  })
+
+  it('shows the error, not an empty state, when a load fails', async () => {
+    routes['GET /me/requests'] = () => ({ status: 500, body: { error: { code: 'internal', message: 'database is locked' } } })
+    routes['GET /me/accounts'] = () => ({ status: 500, body: { error: { code: 'internal', message: 'database is locked' } } })
+    wrap(<InboxPage person={{ ...person, supervisor: false }} onChange={() => {}} />)
+    await screen.findAllByText(/database is locked/)
+    expect(screen.queryByText(/Nothing waits for you/)).toBeNull()
+    expect(screen.queryByText('Loading…')).toBeNull()
+    cleanup()
+    wrap(<AccountsPage person={{ ...person, supervisor: false }} />)
+    await screen.findAllByText(/database is locked/)
+    expect(screen.queryByText(/no role on any cloud account/)).toBeNull()
+  })
+})
+
+describe('hands-on findings, 2026-11-23', () => {
+  const provider = { id: 'prv_1', name: 'demo', type: 'aliyun', mode: 'mock', region: 'cn-hangzhou', cloud_account_id: '1', status: 'active' }
+  const jun = { ...person, id: 'per_2', username: 'jun', display_name: 'Jun', supervisor: false }
+
+  it('warns about revoking only when a role is lowered', async () => {
+    routes['GET /me/accounts'] = { items: [], total: 0 }
+    routes['GET /me/long-lived'] = { items: [], total: 0 }
+    routes['GET /supervisor/long-lived'] = { items: [], total: 0 }
+    routes['GET /supervisor/accounts'] = { items: [provider], total: 1 }
+    routes['GET /supervisor/people'] = { items: [person, jun], total: 2 }
+    routes['GET /supervisor/bindings'] = { items: [{ person_id: 'per_2', provider_id: 'prv_1', role: 'guest' }], total: 1 }
+    wrap(<AccountsPage person={person} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage' }))
+    const select = await screen.findByDisplayValue('Guest · read only')
+    fireEvent.change(select, { target: { value: 'member' } })
+    await screen.findByText(/Make Jun member/)
+    expect(screen.queryByText(/revoked at once/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    // A supervisor is Administrator everywhere and is not offered a role.
+    expect(screen.queryByRole('option', { name: 'Mei' })).toBeNull()
+  })
+
+  it('does not offer to remove, reset or suspend the last supervisor', async () => {
+    routes['GET /supervisor/people'] = { items: [person, jun], total: 2 }
+    wrap(<PeoplePage me={person} />)
+    await screen.findByText('Jun')
+    expect(screen.getByText(/last supervisor/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Remove supervisor' })).toBeNull()
+    expect(screen.getAllByRole('button', { name: 'Reset' }).length).toBe(1) // Jun's only
+  })
+
+  it('names a refused limit by its label', async () => {
+    routes['GET /me/cli-sessions'] = { items: [], total: 0 }
+    routes['GET /supervisor/settings'] = {
+      max_lease_ttl_seconds: 3600, pending_timeout_seconds: 600, max_concurrent_leases_per_agent: 3,
+      leases_per_minute_per_agent: 6, max_refresh_lifetime_seconds: 86400,
+    }
+    routes['PUT /supervisor/settings'] = () => ({ status: 400, body: { error: { code: 'bad_request', message: 'max_concurrent_leases_per_agent must be positive' } } })
+    wrap(<SettingsPage person={person} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Save limits' }))
+    await screen.findByText('"Open requests and credentials per agent" must be positive')
+    expect(screen.getByText(/seconds · 1 h/)).toBeTruthy()
+  })
+})
+
+describe('duration', () => {
+  it('says day, not days, for one day', () => {
+    expect(duration(86400)).toBe('1 day')
+    expect(duration(2 * 86400)).toBe('2 days')
+    expect(duration(3600)).toBe('1 h')
+  })
+})

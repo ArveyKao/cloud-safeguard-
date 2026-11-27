@@ -14,6 +14,10 @@ export function PeoplePage({ me }: { me: Person }) {
   const ask = (title: string, body: string, confirmLabel: string, fn: () => Promise<unknown>, danger = true) =>
     confirm({ title, body, confirmLabel, danger, run: async () => { await fn(); people.reload() } })
   const label = (p: Person) => p.display_name || p.username
+  // The server refuses to suspend, reset or demote the last active supervisor;
+  // say so instead of offering buttons that can only fail.
+  const activeSupervisors = (people.data?.items ?? []).filter((x) => x.supervisor && x.status === 'active').length
+  const isLastSupervisor = (p: Person) => p.supervisor && p.status === 'active' && activeSupervisors <= 1
 
   return (
     <>
@@ -27,7 +31,7 @@ export function PeoplePage({ me }: { me: Person }) {
             {(people.data?.items ?? []).map((p) => (
               <tr key={p.id}>
                 <td>
-                  <b>{p.display_name || p.username}</b> <span className="muted small">{p.username}</span>
+                  <b>{p.display_name || p.username}</b>{p.display_name && p.display_name !== p.username && <> <span className="muted small">{p.username}</span></>}
                   {p.supervisor && <> <Badge tone="blue">supervisor</Badge></>}
                   {!p.supervisor && p.long_lived && <> <Badge tone="amber">long-lived keys</Badge></>}
                 </td>
@@ -35,6 +39,7 @@ export function PeoplePage({ me }: { me: Person }) {
                 <td className="muted">{ago(p.last_login_at)}</td>
                 <td className="muted small">{p.setup_issued ? `code from ${p.setup_issued.by_name}, ${when(p.setup_issued.at)}` : '—'}</td>
                 <td className="right nowrap">
+                  {isLastSupervisor(p) ? <span className="muted small" title="Make another person a supervisor first.">last supervisor: cannot be suspended, reset or removed</span> : <>
                   {p.id !== me.id && p.status !== 'suspended' && <Button kind="link" onClick={() => ask(`Suspend ${label(p)}?`,
                     `They are signed out at once and cannot sign in. Their agents stop working and every credential they hold is revoked. ${STILL_VALID}`,
                     'Suspend', async () => { await api.updatePerson(p.id, { status: 'suspended' }); toast(`${p.username} suspended`) })}>Suspend</Button>}
@@ -52,6 +57,7 @@ export function PeoplePage({ me }: { me: Person }) {
                     async () => { await api.updatePerson(p.id, { supervisor: !p.supervisor }); toast(p.supervisor ? 'Supervisor removed' : 'Now a supervisor') }, !p.supervisor)}>
                     {p.supervisor ? 'Remove supervisor' : 'Make supervisor'}
                   </Button>
+                  </>}
                   {!p.supervisor && <Button kind="link" onClick={() => ask(p.long_lived ? `Stop ${label(p)} from holding long-lived keys?` : `Allow ${label(p)} to create long-lived keys?`,
                     p.long_lived
                       ? 'Every long-lived key they created is deleted in the cloud at once, and they cannot create new ones.'
@@ -73,6 +79,7 @@ export function PeoplePage({ me }: { me: Person }) {
           <p>Give this code to {issued.person.display_name || issued.person.username} in person or through a channel only they read. They open this console, choose <b>Set up your account</b>, pick a password and add an authenticator app.</p>
           <Secret label="Setup code" value={issued.setup_code} />
           <p className="muted small">Shown once. Valid until {when(issued.setup_expires_at)}. Whoever uses it first sets the password, and the record shows you issued it.</p>
+          {!issued.person.supervisor && <p className="muted small">Next, give them a role on the cloud accounts they need, in <b>Cloud accounts → Manage</b>. Without one their agents can get nothing.</p>}
           <div className="row-actions"><Button kind="primary" onClick={() => setIssued(null)}>I have given it to them</Button></div>
         </Modal>
       )}

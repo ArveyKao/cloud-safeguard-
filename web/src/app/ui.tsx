@@ -73,6 +73,16 @@ export function Empty({ children }: { children: ReactNode }) {
   return <p className="empty">{children}</p>
 }
 
+/** Shown instead of an empty state until the first load has answered. */
+export function Loading() {
+  return <p className="empty muted" aria-busy="true">Loading…</p>
+}
+
+/** Before data arrives: "Loading…", or nothing when the load failed. */
+export function Pending({ error }: { error: unknown }) {
+  return error ? null : <Loading />
+}
+
 /** Loads data and reloads it on demand or every `everyMs`. */
 export function useLoad<T>(load: () => Promise<T>, deps: unknown[] = [], everyMs = 0) {
   const [data, setData] = useState<T | null>(null)
@@ -94,7 +104,11 @@ export function useLoad<T>(load: () => Promise<T>, deps: unknown[] = [], everyMs
     return () => window.clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps)
-  return { data, error, reload }
+  // ready is true once data has arrived. Before that a page shows <Pending>:
+  // "Loading…", or nothing once the load failed (its ErrorNote says why), never
+  // an empty state, which would claim something the page does not know.
+  // Use it only with loaders that resolve to an object, never to null.
+  return { data, error, reload, ready: data !== null }
 }
 
 /** Runs an action, tracking busy and error state. */
@@ -225,7 +239,8 @@ export function duration(seconds: number): string {
   if (seconds < 60) return `${seconds} s`
   if (seconds < 3600) return `${Math.round(seconds / 60)} min`
   if (seconds < 86400) return `${Math.round(seconds / 3600)} h`
-  return `${Math.round(seconds / 86400)} days`
+  const days = Math.round(seconds / 86400)
+  return days === 1 ? '1 day' : `${days} days`
 }
 
 export function when(iso?: string): string {

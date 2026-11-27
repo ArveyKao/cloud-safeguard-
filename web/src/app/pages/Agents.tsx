@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { Agent } from '../types'
-import { Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, STILL_VALID, ago, useAction, useLoad, useToast } from '../ui'
+import { Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, STILL_VALID, ago, useAction, useLoad, useToast, Pending } from '../ui'
 
 export function AgentsPage() {
   const agents = useLoad(() => api.myAgents(), [], 15000)
@@ -29,7 +29,7 @@ export function AgentsPage() {
                 Nothing to install on that machine.
               </li>
               <li>The app opens this console in your browser. Check where the sign-in goes, name the agent and approve.
-                The agent gets list_accounts, request_access, check_status, get_credential and revoke; get_credential hands the secret to a shell through a one-time link, never to the model.
+                The agent gets list_accounts, request_access, check_status, get_credential, refresh_credential, request_long_lived_credential and revoke; get_credential hands the secret to a shell through a one-time link, never to the model.
               </li>
             </ol>
           ) : (
@@ -41,7 +41,7 @@ export function AgentsPage() {
             {tab === 'mcp' ? (
               <li>Add Cloud Safeguard to the agent's MCP servers:
                 <pre>{`"cloud-safeguard": { "command": "csg", "args": ["mcp"] }`}</pre>
-                The agent gets list_accounts, request_access, check_status, get_credential and revoke.
+                The agent gets list_accounts, request_access, check_status, get_credential, refresh_credential, request_long_lived_credential and revoke.
               </li>
             ) : (
               <li>Run a cloud command with short-lived access:
@@ -54,7 +54,7 @@ export function AgentsPage() {
       )}
       <ErrorNote error={agents.error} />
       <Card>
-        {list.length === 0 ? <Empty>No agents yet.</Empty> : (
+        {!agents.ready ? <Pending error={agents.error} /> : list.length === 0 ? <Empty>No agents yet.</Empty> : (
           <table className="table">
             <thead><tr><th>Agent</th><th>Status</th><th>Last active</th><th>Signed in</th><th /></tr></thead>
             <tbody>

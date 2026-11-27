@@ -3,9 +3,7 @@ import { api } from '../api'
 import type { ApprovalMode, Person, PersonAccount, Provider, Role } from '../types'
 import { navigate } from '../router'
 import { LongLivedCard, UserAdminSection } from './LongLived'
-import {
-  Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, STILL_VALID, ago, roleHint, roleLabel, useAction, useConfirm, useLoad, useToast, when,
-} from '../ui'
+import { Badge, Button, Card, Empty, ErrorNote, Field, Modal, PageHead, STILL_VALID, ago, roleHint, roleLabel, useAction, useConfirm, useLoad, useToast, when, Loading, Pending } from '../ui'
 
 const MODES: { value: ApprovalMode; title: string; text: string }[] = [
   { value: 'read', title: 'Read mode', text: 'Reading is automatic. Every change asks you.' },
@@ -34,7 +32,7 @@ export function AccountsPage({ person }: { person: Person }) {
         actions={person.supervisor && <Button kind="primary" onClick={() => navigate('/accounts/new')}>+ Add cloud account</Button>} />
       <ErrorNote error={mine.error} />
       <Card title="Your roles">
-        {(mine.data?.items ?? []).length === 0 ? <Empty>You have no role on any cloud account yet. A supervisor gives you one.</Empty> : (
+        {!mine.ready ? <Pending error={mine.error} /> : (mine.data?.items ?? []).length === 0 ? <Empty>You have no role on any cloud account yet. A supervisor gives you one.</Empty> : (
           <table className="table">
             <thead><tr><th>Account</th><th>Your role</th><th>Your approval mode</th><th>Your agents get without asking</th><th>Status</th></tr></thead>
             <tbody>
@@ -147,7 +145,7 @@ function ManageAccounts({ onChange }: { onChange: () => void }) {
     <>
       <h2 className="section-title">All cloud accounts</h2>
       <ErrorNote error={accounts.error} />
-      {list.length === 0 && <Card><Empty>No cloud accounts yet.</Empty></Card>}
+      {!accounts.ready ? (accounts.error ? null : <Card><Loading /></Card>) : list.length === 0 && <Card><Empty>No cloud accounts yet.</Empty></Card>}
       {list.map((p) => (
         <AccountCard key={p.id} account={p} people={people.data?.items ?? []} open={open === p.id}
           onToggle={() => setOpen(open === p.id ? null : p.id)} onChange={() => { accounts.reload(); onChange() }} />
@@ -168,7 +166,8 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
   const byId = new Map(people.map((p) => [p.id, p]))
   const nameOf = (id: string) => { const p = byId.get(id); return p ? (p.display_name || p.username) : id }
   const bound = bindings.data?.items ?? []
-  const unbound = people.filter((p) => p.status !== 'suspended' && !bound.some((b) => b.person_id === p.id))
+  // Supervisors are Administrator on every account already (CONTRACT §17.1).
+  const unbound = people.filter((p) => p.status !== 'suspended' && !p.supervisor && !bound.some((b) => b.person_id === p.id))
 
   const run = (fn: () => Promise<unknown>, done: string) => action.run(async () => {
     await fn(); toast(done); bindings.reload(); onChange()
@@ -176,12 +175,17 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
   // Asks first, then runs; the toast and reload follow a confirmed change.
   const ask = (title: string, body: string, confirmLabel: string, fn: () => Promise<unknown>, done: string, danger = false) =>
     confirm({ title, body, confirmLabel, danger, run: async () => { await fn(); toast(done); bindings.reload(); onChange() } })
-  const changeRole = (personId: string, from: Role, to: Role) => ask(
-    `Make ${nameOf(personId)} ${roleLabel[to].toLowerCase()} on ${account.name}?`,
-    to === 'administrator'
-      ? `Their agents will be able to ask for full access here, including creating and deleting resources.`
-      : `Their agents get at most ${roleHint[to]} here. Credentials beyond that are revoked at once. ${STILL_VALID}`,
-    'Change role', () => api.putBinding(account.id, personId, to), 'Role changed', to !== 'administrator' && from !== to && roleRank(to) < roleRank(from))
+  const changeRole = (personId: string, from: Role, to: Role) => {
+    const lowering = roleRank(to) < roleRank(from)
+    return ask(
+      `Make ${nameOf(personId)} ${roleLabel[to].toLowerCase()} on ${account.name}?`,
+      lowering
+        ? `Their agents get at most ${roleHint[to]} here. Credentials beyond that are revoked at once. ${STILL_VALID}`
+        : to === 'administrator'
+          ? `Their agents will be able to ask for full access here, including creating and deleting resources.`
+          : `Their agents will be able to ask for ${roleHint[to]} here. What is issued without asking still follows their approval mode.`,
+      'Change role', () => api.putBinding(account.id, personId, to), 'Role changed', lowering)
+  }
 
   return (
     <Card>
@@ -201,7 +205,7 @@ function AccountCard({ account, people, open, onToggle, onChange }: {
         <div className="account-body">
           <ErrorNote error={action.error ?? bindings.error} />
           <h3>People and roles</h3>
-          {bound.length === 0 ? <p className="muted">Nobody has a role here yet.</p> : (
+          {bindings.data === null ? <Pending error={bindings.error} /> : bound.length === 0 ? <p className="muted">Nobody has a role here yet.</p> : (
             <table className="table compact">
               <tbody>
                 {bound.map((b) => {

@@ -344,7 +344,9 @@ func (s *Server) stepUp(w http.ResponseWriter, r *http.Request) bool {
 		s.personAudit(ctx, sc.person, "auth.step_up_failed", "denied", "warning", "session", sc.session.ID, map[string]any{
 			"reason": reason, "method": r.Method, "path": logPath(r.URL.Path),
 		})
-		s.writeError(w, http.StatusForbidden, model.ErrCodeAuthenticatorCodeInvalid, "the authenticator code was not accepted")
+		// One message for a wrong and a reused code, so neither is revealed.
+		s.writeError(w, http.StatusForbidden, model.ErrCodeAuthenticatorCodeInvalid,
+			"the authenticator code was not accepted: a code works only once, so wait for the next one and try again")
 		return false
 	}
 	unlock, err := s.lockPerson(ctx, sc.person.ID)

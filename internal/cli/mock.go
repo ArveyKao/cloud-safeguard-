@@ -73,7 +73,7 @@ Prints the response body; exits 1 on HTTP >= 400.
 		}
 	}
 	if mockToken == "" {
-		return usagef("ALIBABA_CLOUD_SECURITY_TOKEN or AWS_SESSION_TOKEN is not set: fetch a lease credential first (csg credential --lease ID --export)")
+		return usagef("ALIBABA_CLOUD_SECURITY_TOKEN or AWS_SESSION_TOKEN is not set: fetch a credential first (csg credential --lease ID --export)")
 	}
 
 	if !strings.HasPrefix(requestPath, "/") {

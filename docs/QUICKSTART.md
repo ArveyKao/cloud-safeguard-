@@ -186,8 +186,9 @@ revocation and mock cloud call, with who caused it, and whether the hash chain v
 
 ## 1.12 Use it from Claude, Cursor or another agent (MCP)
 
-The agent's tools are `list_accounts`, `request_access`, `check_status`, `get_credential` and
-`revoke`, over either of two connections.
+The agent's tools are `list_accounts`, `request_access`, `check_status`, `get_credential`,
+`refresh_credential`, `request_long_lived_credential` and `revoke`, over either of two
+connections. None of them ever returns a secret to the model.
 
 **By URL (nothing to install where the agent runs).** Add a remote MCP server with the URL
 `<server>/mcp`, for example in Claude Code:
@@ -478,7 +479,7 @@ these with your 12-digit account ID filled in.
         "s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions",
         "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts",
         "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
-        "s3:CreateBucket", "s3:DeleteBucket",
+        "s3:CreateBucket", "s3:DeleteBucket", "s3:ListAllMyBuckets",
         "sts:GetCallerIdentity"
       ],
       "Resource": "*"

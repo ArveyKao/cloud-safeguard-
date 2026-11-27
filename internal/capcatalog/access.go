@@ -107,6 +107,15 @@ type resourceSpec struct {
 	// full are the additional actions of the full level: creating and
 	// deleting the resource itself.
 	full []string
+	// list are the read-level actions that list the resources of this type,
+	// and listResources the policy Resource entries they need. Listing works
+	// on the whole type, not on one resource, so a credential for one named
+	// resource gets them in a statement of their own: it can find its
+	// resource, and sees the others' names and settings, which a read
+	// request on "*" (issued at once to any guest) shows anyway. It can
+	// change nothing beyond its resource.
+	list          []string
+	listResources []string
 }
 
 var resourceSpecs = []resourceSpec{
@@ -123,8 +132,10 @@ var resourceSpecs = []resourceSpec{
 		// instance's login password, which with a reboot gives a shell on
 		// the instance and so the credentials of any RAM role attached to
 		// it. That would be a way around the IAM prohibition.
-		write: []string{"ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance"},
-		full:  []string{"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance"},
+		write:         []string{"ecs:StartInstance", "ecs:StopInstance", "ecs:RebootInstance"},
+		full:          []string{"ecs:RunInstances", "ecs:CreateInstance", "ecs:DeleteInstance"},
+		list:          []string{"ecs:DescribeInstances"},
+		listResources: []string{"acs:ecs:*:*:instance/*"},
 	},
 	{
 		provider:    model.ProviderAliyun,
@@ -139,19 +150,23 @@ var resourceSpecs = []resourceSpec{
 			"alidns:AddDomainRecord", "alidns:UpdateDomainRecord", "alidns:DeleteDomainRecord",
 			"alidns:SetDomainRecordStatus",
 		},
-		full: []string{"alidns:AddDomain", "alidns:DeleteDomain"},
+		full:          []string{"alidns:AddDomain", "alidns:DeleteDomain"},
+		list:          []string{"alidns:DescribeDomains"},
+		listResources: []string{"*"},
 	},
 	{
-		provider:    model.ProviderAliyun,
-		resource:    "oss",
-		title:       "OSS buckets",
-		service:     "oss",
-		resources:   []string{"acs:oss:*:*:{{resource_name}}", "acs:oss:*:*:{{resource_name}}/*"},
-		namePattern: `^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`,
-		nameHint:    "a bucket name",
-		read:        []string{"oss:Get*", "oss:List*"},
-		write:       []string{"oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
-		full:        []string{"oss:PutBucket", "oss:DeleteBucket"},
+		provider:      model.ProviderAliyun,
+		resource:      "oss",
+		title:         "OSS buckets",
+		service:       "oss",
+		resources:     []string{"acs:oss:*:*:{{resource_name}}", "acs:oss:*:*:{{resource_name}}/*"},
+		namePattern:   `^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`,
+		nameHint:      "a bucket name",
+		read:          []string{"oss:Get*", "oss:List*"},
+		write:         []string{"oss:PutObject", "oss:DeleteObject", "oss:AbortMultipartUpload"},
+		full:          []string{"oss:PutBucket", "oss:DeleteBucket"},
+		list:          []string{"oss:ListBuckets"},
+		listResources: []string{"acs:oss:*:*:*"},
 	},
 	{
 		provider: model.ProviderAWS,
@@ -170,6 +185,9 @@ var resourceSpecs = []resourceSpec{
 			"s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts"},
 		write: []string{"s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
 		full:  []string{"s3:CreateBucket", "s3:DeleteBucket"},
+		// Bucket names only; AWS accepts no narrower Resource for it.
+		list:          []string{"s3:ListAllMyBuckets"},
+		listResources: []string{"*"},
 	},
 }
 
@@ -245,11 +263,17 @@ func buildAccessTemplates() map[string]AccessTemplate {
 			if p.Rank() >= PermissionFull.Rank() {
 				actions = append(actions, spec.full...)
 			}
+			statements := []any{map[string]any{
+				"Effect": "Allow", "Action": actions, "Resource": spec.resources,
+			}}
+			if len(spec.list) > 0 {
+				statements = append(statements, map[string]any{
+					"Effect": "Allow", "Action": spec.list, "Resource": spec.listResources,
+				})
+			}
 			doc := map[string]any{
-				"Version": policyVersion(spec.provider),
-				"Statement": []any{map[string]any{
-					"Effect": "Allow", "Action": actions, "Resource": spec.resources,
-				}},
+				"Version":   policyVersion(spec.provider),
+				"Statement": statements,
 			}
 			raw, err := json.Marshal(doc)
 			if err != nil {
@@ -343,7 +367,7 @@ func CheckAccessTemplateLevel(t AccessTemplate, policy []byte) error {
 	for _, spec := range resourceSpecs {
 		if accessTemplateID(spec.provider, spec.resource, t.Permission) == t.Capability.ID {
 			service = spec.service
-			for _, list := range [][]string{spec.read, spec.write, spec.full} {
+			for _, list := range [][]string{spec.read, spec.write, spec.full, spec.list} {
 				for _, action := range list {
 					declared[action] = true
 				}

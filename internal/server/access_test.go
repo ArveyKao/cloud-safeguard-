@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -221,9 +222,10 @@ func TestWriteAndFullWaitForTheOwner(t *testing.T) {
 			}
 			policy := string(a.minter.lastRequest(t).PolicyJSON)
 			if !strings.Contains(policy, `"`+tc.action+`"`) || !strings.Contains(policy, "instance/i-2ze0demo001") ||
-				strings.Contains(policy, "instance/*") || !strings.Contains(policy, `"ram:*"`) {
+				!strings.Contains(policy, `"ram:*"`) {
 				t.Fatalf("policy = %s", policy)
 			}
+			requireOnlyListingBeyond(t, policy, "acs:ecs:*:*:instance/i-2ze0demo001")
 			if tc.permission == "write" && strings.Contains(policy, "DeleteInstance") {
 				t.Fatalf("write policy allows deleting: %s", policy)
 			}
@@ -708,5 +710,35 @@ func TestRevocationAttributionAndSupervisorLimits(t *testing.T) {
 	requireStatus(t, a.approve(a.mei, pending.ID), http.StatusConflict)
 	if a.status(pending.ID) != model.LeaseDenied || a.minter.requestCount() != 1 {
 		t.Fatal("a request a supervisor stopped was issued")
+	}
+}
+
+// requireOnlyListingBeyond checks a one-resource policy: every Allow
+// statement that reaches beyond the named resource holds nothing but the
+// single list action (ecs:DescribeInstances); every other action is on that
+// resource only.
+func requireOnlyListingBeyond(t *testing.T, policy, resource string) {
+	t.Helper()
+	var doc struct {
+		Statement []struct {
+			Effect   string
+			Action   []string
+			Resource any
+		}
+	}
+	if err := json.Unmarshal([]byte(policy), &doc); err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+	for _, st := range doc.Statement {
+		if st.Effect != "Allow" {
+			continue
+		}
+		res, _ := json.Marshal(st.Resource)
+		if string(res) == `["`+resource+`"]` {
+			continue
+		}
+		if len(st.Action) != 1 || st.Action[0] != "ecs:DescribeInstances" {
+			t.Fatalf("a statement beyond %s allows %v on %s: %s", resource, st.Action, res, policy)
+		}
 	}
 }

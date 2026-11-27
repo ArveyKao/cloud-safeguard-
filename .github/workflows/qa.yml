@@ -1,0 +1,76 @@
+name: QA
+
+# The full QA run (scripts/qa.sh): format, vet, tests, race detector, console,
+# the S1-S14 end-to-end demo and a smoke test of a fresh server. It runs on
+# every pull request, every night, and on demand. A failing nightly run opens
+# (or comments on) one tracking issue labelled "qa", so a failure becomes the
+# next task instead of a red mark nobody reads.
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 18 * * *" # 02:17 China Standard Time
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qa:
+    name: Full QA run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: scripts/qa.sh
+        run: ./scripts/qa.sh
+      # Only the per-step logs: server and container logs stay on the runner.
+      - name: Keep the step logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-logs
+          path: |
+            build/qa/*/*.log
+            build/qa/*/summary.txt
+          retention-days: 14
+
+  report:
+    name: File the nightly failure
+    needs: qa
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # One report at a time, so two failing runs never both open an issue.
+    concurrency:
+      group: qa-report
+      cancel-in-progress: false
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the QA tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="[qa] nightly QA run fails on ${GITHUB_REF_NAME}"
+          body="The nightly QA run failed at ${GITHUB_SHA::7}: ${RUN_URL} (step logs are in the qa-logs artifact)."
+          gh label create qa --color D93F0B --description "Automatic QA run" 2>/dev/null || true
+          existing=$(gh issue list --label qa --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label qa --body "$body"
+          fi

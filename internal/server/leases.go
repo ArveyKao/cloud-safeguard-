@@ -149,7 +149,7 @@ func (s *Server) submitLease(ctx context.Context, ag model.Agent, capability mod
 		if current, err := s.db.GetLease(ctx, lease.ID); err != nil {
 			return model.Lease{}, err
 		} else if current.Status != model.LeasePending {
-			return model.Lease{}, errConflictAPI("lease " + lease.ID + " is " + string(current.Status) + "; auto-approval skipped")
+			return model.Lease{}, errConflictAPI("request " + lease.ID + " is " + string(current.Status) + "; auto-approval skipped")
 		}
 		approvedAt := now
 		lease.ApprovedAt = &approvedAt
@@ -308,7 +308,7 @@ func (s *Server) handleAgentListLeases(w http.ResponseWriter, r *http.Request) {
 	if status != "" {
 		st := model.LeaseStatus(status)
 		if !st.Valid() {
-			s.badRequest(w, "invalid lease status "+status)
+			s.badRequest(w, "invalid request status "+status)
 			return
 		}
 		filter.Statuses = []model.LeaseStatus{st}
@@ -340,7 +340,7 @@ func (s *Server) handleAgentGetLease(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 			return
 		}
 		s.writeHandlerError(w, err)
@@ -348,7 +348,7 @@ func (s *Server) handleAgentGetLease(w http.ResponseWriter, r *http.Request) {
 	}
 	// Cross-agent access is indistinguishable from a missing lease.
 	if lease.AgentID != ag.ID {
-		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 		return
 	}
 	s.writeData(w, http.StatusOK, agentLeaseView(lease))
@@ -385,24 +385,24 @@ func (s *Server) handleAgentFetchCredential(w http.ResponseWriter, r *http.Reque
 	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 			return
 		}
 		s.writeHandlerError(w, err)
 		return
 	}
 	if lease.AgentID != ag.ID {
-		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 		return
 	}
 	if lease.Status != model.LeaseActive {
 		s.writeError(w, http.StatusConflict, model.ErrCodeLeaseNotActive,
-			"lease is "+string(lease.Status)+"; credentials are only available for active leases")
+			"request is "+string(lease.Status)+"; a credential is only available for an active request")
 		return
 	}
 	now := s.nowUTC()
 	if lease.ExpiresAt == nil || !lease.ExpiresAt.After(now) {
-		s.writeError(w, http.StatusConflict, model.ErrCodeLeaseNotActive, "lease credential has expired")
+		s.writeError(w, http.StatusConflict, model.ErrCodeLeaseNotActive, "the credential of this request has expired")
 		return
 	}
 	encrypted, err := s.db.GetLeaseCredential(r.Context(), lease.ID)
@@ -497,14 +497,14 @@ func (s *Server) handleAgentRevokeLease(w http.ResponseWriter, r *http.Request) 
 	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 			return
 		}
 		s.writeHandlerError(w, err)
 		return
 	}
 	if lease.AgentID != ag.ID {
-		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+		s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 		return
 	}
 	reason, err := revokeReason(in.Reason, "revoked by agent")
@@ -531,7 +531,7 @@ func (s *Server) handleListLeases(w http.ResponseWriter, r *http.Request) {
 	if status := r.URL.Query().Get("status"); status != "" {
 		st := model.LeaseStatus(status)
 		if !st.Valid() {
-			s.badRequest(w, "invalid lease status "+status)
+			s.badRequest(w, "invalid request status "+status)
 			return
 		}
 		filter.Statuses = []model.LeaseStatus{st}
@@ -555,7 +555,7 @@ func (s *Server) handleGetLease(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 			return
 		}
 		s.writeHandlerError(w, err)
@@ -602,7 +602,7 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 		return model.Lease{}, notFound
 	}
 	if lease.Status != model.LeasePending {
-		return model.Lease{}, errConflictAPI("lease is " + string(lease.Status) + ", only pending leases can be approved")
+		return model.Lease{}, errConflictAPI("request is " + string(lease.Status) + "; only a pending request can be approved")
 	}
 	now := s.nowUTC()
 	settings, err := s.db.GetPolicySettings(ctx)
@@ -612,7 +612,7 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 	if now.Sub(lease.CreatedAt) > time.Duration(settings.PendingTimeoutSeconds)*time.Second {
 		// The sweeper may not have run yet; expire it inline then report 409.
 		s.expireLease(ctx, lease, "pending request timed out")
-		return model.Lease{}, errConflictAPI("lease approval window has expired")
+		return model.Lease{}, errConflictAPI("the approval window of this request has expired")
 	}
 	capability, err := s.capabilityByID(ctx, lease.CapabilityID)
 	if err != nil {
@@ -622,7 +622,7 @@ func (s *Server) approveLease(ctx context.Context, leaseID string, in model.Appr
 		return model.Lease{}, err
 	}
 	if lease.ProviderID == "" {
-		return model.Lease{}, errConflictAPI("lease has no provider")
+		return model.Lease{}, errConflictAPI("request has no cloud account")
 	}
 	prov, err := s.db.GetProvider(ctx, lease.ProviderID)
 	if err != nil {
@@ -743,14 +743,14 @@ func (s *Server) handleDenyLease(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 			return
 		}
 		s.writeHandlerError(w, err)
 		return
 	}
 	if lease.Status != model.LeasePending {
-		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease is "+string(lease.Status)+", only pending leases can be denied")
+		s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "request is "+string(lease.Status)+"; only a pending request can be denied")
 		return
 	}
 	lease.Status = model.LeaseDenied
@@ -761,7 +761,7 @@ func (s *Server) handleDenyLease(w http.ResponseWriter, r *http.Request) {
 	// the read above is not overwritten.
 	if err := s.db.UpdateLeaseIfStatus(r.Context(), lease, model.LeasePending); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "lease is no longer pending")
+			s.writeError(w, http.StatusConflict, model.ErrCodeConflict, "request is no longer pending")
 			return
 		}
 		s.writeHandlerError(w, err)
@@ -786,7 +786,7 @@ func (s *Server) handleRevokeLease(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.db.GetLease(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "lease not found")
+			s.writeError(w, http.StatusNotFound, model.ErrCodeNotFound, "request not found")
 			return
 		}
 		s.writeHandlerError(w, err)
@@ -833,7 +833,7 @@ func (s *Server) activateLease(ctx context.Context, lease model.Lease) error {
 				s.logf("lease %s: revoke after failed recheck: %v", lease.ID, rerr)
 			}
 		}
-		return errConflictAPI("lease " + lease.ID + " was not activated: " + problem)
+		return errConflictAPI("request " + lease.ID + " was not activated: " + problem)
 	}
 	if s.hookAfterLeaseRecheck != nil {
 		s.hookAfterLeaseRecheck(lease.ID)
@@ -844,7 +844,7 @@ func (s *Server) activateLease(ctx context.Context, lease model.Lease) error {
 	}
 	if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
 		s.abortActivation(ctx, lease, "lease left pending before activation completed")
-		return errConflictAPI("lease " + lease.ID + " changed while it was being activated (revoked, expired or its agent changed); no credential was issued")
+		return errConflictAPI("request " + lease.ID + " changed while it was being activated (revoked, expired or its agent changed); no credential was issued")
 	}
 	// Any other failure: the lease did not become active, so its freshly
 	// stored credential must not stay behind.
@@ -863,7 +863,7 @@ func (s *Server) failLease(ctx context.Context, lease *model.Lease, mintErr erro
 		s.systemAudit(ctx, "lease.activation_aborted", "denied", "warning", "lease", lease.ID, map[string]any{
 			"reason": "lease left pending while its credential was minted; nothing was stored",
 		})
-		return errConflictAPI("lease " + lease.ID + " changed while its credential was being minted; no credential was issued")
+		return errConflictAPI("request " + lease.ID + " changed while its credential was being minted; no credential was issued")
 	}
 	lease.Status = model.LeaseFailed
 	lease.FailureReason = sanitizeMessage(mintErr.Error())
@@ -871,7 +871,7 @@ func (s *Server) failLease(ctx context.Context, lease *model.Lease, mintErr erro
 	lease.CredentialFingerprint = ""
 	err := s.db.UpdateLeaseIfStatus(ctx, *lease, model.LeasePending)
 	if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
-		return errConflictAPI("lease " + lease.ID + " changed while its credential was being minted; no credential was issued")
+		return errConflictAPI("request " + lease.ID + " changed while its credential was being minted; no credential was issued")
 	}
 	if err != nil {
 		s.logf("lease %s: persist failed state: %v", lease.ID, err)
@@ -1027,16 +1027,16 @@ func (s *Server) leaseAuthorityProblem(ctx context.Context, ag model.Agent, capa
 func (s *Server) credentialReleaseProblem(ctx context.Context, agentID, leaseID string) (string, error) {
 	lease, err := s.db.GetLease(ctx, leaseID)
 	if errors.Is(err, store.ErrNotFound) {
-		return "lease no longer exists", nil
+		return "request no longer exists", nil
 	}
 	if err != nil {
 		return "", err
 	}
 	if lease.Status != model.LeaseActive {
-		return "lease is " + string(lease.Status) + "; credentials are only available for active leases", nil
+		return "request is " + string(lease.Status) + "; a credential is only available for an active request", nil
 	}
 	if lease.ExpiresAt == nil || !lease.ExpiresAt.After(s.nowUTC()) {
-		return "lease credential has expired", nil
+		return "the credential of this request has expired", nil
 	}
 	ag, err := s.db.GetAgent(ctx, agentID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -1114,6 +1114,16 @@ func (s *Server) revalidateLeasesAs(ctx context.Context, filter store.LeaseFilte
 // revokeLeaseWithCause revokes a lease on behalf of the control plane and
 // records what triggered it.
 func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, reason string, cause map[string]any) (model.Lease, error) {
+	return s.revokeLeaseRecorded(ctx, lease, reason, cause, false)
+}
+
+// revokeLeaseByPerson revokes a lease that the signed-in person ended
+// directly: the event names that person as the actor, not the control plane.
+func (s *Server) revokeLeaseByPerson(ctx context.Context, lease model.Lease, reason string, cause map[string]any) (model.Lease, error) {
+	return s.revokeLeaseRecorded(ctx, lease, reason, cause, true)
+}
+
+func (s *Server) revokeLeaseRecorded(ctx context.Context, lease model.Lease, reason string, cause map[string]any, byPerson bool) (model.Lease, error) {
 	updated, previousStatus, err := s.markLeaseRevoked(ctx, lease, reason)
 	if err != nil {
 		return model.Lease{}, err
@@ -1125,6 +1135,11 @@ func (s *Server) revokeLeaseWithCause(ctx context.Context, lease model.Lease, re
 	})
 	for k, v := range cause {
 		metadata[k] = v
+	}
+	if sc, ok := sessionFromContext(ctx); byPerson && ok {
+		metadata["actor"] = "person:" + sc.person.ID
+		s.personAudit(ctx, sc.person, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
+		return updated, nil
 	}
 	s.systemAudit(ctx, "lease.revoked", "denied", denySeverity(updated.BreakGlass), "lease", updated.ID, metadata)
 	return updated, nil
@@ -1175,7 +1190,7 @@ func (s *Server) revokeLeaseAsSystem(ctx context.Context, lease model.Lease, rea
 // credential, returning the updated lease and the status it had before.
 func (s *Server) markLeaseRevoked(ctx context.Context, lease model.Lease, reason string) (model.Lease, model.LeaseStatus, error) {
 	if lease.Status != model.LeasePending && lease.Status != model.LeaseActive {
-		return model.Lease{}, "", errConflictAPI("lease is " + string(lease.Status) + "; only pending or active leases can be revoked")
+		return model.Lease{}, "", errConflictAPI("request is " + string(lease.Status) + "; only a pending or active request can be revoked")
 	}
 	previousStatus := lease.Status
 	now := s.nowUTC()

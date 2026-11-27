@@ -1026,7 +1026,11 @@ func TestOwnerRevocationNamesTheOwner(t *testing.T) {
 	a := newAccessEnv(t, model.RoleMember)
 	req := a.request(accessInput("ecs", "read"))
 	requireStatus(t, a.mei.do(http.MethodPost, "/api/v1/me/requests/"+req.ID+"/revoke", nil), http.StatusOK)
-	m := a.lastEvent("lease.revoked").Metadata
+	ev := a.lastEvent("lease.revoked")
+	if ev.ActorType != "person" || ev.ActorID != a.mei.person.ID {
+		t.Fatalf("owner revocation actor = %s %s, want the owner (the Activity page shows the actor)", ev.ActorType, ev.ActorID)
+	}
+	m := ev.Metadata
 	if m["caused_by"] != "person:"+a.mei.person.ID || m["caused_by_username"] != "mei" || m["cause"] != "owner_revoked" ||
 		m["agent_id"] != a.agent.ID || m["owner_id"] != a.mei.person.ID {
 		t.Fatalf("owner revocation metadata = %+v", m)

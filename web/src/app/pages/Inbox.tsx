@@ -2,9 +2,7 @@ import { useState } from 'react'
 import { api } from '../api'
 import type { AccessRequest, Person } from '../types'
 import { navigate } from '../router'
-import {
-  Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, ago, duration, permissionTone, useAction, useConfirm, useLoad, useToast, when,
-} from '../ui'
+import { Badge, Button, Card, Empty, ErrorNote, Modal, PageHead, ago, duration, permissionTone, useAction, useConfirm, useLoad, useToast, when, Loading } from '../ui'
 
 /** Requests from the person's own agents that wait for a decision. */
 export function InboxPage({ person, onChange }: { person: Person; onChange: () => void }) {
@@ -36,12 +34,12 @@ export function InboxPage({ person, onChange }: { person: Person; onChange: () =
       {fresh && issued && (
         <p className="note note-info">
           Your account was {issued.kind === 'created' ? 'created' : 'reset'} by <b>{issued.by_name}</b> on {when(issued.at)}.
-          If you did not choose your own password, tell another supervisor.
+          If you did not choose your own password, tell a supervisor other than {issued.by_name}.
         </p>
       )}
       <ErrorNote error={pending.error ?? action.error} />
-      {items.length === 0 ? (
-        <Card><Empty>Nothing waits for you. <a href="/agents" onClick={(e) => { e.preventDefault(); navigate('/agents') }}>Connect an agent</a> to get started.</Empty></Card>
+      {!pending.ready ? (pending.error ? null : <Card><Loading /></Card>) : items.length === 0 ? (
+        <Card><Empty>Nothing waits for you. When one of your agents asks for more than your approval mode allows, it appears here. To add an agent, go to <a href="/agents" onClick={(e) => { e.preventDefault(); navigate('/agents') }}>Agents</a>.</Empty></Card>
       ) : items.map((r) => (
         <Card key={r.id}>
           <div className="request">

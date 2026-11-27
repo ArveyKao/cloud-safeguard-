@@ -78,7 +78,7 @@ configuration:
   "cloud-safeguard": { "command": "csg", "args": ["mcp"] }
 
 Tools: list_accounts, request_access, check_status, get_credential,
-refresh_credential, revoke.
+refresh_credential, revoke, request_long_lived_credential.
 Credentials are written to ~/.config/cloud-safeguard/credentials/ (mode 0600)
 and never returned to the model.
 `)

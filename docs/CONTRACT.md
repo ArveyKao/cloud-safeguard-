@@ -880,6 +880,13 @@ each part. This section is the running behaviour. Rationale: ADR-015.
 - `resource_name` names one resource (an instance ID, a domain, a bucket), is at most 253
   characters and is validated against the resource type's pattern. Left out, the request
   covers all resources of that type in the account. Wildcards inside a name are refused.
+- Every template also lets its credential list the resources of its type, in a statement of
+  its own (owner's decision, 2026-11-23), so a credential for one resource can find it:
+  `ecs:DescribeInstances` on `instance/*`, `alidns:DescribeDomains`, `oss:ListBuckets`,
+  `s3:ListAllMyBuckets`. Listing shows the other resources' names and settings, which a read
+  request on all resources (issued at once to any guest) shows anyway; every action that
+  changes something stays on the named resource only. The list statement is pinned by a
+  test and may hold read actions only.
 - ECS `write` is start, stop and reboot. `ecs:ModifyInstanceAttribute` is in no template: it
   can set an instance's login password, which gives a shell on the instance and with it the
   credentials of any RAM role attached to that instance, a way around the IAM prohibition.
@@ -985,9 +992,11 @@ agent or the request.
   person who caused it when there is one (the owner, an approver or a supervisor). Events
   the control plane causes itself (a deadline, the check at start, local recovery) are
   recorded as `system` with what triggered them, one event per credential.
-  A `lease.revoked` event caused by a person's action (suspension, reset, an owner revoking
-  an agent, a re-sign-in) is recorded as the control plane's, with `caused_by`, `owner_id`,
-  `agent_id` and `agent_name` in its metadata.
+  A `lease.revoked` event that follows from a person's action on something else (suspension,
+  reset, a lowered or removed role, an owner revoking a whole agent, a re-sign-in) is recorded
+  as the control plane's, with `caused_by`, `owner_id`, `agent_id` and `agent_name` in its
+  metadata. When a person revokes one request directly (the owner in the Inbox, a supervisor
+  through the API), the event names that person as the actor, with the same metadata.
 
 ### 17.7 MCP server and agent CLI
 
@@ -1001,6 +1010,7 @@ It is a thin client of the agent API and holds only the agent token saved by `cs
 | `check_status` | Status of a request, with `expires_at` and, once issued, `refresh_until`, `max_lifetime_seconds` and `refresh_count`. |
 | `get_credential` | Writes the credential to `~/.config/cloud-safeguard/credentials/<request id>.env` (directory 0700, file 0600) as `export` lines and returns only the path, expiry and `source <path>`. The secret is never returned to the model, so it stays out of transcripts, logs and model-provider requests. |
 | `refresh_credential` | A new key under the same request (§17.12), then handed over as `get_credential` does. |
+| `request_long_lived_credential` | Asks for a long-lived key (§17.14 below); the answer is only a console link for the owner, never a key. |
 | `revoke` | Ends the request and deletes its credential file. |
 
 Request IDs are validated (`lea_` + 32 hex) before use, so a tool argument can never name another

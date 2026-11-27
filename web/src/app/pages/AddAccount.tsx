@@ -102,10 +102,10 @@ export function AddAccountPage() {
           <>
             <h1>Create a user and a role for Cloud Safeguard</h1>
             <p className="muted">Three things in {c.consoleName} of account {id}. Use these names, so the policies below fit as they are.</p>
-            <h3>1. A {c.iam} user named <span className="mono">{BROKER_USER}</span></h3>
+            <h3>1. An {c.iam} user named <span className="mono">{BROKER_USER}</span></h3>
             <p className="muted small">Create an access key for it and keep the secret for the next step. Give the user only this policy: it can do nothing but assume the role.</p>
             <Policy text={c.broker(id)} />
-            <h3>2. A {c.iam} role named <span className="mono">{ROLE_NAME}</span></h3>
+            <h3>2. An {c.iam} role named <span className="mono">{ROLE_NAME}</span></h3>
             <p className="muted small">Trusted by that user only. This is the role's trust policy.</p>
             <Policy text={c.trust(id)} />
             <h3>3. The role's permissions</h3>

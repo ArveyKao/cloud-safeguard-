@@ -381,14 +381,13 @@ func (a *App) printAccess(req model.AccessRequest, jsonOut bool) {
 		_ = a.printJSON(req)
 		return
 	}
-	scope := req.ResourceName
-	if scope == "" {
-		scope = "all"
-	}
 	fmt.Fprintf(a.Stdout, "request:    %s\n", req.ID)
 	fmt.Fprintf(a.Stdout, "status:     %s\n", req.Status)
-	fmt.Fprintf(a.Stdout, "access:     %s %s (%s) on %s\n", req.Permission, req.Resource, scope, req.CloudAccountID)
-	fmt.Fprintf(a.Stdout, "valid for:  %s\n", formatSeconds(req.TTLSeconds))
+	fmt.Fprintf(a.Stdout, "access:     %s on %s\n", formatAccessLabel(req.Permission, req.Resource, req.ResourceName), req.CloudAccountID)
+	switch req.Status {
+	case model.LeasePending, model.LeaseActive:
+		fmt.Fprintf(a.Stdout, "valid for:  %s\n", formatSeconds(req.TTLSeconds))
+	}
 	if req.ExpiresAt != nil {
 		fmt.Fprintf(a.Stdout, "expires:    %s\n", req.ExpiresAt.Local().Format(time.RFC3339))
 	}
