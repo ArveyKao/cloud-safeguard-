@@ -309,7 +309,7 @@ func TestCredentialReleaseIsRechecked(t *testing.T) {
 	}
 	exec(`UPDATE agents SET status = 'active' WHERE id = ?`, ag.ID)
 	exec(`UPDATE leases SET status = 'revoked' WHERE id = ?`, lease.ID)
-	if p := problem(); !strings.Contains(p, "lease is revoked") {
+	if p := problem(); !strings.Contains(p, "request is revoked") {
 		t.Fatalf("revoked lease: %q", p)
 	}
 	exec(`UPDATE leases SET status = 'active' WHERE id = ?`, lease.ID)
